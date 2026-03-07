@@ -66,13 +66,28 @@ pub fn main() !void {
     // and args slices point into this pool if passed by user.
     // However, if process terminates, OS reclaims memory.
 
-    const cfg = Config.parse(args, std.io.getStdErr().writer()) catch |err| {
+    var cfg = Config.parse(allocator, args, std.io.getStdErr().writer()) catch |err| {
         if (err == error.HelpRequested) {
             std.process.exit(0);
         } else {
             std.process.exit(1);
         }
     };
+    defer cfg.deinit();
+
+    std.debug.print("Config resolved:\n", .{});
+    std.debug.print("  listen_port={d} (from {s})\n", .{ cfg.listen_port, cfg.listen_port_src.asStr() });
+    std.debug.print("  target_host={s} (from {s})\n", .{ cfg.target_host, cfg.target_host_src.asStr() });
+    std.debug.print("  target_port={d} (from {s})\n", .{ cfg.target_port, cfg.target_port_src.asStr() });
+    if (cfg.entity_file) |ef| {
+        std.debug.print("  entity_file={s} (from {s})\n", .{ ef, cfg.entity_file_src.asStr() });
+    } else {
+        std.debug.print("  entity_file=null (from {s})\n", .{cfg.entity_file_src.asStr()});
+    }
+    std.debug.print("  fuzzy_threshold={d:.2} (from {s})\n", .{ cfg.fuzzy_threshold, cfg.fuzzy_threshold_src.asStr() });
+    std.debug.print("  max_connections={d} (from {s})\n", .{ cfg.max_connections, cfg.max_connections_src.asStr() });
+    std.debug.print("  log_level={s} (from {s})\n", .{ @tagName(cfg.log_level), cfg.log_level_src.asStr() });
+    std.debug.print("\n", .{});
 
     // --- Entity Masking Setup ---
     // Demo name set. In production, these come from case metadata,

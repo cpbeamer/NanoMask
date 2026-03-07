@@ -243,15 +243,20 @@ zig test src/fuzzy_match.zig --test-filter "OCR corrupted"
 
 ## Configuration
 
-| Setting | Location | Default | Description |
-|---|---|---|---|
-| Listen port | `src/main.zig` | `8081` | Port the proxy listens on |
-| Target host | `src/main.zig` | `httpbin.org` | Upstream server hostname |
-| Target port | `src/main.zig` | `80` | Upstream server port |
-| Entity names | `src/main.zig` or `X-ZPG-Entities` header | Demo set | Names to mask |
-| Fuzzy threshold | `src/main.zig` | `0.80` (80%) | Minimum similarity for fuzzy match |
-| Max connections | `src/main.zig` | `128` | Concurrent connection limit |
-| Connection pool | `std.http.Client` default | `32` | Max pooled upstream connections |
+NanoMask supports a strict configuration precedence:
+`CLI Flag` (highest) > `Environment Variable` > `Compiled Default` (lowest)
+
+| Setting | CLI Flag | Environment Variable | Default | Description |
+|---|---|---|---|---|
+| Listen port | `--listen-port` | `NANOMASK_LISTEN_PORT` | `8081` | Port the proxy listens on |
+| Target host | `--target-host` | `NANOMASK_TARGET_HOST` | `httpbin.org` | Upstream server hostname |
+| Target port | `--target-port` | `NANOMASK_TARGET_PORT` | `80` | Upstream server port |
+| Entity file | `--entity-file` | `NANOMASK_ENTITY_FILE` | none | Path to file containing entity aliases |
+| Fuzzy threshold | `--fuzzy-threshold` | `NANOMASK_FUZZY_THRESHOLD`| `0.80` (80%) | Minimum similarity for fuzzy match |
+| Max connections | `--max-connections` | `NANOMASK_MAX_CONNECTIONS`| `128` | Concurrent connection limit |
+| Log level | `--log-level` | `NANOMASK_LOG_LEVEL` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
+
+*Note: Per-request `X-ZPG-Entities` header overrides the entity names loaded from the file or compiled defaults.*
 
 ## License
 

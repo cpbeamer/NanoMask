@@ -109,7 +109,7 @@
 
 **Goal**: Remove all hardcoded config from source code. Ops teams must be able to configure the proxy without recompilation.
 
-#### 3.1 — CLI argument parsing
+#### ✅ 3.1 — CLI argument parsing
 
 **Type**: Feature  
 **Estimate**: 1 day  
@@ -128,7 +128,7 @@
 
 ---
 
-#### 3.2 — Environment variable overrides
+#### ✅ 3.2 — Environment variable overrides
 
 **Type**: Feature  
 **Estimate**: 0.5 day  
