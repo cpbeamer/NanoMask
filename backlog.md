@@ -217,7 +217,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 🔄 3.5 — Entity management REST API
+#### ✅ 3.5 — Entity management REST API
 
 **Type**: Feature  
 **Estimate**: 1.5 days  

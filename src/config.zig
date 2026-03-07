@@ -52,6 +52,10 @@ pub const Config = struct {
     admin_token_src: ConfigSource = .default,
     entity_file_sync: bool = false,
     entity_file_sync_src: ConfigSource = .default,
+    tls_cert: ?[]const u8 = null,
+    tls_cert_src: ConfigSource = .default,
+    tls_key: ?[]const u8 = null,
+    tls_key_src: ConfigSource = .default,
 
     allocator: std.mem.Allocator,
 
@@ -65,6 +69,9 @@ pub const Config = struct {
         InvalidWatchInterval,
         EntityFileNotFound,
         InvalidAdminFlag,
+        MissingTlsPair,
+        TlsCertNotFound,
+        TlsKeyNotFound,
         UnknownFlag,
         OutOfMemory,
     };
@@ -78,6 +85,12 @@ pub const Config = struct {
         }
         if (self.admin_token != null and self.admin_token_src == .env_var) {
             self.allocator.free(self.admin_token.?);
+        }
+        if (self.tls_cert != null and self.tls_cert_src == .env_var) {
+            self.allocator.free(self.tls_cert.?);
+        }
+        if (self.tls_key != null and self.tls_key_src == .env_var) {
+            self.allocator.free(self.tls_key.?);
         }
     }
 
@@ -97,6 +110,8 @@ pub const Config = struct {
             \\  --admin-api                 Enable /_admin/entities REST endpoints (default: disabled)
             \\  --admin-token <secret>      Require Bearer token for admin endpoints
             \\  --entity-file-sync          Write API entity changes back to entity file
+            \\  --tls-cert <path>           PEM certificate file for TLS (requires --tls-key)
+            \\  --tls-key <path>            PEM private key file for TLS (requires --tls-cert)
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -179,6 +194,24 @@ pub const Config = struct {
                 return error.InvalidAdminFlag;
             }
             config.entity_file_sync_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_TLS_CERT")) {
+            config.tls_cert = try allocator.dupe(u8, value);
+            config.tls_cert_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open TLS cert file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.TlsCertNotFound;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_TLS_KEY")) {
+            config.tls_key = try allocator.dupe(u8, value);
+            config.tls_key_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open TLS key file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.TlsKeyNotFound;
+            }
         }
     }
 
@@ -201,6 +234,8 @@ pub const Config = struct {
             "NANOMASK_ADMIN_API",
             "NANOMASK_ADMIN_TOKEN",
             "NANOMASK_ENTITY_FILE_SYNC",
+            "NANOMASK_TLS_CERT",
+            "NANOMASK_TLS_KEY",
         };
 
         for (env_keys) |key| {
@@ -346,10 +381,54 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--entity-file-sync")) {
                 config.entity_file_sync = true;
                 config.entity_file_sync_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --tls-cert\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.tls_cert != null and config.tls_cert_src == .env_var) {
+                    allocator.free(config.tls_cert.?);
+                }
+                config.tls_cert = args[i];
+                config.tls_cert_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open TLS cert file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.TlsCertNotFound;
+                }
+            } else if (std.mem.eql(u8, arg, "--tls-key")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --tls-key\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.tls_key != null and config.tls_key_src == .env_var) {
+                    allocator.free(config.tls_key.?);
+                }
+                config.tls_key = args[i];
+                config.tls_key_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open TLS key file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.TlsKeyNotFound;
+                }
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
             }
+        }
+
+        // Validate TLS cert/key pairing — both must be provided together
+        if (config.tls_cert != null and config.tls_key == null) {
+            std.debug.print("error: --tls-cert requires --tls-key\n", .{});
+            return error.MissingTlsPair;
+        }
+        if (config.tls_key != null and config.tls_cert == null) {
+            std.debug.print("error: --tls-key requires --tls-cert\n", .{});
+            return error.MissingTlsPair;
         }
 
         return config;
@@ -522,4 +601,102 @@ test "Config - entity-file-sync flag" {
 
     try testing.expect(cfg.entity_file_sync);
     try testing.expectEqual(ConfigSource.cli_flag, cfg.entity_file_sync_src);
+}
+
+test "Config - tls-cert without tls-key" {
+    // Create a temporary cert file for the test
+    const tmp_cert = "test_tls_cert.pem";
+    {
+        var f = try std.fs.cwd().createFile(tmp_cert, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_cert) catch {};
+
+    const args = [_][]const u8{
+        "nanomask",
+        "--tls-cert", tmp_cert,
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingTlsPair, res);
+}
+
+test "Config - tls-key without tls-cert" {
+    const tmp_key = "test_tls_key.pem";
+    {
+        var f = try std.fs.cwd().createFile(tmp_key, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_key) catch {};
+
+    const args = [_][]const u8{
+        "nanomask",
+        "--tls-key", tmp_key,
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingTlsPair, res);
+}
+
+test "Config - tls-cert and tls-key valid pair" {
+    const tmp_cert = "test_tls_cert2.pem";
+    const tmp_key = "test_tls_key2.pem";
+    {
+        var f = try std.fs.cwd().createFile(tmp_cert, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_cert) catch {};
+    {
+        var f = try std.fs.cwd().createFile(tmp_key, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_key) catch {};
+
+    const args = [_][]const u8{
+        "nanomask",
+        "--tls-cert", tmp_cert,
+        "--tls-key", tmp_key,
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings(tmp_cert, cfg.tls_cert.?);
+    try testing.expectEqualStrings(tmp_key, cfg.tls_key.?);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.tls_cert_src);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.tls_key_src);
+}
+
+test "Config - tls-cert file not found" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--tls-cert", "nonexistent_tls_cert_12345.pem",
+        "--tls-key", "nonexistent_tls_key_12345.pem",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.TlsCertNotFound, res);
+}
+
+test "Config - tls-key file not found" {
+    const tmp_cert = "test_tls_cert3.pem";
+    {
+        var f = try std.fs.cwd().createFile(tmp_cert, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_cert) catch {};
+
+    const args = [_][]const u8{
+        "nanomask",
+        "--tls-cert", tmp_cert,
+        "--tls-key", "nonexistent_tls_key_12345.pem",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.TlsKeyNotFound, res);
 }

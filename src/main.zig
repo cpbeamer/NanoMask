@@ -10,6 +10,7 @@ const EntitySnapshot = versioned_entity_set.EntitySnapshot;
 const file_watcher = @import("file_watcher.zig");
 const FileWatcher = file_watcher.FileWatcher;
 const admin = @import("admin.zig");
+const tls_mod = @import("tls.zig");
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
@@ -25,6 +26,9 @@ const ThreadContext = struct {
     http_client: *std.http.Client,
     active_connections: *std.atomic.Value(u32),
     admin_config: admin.AdminConfig,
+    /// TODO: Wire into handleConnection to perform TLS handshake on accepted
+    /// streams once the TlsContext.accept() method is implemented.
+    tls_context: ?*tls_mod.TlsContext,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -107,6 +111,16 @@ pub fn main() !void {
     std.debug.print("  max_connections={d} (from {s})\n", .{ cfg.max_connections, cfg.max_connections_src.asStr() });
     std.debug.print("  log_level={s} (from {s})\n", .{ @tagName(cfg.log_level), cfg.log_level_src.asStr() });
     std.debug.print("  watch_interval_ms={d} (from {s})\n", .{ cfg.watch_interval_ms, cfg.watch_interval_ms_src.asStr() });
+    if (cfg.tls_cert) |tc| {
+        std.debug.print("  tls_cert={s} (from {s})\n", .{ tc, cfg.tls_cert_src.asStr() });
+    } else {
+        std.debug.print("  tls_cert=null (from {s})\n", .{cfg.tls_cert_src.asStr()});
+    }
+    if (cfg.tls_key) |tk| {
+        std.debug.print("  tls_key={s} (from {s})\n", .{ tk, cfg.tls_key_src.asStr() });
+    } else {
+        std.debug.print("  tls_key=null (from {s})\n", .{cfg.tls_key_src.asStr()});
+    }
     std.debug.print("\n", .{});
 
     // --- Entity Masking Setup (RCU) ---
@@ -173,7 +187,23 @@ pub fn main() !void {
         std.debug.print("WARNING: No entity file provided. Running in SSN-only mode unless X-ZPG-Entities header is present on requests.\n", .{});
     }
 
-    std.debug.print("Listening on http://127.0.0.1:{}\n", .{cfg.listen_port});
+    // --- TLS setup ---
+    var tls_context: ?tls_mod.TlsContext = null;
+    defer if (tls_context) |*tc| tc.deinit();
+
+    if (cfg.tls_cert) |cert_path| {
+        if (cfg.tls_key) |key_path| {
+            tls_context = tls_mod.TlsContext.init(cert_path, key_path, allocator) catch |err| {
+                std.debug.print("error: failed to load TLS certificate/key: {}\n", .{err});
+                std.process.exit(1);
+            };
+            std.debug.print("TLS: loaded certificate from {s}\n", .{cert_path});
+        }
+    }
+
+    const tls_enabled = tls_context != null;
+    const protocol = if (tls_enabled) "https" else "http";
+    std.debug.print("Listening on {s}://127.0.0.1:{}\n", .{ protocol, cfg.listen_port });
     std.debug.print("Forwarding to http://{s}:{}\n", .{ cfg.target_host, cfg.target_port });
 
     if (entity_set) |es| {
@@ -208,6 +238,11 @@ pub fn main() !void {
         std.debug.print("\n", .{});
     } else {
         std.debug.print("Admin API: disabled\n", .{});
+    }
+    if (tls_enabled) {
+        std.debug.print("TLS: certificate loaded (handshake not yet wired — traffic is still plaintext)\n", .{});
+    } else {
+        std.debug.print("WARNING: running without TLS -- not suitable for production\n", .{});
     }
     std.debug.print("\n", .{});
 
@@ -244,6 +279,7 @@ pub fn main() !void {
         .http_client = &http_client,
         .active_connections = &active_connections,
         .admin_config = admin_config,
+        .tls_context = if (tls_context) |*tc| tc else null,
     };
 
     while (true) {

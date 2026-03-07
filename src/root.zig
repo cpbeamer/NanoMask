@@ -7,6 +7,7 @@ pub const versioned_entity_set = @import("versioned_entity_set.zig");
 pub const config = @import("config.zig");
 pub const file_watcher = @import("file_watcher.zig");
 pub const admin = @import("admin.zig");
+pub const tls_server = @import("tls.zig");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -17,5 +18,6 @@ test {
     _ = config;
     _ = file_watcher;
     _ = admin;
+    _ = tls_server;
     _ = @import("http_util.zig");
 }
