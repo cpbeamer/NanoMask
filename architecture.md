@@ -32,10 +32,21 @@ The proxy intercepts the HTTP transaction in a bidirectional pipeline:
 
 The core privacy mechanism lives in an isolated engine module.
 
-### In-Place Scanning
-To maintain maximum performance and avoid expensive heap-allocations or garbage collection pauses, the SSN redaction engine uses **in-place mutation**. 
-*   It utilizes SIMD-accelerated dash scanning (`@Vector(16, u8)`) to locate candidate positions, then validates the full `\d{3}-\d{2}-\d{4}` pattern.
-*   When a pattern match occurs, the sequence is directly mutated within the same memory slice to `***-**-****`.
+### In-Place SIMD Scanning
+To maintain maximum performance and avoid expensive heap-allocations or garbage collection pauses, the SSN redaction engine uses **in-place mutation**.
+*   It loads 16 bytes at a time via `@Vector(16, u8)` and builds a bitmask of all `-` (dash) positions using a SIMD compare.
+*   Windows with no dashes are skipped entirely (one compare + mask check). For each dash candidate, the surrounding bytes are validated against the full `\d{3}-\d{2}-\d{4}` pattern.
+*   When a pattern match occurs, the digit positions are directly mutated to `*` within the same memory slice.
+*   A 3-byte scalar rewind after the SIMD loop ensures no SSN is missed at window boundaries (SSN first dash is at offset +3 from start, so the rewind covers the maximum gap between a SIMD window edge and a valid SSN start).
+*   Throughput: ~16,000 MB/s at ReleaseFast (1 MB payload, 100 iterations, single-threaded).
+
+### Streaming Chunked SSN Redaction
+For streaming proxy scenarios where the full body is not available at once, `redactSsnChunked` processes data in arbitrarily-sized chunks:
+*   A `SsnChunkState` struct holds a 10-byte pending buffer (SSN is 11 bytes, so at most 10 bytes can span a boundary).
+*   Each call returns a `SsnChunkResult` with two slices: `finalized` (boundary-scanned old pending bytes, safe to emit) and `emitted` (the chunk body minus the new pending tail).
+*   Small chunks (< 10 bytes) accumulate in pending without emitting, ensuring SSNs are never split across uncommitted buffers.
+*   A `flush()` method emits the final pending bytes at end-of-stream.
+*   Correctness is verified by a 1 MB fuzz-equivalence test (chunked output == single-pass output for 64-byte chunks).
 
 ## 4. Entity Masking Engine (`src/entity_mask.zig`)
 

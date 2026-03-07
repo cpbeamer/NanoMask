@@ -2,7 +2,7 @@
   <h1 align="center">🛡️ NanoMask</h1>
   <p align="center"><strong>Wire-speed PII/PHI redaction proxy — pure Zig, zero dependencies</strong></p>
   <p align="center">
-    <a href="#benchmarks">8.5 GB/s SSN redaction</a> · <a href="#algorithms">3-stage privacy pipeline</a> · <a href="#quick-start">Single binary deploy</a>
+    <a href="#benchmarks">16+ GB/s SSN redaction</a> · <a href="#algorithms">3-stage privacy pipeline</a> · <a href="#quick-start">Single binary deploy</a>
   </p>
 </p>
 
@@ -16,7 +16,7 @@ Built for **VA claims processing** and DoD environments where OCR-scanned clinic
 
 | Problem | NanoMask's Answer |
 |---|---|
-| SSNs in API payloads | SIMD-accelerated pattern scan at **8,500 MB/s** |
+| SSNs in API payloads | SIMD-accelerated pattern scan at **16+ GB/s** (ReleaseFast) |
 | Patient names in LLM prompts | Aho-Corasick automaton replaces names with aliases at **260 MB/s** |
 | OCR misspellings (`J0hn Doe`, `JOHN E DOE`) | Myers' bit-vector fuzzy matching at **193 MB/s** |
 | Per-request TCP overhead to upstream | Built-in connection pooling with keep-alive |
@@ -37,10 +37,10 @@ zig build -Doptimize=ReleaseFast
 # Run with defaults (listens on :8081, forwards to httpbin.org:80)
 zig build run
 
-# Run benchmarks
-zig build bench-all
+# Run benchmarks (ReleaseFast, clean output on Windows)
+zig build bench-all 2>$null
 
-# Run all tests (45 tests)
+# Run all tests (49 tests)
 zig build test
 ```
 
@@ -78,18 +78,20 @@ And transparently restores `Entity_A` → `John Doe` in the upstream response.
 
 NanoMask runs a **3-stage privacy pipeline** on every request body. Each stage is optimized for a specific class of PII pattern, and they execute in sequence so that later stages only process text not already redacted by earlier ones.
 
-### Stage 1: SIMD SSN Redaction (~8,500 MB/s)
+### Stage 1: SIMD SSN Redaction (~16 GB/s)
 
 **What it catches**: Social Security Numbers in `NNN-NN-NNNN` format.
 
-**How it works**: A branchless, byte-at-a-time scan that checks each position for the SSN pattern (3 digits, hyphen, 2 digits, hyphen, 4 digits). When a match is found, all digit characters are replaced with `*` in-place. The scan operates directly on the mutable request buffer with zero allocations.
+**How it works**: A SIMD dash-scanning engine loads 16 bytes at a time via `@Vector(16, u8)` and builds a bitmask of all `-` positions. For each dash candidate, it checks if the surrounding bytes form a valid `XXX-XX-XXXX` digit pattern. Matched digits are replaced with `*` in-place with zero allocations.
 
 ```
 Input:  "Patient SSN 123-45-6789 is active"
 Output: "Patient SSN ***-**-**** is active"
 ```
 
-**Why it's fast**: The scan is a simple state machine with no branching on the hot path. At ReleaseFast optimization, Zig compiles this into SIMD-width operations that process multiple bytes per cycle, achieving memory-bandwidth-limited throughput.
+**Why it's fast**: Dashes are rare in typical payloads, so most 16-byte windows are skipped entirely (one SIMD compare + mask check). A 3-byte scalar rewind after the SIMD loop ensures no SSN is missed at window boundaries. At ReleaseFast, the scan achieves ~16 GB/s on a single core.
+
+**Streaming support**: `redactSsnChunked` processes data in arbitrarily-sized chunks for streaming proxy use. A 10-byte pending buffer defers output until the next chunk confirms no boundary-spanning SSN exists. Equivalent output to single-pass `redactSsn` — verified by a 1 MB fuzz-equivalence test.
 
 **Source**: [`src/redact.zig`](src/redact.zig)
 
@@ -168,14 +170,14 @@ Stage 3 only scans the **gaps** between regions already masked by Stages 1 and 2
 
 ## Benchmarks
 
-All benchmarks run with `zig build bench-all` (ReleaseFast, single-threaded):
+All benchmarks run with `zig build bench-all 2>$null` (ReleaseFast, single-threaded):
 
 ```
 === NanoMask Pipeline Benchmarks ===
 
-Stage 1 | SIMD SSN Redaction  |  8,500 MB/s | 100 iter × 1 MB
+Stage 1 | SIMD SSN Redaction  | 16,000 MB/s | 100 iter × 1 MB
 Stage 2 | Aho-Corasick Mask   |    260 MB/s |  50 iter × 1 MB
-Stage 3 | Myers' Fuzzy Match  |    193 MB/s |  10 iter × 256 KB
+Stage 3 | Myers' Fuzzy Match  |    201 MB/s |  10 iter × 256 KB
 ```
 
 **Real-world throughput**: For a typical 50 KB clinical document, the entire 3-stage pipeline completes in **< 0.5 ms**. Network round-trip to the upstream (10-50 ms) dominates total latency.
@@ -226,11 +228,11 @@ src/
 ## Testing
 
 ```bash
-# Run all 45 tests
+# Run all 49 tests
 zig build test
 
-# Run benchmarks (ReleaseFast)
-zig build bench-all
+# Run benchmarks (ReleaseFast, clean output on Windows)
+zig build bench-all 2>$null
 
 # Run only fuzzy match tests
 zig test src/fuzzy_match.zig

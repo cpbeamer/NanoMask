@@ -87,6 +87,11 @@ pub fn redactSsn(buffer: []u8) void {
     }
 
     // --- Scalar tail: handle remaining bytes that don't fill a vector -----
+    // The SIMD loop advances by vector_len when no dashes are found. An SSN's
+    // first dash is at offset +3, so an SSN starting 3 bytes before the
+    // current `i` could have its first dash just past the last SIMD window.
+    // Rewind by 3 to catch this edge case.
+    i = if (i >= 3) i - 3 else 0;
     while (i + 11 <= buffer.len) {
         if (tryRedactAt(buffer, i)) {
             i += 11;
@@ -120,6 +125,123 @@ pub fn redactSsnScalar(buffer: []u8) void {
             i += 1;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chunked SSN Redaction — streaming-compatible interface
+// ---------------------------------------------------------------------------
+// An SSN is exactly 11 bytes (XXX-XX-XXXX). When processing data in chunks,
+// up to 10 bytes of a pattern can spill from one chunk to the next.
+//
+// Strategy: withhold the last 10 bytes of each chunk as "pending". When the
+// next chunk arrives, combine pending + chunk prefix, scan for boundary SSNs,
+// then finalize the old pending bytes and keep a new pending tail. This ensures
+// boundary-spanning SSNs are always caught before bytes are committed.
+//
+// Callers own the state and pass it into each successive call. After all
+// chunks are processed, call `flush()` to emit the final pending bytes.
+// ---------------------------------------------------------------------------
+
+/// Maximum overlap: SSN is 11 bytes, so at most 10 bytes can span a boundary.
+const ssn_overlap = 10;
+
+/// Result of a single `redactSsnChunked` call.
+pub const SsnChunkResult = struct {
+    /// Finalized bytes from the previous chunk's tail (boundary-scanned).
+    /// Valid until the next `redactSsnChunked` or `flush` call.
+    finalized: []u8,
+    /// Safe-to-emit sub-slice of the current chunk (may be empty for small chunks).
+    emitted: []u8,
+};
+
+/// Persistent state for chunked SSN redaction.
+/// Caller initializes once, passes to each `redactSsnChunked` / `flush` call.
+pub const SsnChunkState = struct {
+    /// Bytes withheld from the previous chunk, not yet committed.
+    pending: [ssn_overlap]u8 = undefined,
+    /// Finalized pending bytes (output buffer for the caller).
+    finalized: [ssn_overlap]u8 = undefined,
+    /// How many bytes in `pending` are valid (0 on first call).
+    len: u8 = 0,
+
+    /// Emit any remaining pending bytes (call after the last chunk).
+    /// Returns a slice into `self.finalized` — valid until the next call.
+    pub fn flush(self: *SsnChunkState) []u8 {
+        if (self.len == 0) return self.finalized[0..0];
+        // Redact any SSN patterns within the remaining pending bytes.
+        redactSsn(self.pending[0..self.len]);
+        @memcpy(self.finalized[0..self.len], self.pending[0..self.len]);
+        const out_len = self.len;
+        self.len = 0;
+        return self.finalized[0..out_len];
+    }
+};
+
+/// Process a single chunk for SSN redaction in streaming mode.
+///
+/// Returns finalized bytes from the previous chunk's tail (after boundary
+/// scanning) and the safe-to-emit sub-slice of the current chunk.
+///
+/// The caller should emit `result.finalized` then `result.emitted`.
+/// After all chunks, call `state.flush()` for the remaining tail.
+pub fn redactSsnChunked(chunk: []u8, state: *SsnChunkState) SsnChunkResult {
+    if (chunk.len == 0) {
+        return .{ .finalized = state.finalized[0..0], .emitted = chunk[0..0] };
+    }
+
+    const old_pending_len: usize = state.len;
+    const total = old_pending_len + chunk.len;
+
+    // If the combined pending + chunk is too small to contain an SSN,
+    // just accumulate into pending without emitting anything.
+    if (total <= ssn_overlap) {
+        @memcpy(state.pending[old_pending_len..][0..chunk.len], chunk);
+        state.len = @intCast(total);
+        return .{ .finalized = state.finalized[0..0], .emitted = chunk[0..0] };
+    }
+
+    // --- Phase 1: scan for SSNs spanning the pending/chunk boundary ---
+    if (old_pending_len > 0) {
+        var boundary: [ssn_overlap + 11]u8 = undefined;
+        @memcpy(boundary[0..old_pending_len], state.pending[0..old_pending_len]);
+        const take: usize = @min(11, chunk.len);
+        @memcpy(boundary[old_pending_len..][0..take], chunk[0..take]);
+        const boundary_len = old_pending_len + take;
+
+        var i: usize = 0;
+        while (i + 11 <= boundary_len) {
+            if (i >= old_pending_len) break;
+            if (tryRedactAt(&boundary, i)) {
+                const pending_end = @min(i + 11, old_pending_len);
+                @memcpy(state.pending[i..pending_end], boundary[i..pending_end]);
+                if (i + 11 > old_pending_len) {
+                    const chunk_end: usize = i + 11 - old_pending_len;
+                    @memcpy(chunk[0..chunk_end], boundary[old_pending_len..][0..chunk_end]);
+                }
+                i += 11;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // --- Phase 2: redact SSNs fully within the chunk ---
+    redactSsn(chunk);
+
+    // --- Phase 3: finalize old pending, withhold new tail ---
+    @memcpy(state.finalized[0..old_pending_len], state.pending[0..old_pending_len]);
+
+    // Withhold the last ssn_overlap bytes of chunk as new pending.
+    const new_pending_len: u8 = @intCast(@min(ssn_overlap, chunk.len));
+    const emit_len = chunk.len - new_pending_len;
+
+    state.len = new_pending_len;
+    @memcpy(state.pending[0..new_pending_len], chunk[chunk.len - new_pending_len ..]);
+
+    return .{
+        .finalized = state.finalized[0..old_pending_len],
+        .emitted = chunk[0..emit_len],
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +280,6 @@ test "redactSsn - adjacent SSNs no separator" {
 }
 
 test "redactSsn - partial pattern is not redacted" {
-    // Only 2 leading digits instead of 3 -- should NOT match.
     var buf = "12-34-5678 is not an SSN".*;
     const expected = "12-34-5678 is not an SSN";
     redactSsn(&buf);
@@ -167,22 +288,17 @@ test "redactSsn - partial pattern is not redacted" {
 
 test "redactSsn - empty buffer" {
     var buf: [0]u8 = .{};
-    redactSsn(&buf); // must not panic
+    redactSsn(&buf);
     try std.testing.expectEqual(@as(usize, 0), buf.len);
 }
 
 test "redactSsn - SSN with surrounding digits" {
-    // "9123-45-67890" = 13 chars.
-    // At i=0: buf[3]='3' (not '-'), no match.
-    // At i=1: "123-45-6789" matches, gets redacted. i advances to 12.
-    // Result: "9***-**-****0"
     var buf = "9123-45-67890".*;
     redactSsn(&buf);
     try std.testing.expectEqualStrings("9***-**-****0", &buf);
 }
 
 test "redactSsn - scalar fallback matches SIMD" {
-    // Verify both implementations produce identical results on the same input.
     const input = "prefix 111-22-3333 mid 444-55-6666 end 777-88-9999 tail".*;
     var simd_buf = input;
     var scalar_buf = input;
@@ -192,10 +308,98 @@ test "redactSsn - scalar fallback matches SIMD" {
 }
 
 test "redactSsn - large buffer with scattered SSNs" {
-    // 80-byte buffer with SSNs at various offsets to exercise SIMD chunking.
     var buf = "aaaaaaaaaa123-45-6789bbbbbbbbbb987-65-4321cccccccccc555-12-9876ddddddddddeeeeee".*;
     redactSsn(&buf);
     try std.testing.expectEqualStrings("aaaaaaaaaa***-**-****bbbbbbbbbb***-**-****cccccccccc***-**-****ddddddddddeeeeee", &buf);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked SSN Redaction Tests
+// ---------------------------------------------------------------------------
+
+/// Test helper: run chunked SSN redaction on `input` using the given chunk size,
+/// collecting all output (finalized + emitted + flush) into one contiguous buffer.
+fn runChunkedSsn(input: []const u8, chunk_size: usize, allocator: std.mem.Allocator) ![]u8 {
+    const buf = try allocator.dupe(u8, input);
+    defer allocator.free(buf);
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var state = SsnChunkState{};
+    var offset: usize = 0;
+
+    while (offset < buf.len) {
+        const end = @min(offset + chunk_size, buf.len);
+        const result = redactSsnChunked(buf[offset..end], &state);
+        try output.appendSlice(allocator, result.finalized);
+        try output.appendSlice(allocator, result.emitted);
+        offset = end;
+    }
+
+    // Flush remaining pending bytes.
+    const flushed = state.flush();
+    try output.appendSlice(allocator, flushed);
+
+    return try output.toOwnedSlice(allocator);
+}
+
+test "redactSsnChunked - SSN fully within one chunk" {
+    const allocator = std.testing.allocator;
+    const result = try runChunkedSsn("Hello 123-45-6789 world", 64, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello ***-**-**** world", result);
+}
+
+test "redactSsnChunked - SSN split across two chunks at every boundary" {
+    const allocator = std.testing.allocator;
+    const ssn = "123-45-6789";
+
+    // Reference: single-pass redaction
+    var reference = "123-45-6789".*;
+    redactSsn(&reference);
+
+    // Split at every possible byte boundary (chunk size = split offset)
+    for (1..11) |split| {
+        const result = try runChunkedSsn(ssn, split, allocator);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings(&reference, result);
+    }
+}
+
+test "redactSsnChunked - no SSNs across multiple chunks" {
+    const allocator = std.testing.allocator;
+    const result = try runChunkedSsn("Hello world, this has no sensitive data.", 13, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello world, this has no sensitive data.", result);
+}
+
+test "redactSsnChunked - equivalence vs single-pass on 1 MB payload" {
+    const allocator = std.testing.allocator;
+    const payload_size = 1024 * 1024;
+
+    // Build reference payload — SSNs planted every 100 bytes.
+    const reference = try allocator.alloc(u8, payload_size);
+    defer allocator.free(reference);
+    @memset(reference, 'a');
+    {
+        var pos: usize = 50;
+        while (pos + 11 <= payload_size) {
+            @memcpy(reference[pos..][0..11], "123-45-6789");
+            pos += 100;
+        }
+    }
+
+    // Single-pass result
+    const single_buf = try allocator.dupe(u8, reference);
+    defer allocator.free(single_buf);
+    redactSsn(single_buf);
+
+    // Chunked result — process in 64-byte chunks
+    const chunked_result = try runChunkedSsn(reference, 64, allocator);
+    defer allocator.free(chunked_result);
+
+    try std.testing.expectEqualStrings(single_buf, chunked_result);
 }
 
 // ---------------------------------------------------------------------------

@@ -3,12 +3,23 @@ const redact = @import("redact.zig");
 const entity_mask = @import("entity_mask.zig");
 const fuzzy_match = @import("fuzzy_match.zig");
 
+/// Write a formatted string to stdout (bypasses stderr interleaving on Windows).
+fn println(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    const handle = std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE) catch return;
+    var written: u32 = 0;
+    _ = std.os.windows.kernel32.WriteFile(handle, text.ptr, @intCast(text.len), &written, null);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("\n=== NanoMask Pipeline Benchmarks ===\n\n", .{});
+    println("", .{});
+    println("=== NanoMask Pipeline Benchmarks ===", .{});
+    println("", .{});
 
     // --- Stage 1: SIMD SSN Redaction ---
     {
@@ -25,7 +36,6 @@ pub fn main() !void {
         const iterations = 100;
         var run: usize = 0;
         while (run < iterations) : (run += 1) {
-            // Reset SSNs for each iteration (redactSsn mutates in-place)
             pos = 0;
             while (pos + 11 <= payload_size) : (pos += 100) {
                 const ssn = "123-45-6789";
@@ -37,7 +47,7 @@ pub fn main() !void {
         const total_bytes = payload_size * iterations;
         const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
             @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
-        std.debug.print("Stage 1 | SIMD SSN Redaction  | {d:>8.1} MB/s | {d:>4} iterations x {d} bytes\n", .{
+        println("Stage 1 | SIMD SSN Redaction  | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
             mb_per_sec, iterations, payload_size,
         });
     }
@@ -73,7 +83,7 @@ pub fn main() !void {
         const total_bytes = payload_size * iterations;
         const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
             @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
-        std.debug.print("Stage 2 | Aho-Corasick Mask   | {d:>8.1} MB/s | {d:>4} iterations x {d} bytes\n", .{
+        println("Stage 2 | Aho-Corasick Mask   | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
             mb_per_sec, iterations, payload_size,
         });
     }
@@ -112,10 +122,11 @@ pub fn main() !void {
         const total_bytes = payload_size * iterations;
         const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
             @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
-        std.debug.print("Stage 3 | Myers' Fuzzy Match  | {d:>8.1} MB/s | {d:>4} iterations x {d} bytes\n", .{
+        println("Stage 3 | Myers' Fuzzy Match  | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
             mb_per_sec, iterations, payload_size,
         });
     }
 
-    std.debug.print("\n===================================\n", .{});
+    println("", .{});
+    println("===================================", .{});
 }
