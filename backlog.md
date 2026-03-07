@@ -1,6 +1,6 @@
 # NanoMask — Backlog
 
-> **Status**: Phase 2 complete (3-stage pipeline + connection pooling ✅). Chunked SSN redaction (2.1) ✅ complete. Phase 3 Epics 1-2 (remaining tickets), Phase 4 (Production Readiness), and Phase 5 (Competitive Moat) are open.
+> **Status**: Phase 2 complete (3-stage pipeline + connection pooling ✅). Chunked SSN redaction (2.1) ✅ complete. Epic 3 (Configuration) ✅ complete. Epic 4.1 (TLS listener) ✅ complete. Phase 3 Epics 1-2 (remaining tickets), Phase 4 (remaining), and Phase 5 (Competitive Moat) are open.
 
 ---
 
@@ -253,7 +253,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 > **In plain English:** TLS is the "padlock icon" — it encrypts all data flowing to and from the proxy. Without it, anyone on the network can read patient data in transit. This is a hard legal requirement in healthcare and government — NanoMask literally cannot be deployed without it.
 
-#### 4.1 — TLS termination on the listener
+#### ✅ 4.1 — TLS termination on the listener
 
 **Type**: Feature  
 **Estimate**: 2–3 days  

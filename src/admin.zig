@@ -180,7 +180,7 @@ fn handlePost(
 
     // Merge with existing names (deduplicate via HashMap for O(1) lookups)
     const es = entity_set orelse {
-        try sendJsonResponse(request, .@"internal server error", "{\"error\":\"entity set not initialized\"}");
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"entity set not initialized\"}");
         return;
     };
 
@@ -247,7 +247,7 @@ fn handleDelete(
     }
 
     const es = entity_set orelse {
-        try sendJsonResponse(request, .@"internal server error", "{\"error\":\"entity set not initialized\"}");
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"entity set not initialized\"}");
         return;
     };
 
@@ -304,7 +304,7 @@ fn handlePut(
     }
 
     const es = entity_set orelse {
-        try sendJsonResponse(request, .@"internal server error", "{\"error\":\"entity set not initialized\"}");
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"entity set not initialized\"}");
         return;
     };
 
@@ -365,10 +365,9 @@ fn syncToFile(path: []const u8, names: []const []const u8) !void {
     var file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
 
-    const writer = file.writer();
     for (names) |name| {
-        try writer.writeAll(name);
-        try writer.writeByte('\n');
+        try file.writeAll(name);
+        try file.writeAll("\n");
     }
 }
 

@@ -26,8 +26,8 @@ const ThreadContext = struct {
     http_client: *std.http.Client,
     active_connections: *std.atomic.Value(u32),
     admin_config: admin.AdminConfig,
-    /// TODO: Wire into handleConnection to perform TLS handshake on accepted
-    /// streams once the TlsContext.accept() method is implemented.
+    /// Optional TLS context — when present, each accepted connection performs
+    /// a TLS 1.3 handshake before HTTP processing.
     tls_context: ?*tls_mod.TlsContext,
 };
 
@@ -51,7 +51,21 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     var stream_reader = connection.stream.reader(&read_buf);
     var stream_writer = connection.stream.writer(&write_buf);
 
-    var server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
+    // TLS handshake: wrap the raw stream with encrypted reader/writer
+    var tls_stream_buf: [32 * 1024]u8 = undefined;
+    var tls_stream: ?tls_mod.TlsServerStream = null;
+    const raw_reader_iface = stream_reader.interface();
+    if (ctx.tls_context) |tls_ctx| {
+        tls_stream = tls_mod.accept(tls_ctx, raw_reader_iface, &stream_writer.interface, &tls_stream_buf) catch |err| {
+            std.debug.print("[ERR] TLS handshake failed: {}\n", .{err});
+            return;
+        };
+    }
+
+    // Use TLS stream reader/writer if handshake succeeded, otherwise raw stream
+    var final_reader: std.Io.Reader = if (tls_stream) |*ts| ts.reader().* else raw_reader_iface.*;
+    var final_writer: std.Io.Writer = if (tls_stream) |*ts| ts.writer().* else stream_writer.interface;
+    var server = std.http.Server.init(&final_reader, &final_writer);
 
     var request = server.receiveHead() catch |err| {
         std.debug.print("[ERR] Receiving head: {}\n", .{err});
@@ -240,7 +254,7 @@ pub fn main() !void {
         std.debug.print("Admin API: disabled\n", .{});
     }
     if (tls_enabled) {
-        std.debug.print("TLS: certificate loaded (handshake not yet wired — traffic is still plaintext)\n", .{});
+        std.debug.print("TLS: enabled (TLS 1.3, AES-128-GCM-SHA256)\n", .{});
     } else {
         std.debug.print("WARNING: running without TLS -- not suitable for production\n", .{});
     }

@@ -218,14 +218,20 @@ See [`architecture.md`](architecture.md) for the full technical design and [`bac
 
 ```
 src/
-├── main.zig          # Entry point, server setup, thread management
-├── proxy.zig         # HTTP proxy handler, pipeline orchestration
-├── redact.zig        # Stage 1: SIMD SSN redaction
-├── entity_mask.zig   # Stage 2: Aho-Corasick entity masking/unmasking
-├── fuzzy_match.zig   # Stage 3: Fuzzy name matching (Myers' + trigram filter)
-├── bench.zig         # Standalone benchmark runner
-├── root.zig          # Module root for test discovery
-└── test_reader.zig   # Test utilities
+├── main.zig                  # Entry point, server setup, thread management
+├── proxy.zig                 # HTTP proxy handler, pipeline orchestration
+├── redact.zig                # Stage 1: SIMD SSN redaction
+├── entity_mask.zig           # Stage 2: Aho-Corasick entity masking/unmasking
+├── fuzzy_match.zig           # Stage 3: Fuzzy name matching (Myers' + trigram filter)
+├── config.zig                # CLI + env var configuration with precedence chain
+├── versioned_entity_set.zig  # RCU-managed entity set for hot-reload
+├── file_watcher.zig          # Poll-based entity file watcher for hot-reload
+├── admin.zig                 # REST API for entity management (/_admin/entities)
+├── tls.zig                   # TLS 1.3 server handshake, record layer, encrypted I/O
+├── http_util.zig             # HTTP response helpers
+├── bench.zig                 # Standalone benchmark runner
+├── root.zig                  # Module root for test discovery
+└── test_reader.zig           # Test utilities
 ```
 
 ## Testing
@@ -258,8 +264,16 @@ NanoMask supports a strict configuration precedence:
 | Fuzzy threshold | `--fuzzy-threshold` | `NANOMASK_FUZZY_THRESHOLD`| `0.80` (80%) | Minimum similarity for fuzzy match |
 | Max connections | `--max-connections` | `NANOMASK_MAX_CONNECTIONS`| `128` | Concurrent connection limit |
 | Log level | `--log-level` | `NANOMASK_LOG_LEVEL` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
+| Watch interval | `--watch-interval` | `NANOMASK_WATCH_INTERVAL` | `1000` | Entity file poll interval in ms |
+| Admin API | `--admin-api` | `NANOMASK_ADMIN_API` | disabled | Enable `/_admin/entities` REST endpoints |
+| Admin token | `--admin-token` | `NANOMASK_ADMIN_TOKEN` | none | Require Bearer token for admin endpoints |
+| Entity sync | `--entity-file-sync` | `NANOMASK_ENTITY_FILE_SYNC` | disabled | Write API entity changes back to entity file |
+| TLS certificate | `--tls-cert` | `NANOMASK_TLS_CERT` | none | PEM certificate file for TLS (requires `--tls-key`) |
+| TLS private key | `--tls-key` | `NANOMASK_TLS_KEY` | none | PEM private key file for TLS (requires `--tls-cert`) |
 
 *Note: Per-request `X-ZPG-Entities` header overrides the entity names loaded from the file or compiled defaults.*
+
+> **TLS**: When both `--tls-cert` and `--tls-key` are provided, NanoMask performs a full TLS 1.3 handshake on each accepted connection using AES-128-GCM-SHA256 with X25519 key exchange. The encrypted reader/writer wraps the raw socket transparently — the HTTP server and redaction pipeline operate on plaintext. Supports ECDSA P-256 and Ed25519 private keys in PKCS#8 PEM format.
 
 ## License
 
