@@ -2,17 +2,18 @@ const std = @import("std");
 const http = std.http;
 const redact = @import("redact.zig");
 
-pub fn handleRequest(allocator: std.mem.Allocator, request: *http.Server.Request, target_host: []const u8, target_port: u16) !void {
+/// Maximum length for the constructed target URL (stack-allocated).
+const max_url_len = 512;
+
+pub fn handleRequest(allocator: std.mem.Allocator, request: *http.Server.Request, client: *std.http.Client, target_host: []const u8, target_port: u16) !void {
     const method = request.head.method;
     const uri_str = request.head.target;
 
     std.debug.print("[PRX] {s} {s}\n", .{ @tagName(method), uri_str });
 
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const target_url_str = try std.fmt.allocPrint(allocator, "http://{s}:{d}{s}", .{ target_host, target_port, uri_str });
-    defer allocator.free(target_url_str);
+    // Stack-allocated URL construction — zero heap allocs per request.
+    var url_buf: [max_url_len]u8 = undefined;
+    const target_url_str = try std.fmt.bufPrint(&url_buf, "http://{s}:{d}{s}", .{ target_host, target_port, uri_str });
 
     const target_uri = try std.Uri.parse(target_url_str);
 

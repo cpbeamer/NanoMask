@@ -19,12 +19,15 @@ pub fn main() !void {
     });
     defer net_server.deinit();
 
+    // Persistent HTTP client — reused across all requests for connection pooling.
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
     while (true) {
         var connection = net_server.accept() catch |err| {
             std.debug.print("Error accepting connection: {}\n", .{err});
             continue;
         };
-        // Explicitly handle sequentially for MVP
         defer connection.stream.close();
 
         var read_buf: [16 * 1024]u8 = undefined;
@@ -40,7 +43,7 @@ pub fn main() !void {
             continue;
         };
 
-        proxy.handleRequest(allocator, &request, target_host, target_port) catch |err| {
+        proxy.handleRequest(allocator, &request, &client, target_host, target_port) catch |err| {
             std.debug.print("Error handling request: {}\n", .{err});
         };
     }
