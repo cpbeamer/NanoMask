@@ -1,0 +1,40 @@
+🎉 NanoMask has been deployed!
+
+Get the proxy URL:
+{{- if eq .Values.service.type "ClusterIP" }}
+  kubectl port-forward svc/{{ include "nanomask.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+{{- else if eq .Values.service.type "NodePort" }}
+  export NODE_PORT=$(kubectl get svc {{ include "nanomask.fullname" . }} -o jsonpath='{.spec.ports[0].nodePort}')
+  export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+  echo "http://$NODE_IP:$NODE_PORT"
+{{- else if eq .Values.service.type "LoadBalancer" }}
+  export SERVICE_IP=$(kubectl get svc {{ include "nanomask.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  echo "http://$SERVICE_IP:{{ .Values.service.port }}"
+{{- end }}
+
+Verify the proxy is healthy:
+{{- if eq .Values.service.type "ClusterIP" }}
+  curl http://localhost:{{ .Values.service.port }}/healthz
+{{- else if eq .Values.service.type "NodePort" }}
+  curl http://$NODE_IP:$NODE_PORT/healthz
+{{- else if eq .Values.service.type "LoadBalancer" }}
+  curl http://$SERVICE_IP:{{ .Values.service.port }}/healthz
+{{- end }}
+
+Forwarding traffic to: {{ .Values.proxy.targetHost }}:{{ .Values.proxy.targetPort }}
+{{- if .Values.proxy.targetTls }} (TLS enabled){{ end }}
+
+{{- if .Values.adminApi.enabled }}
+
+Admin API is enabled:
+  curl http://localhost:{{ .Values.service.port }}/_admin/entities
+{{- end }}
+
+{{- if .Values.entities.data }}
+
+Entity list loaded from ConfigMap ({{ include "nanomask.fullname" . }}-entities).
+{{- else }}
+
+⚠️  No entity list configured — running in SSN-only redaction mode.
+    Set entities.data in values.yaml to enable entity masking.
+{{- end }}

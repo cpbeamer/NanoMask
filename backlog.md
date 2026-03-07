@@ -433,7 +433,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 6.2 — Helm chart + K8s manifests
+#### ✅ 6.2 — Helm chart + K8s manifests
 
 **Type**: Feature  
 **Estimate**: 1–2 days  

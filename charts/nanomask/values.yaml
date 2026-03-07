@@ -1,0 +1,111 @@
+# -- Number of NanoMask pod replicas.
+replicaCount: 1
+
+image:
+  # -- Container image repository.
+  repository: nanomask
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion).
+  tag: ""
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override the release name prefix.
+nameOverride: ""
+# -- Override the full release name.
+fullnameOverride: ""
+
+# ── Proxy configuration ──────────────────────────────────────────────
+proxy:
+  # -- Port NanoMask listens on inside the container.
+  listenPort: 8081
+  # -- Upstream target hostname.
+  targetHost: httpbin.org
+  # -- Upstream target port.
+  targetPort: 80
+  # -- Enable TLS for upstream connections.
+  targetTls: false
+  # -- Suppress system CA bundle loading.
+  # When using tls.caData for self-signed certs, also set this to true.
+  tlsNoSystemCa: false
+  # -- Fuzzy match similarity threshold (0.0–1.0).
+  fuzzyThreshold: 0.8
+  # -- Maximum concurrent connections.
+  maxConnections: 128
+  # -- Log verbosity: debug, info, warn, error.
+  logLevel: info
+  # -- Enable detailed redaction audit events.
+  auditLog: false
+  # -- Maximum request body size in bytes (default 10 MB).
+  maxBodySize: 10485760
+
+# ── Admin API ────────────────────────────────────────────────────────
+adminApi:
+  # -- Enable the /_admin/entities REST API.
+  enabled: false
+  # -- Bearer token required for admin endpoints (leave empty to disable auth).
+  token: ""
+
+# ── Entity list ──────────────────────────────────────────────────────
+entities:
+  # -- Newline-delimited entity names to redact (mounted as a ConfigMap).
+  # Leave empty to run in SSN-only mode.
+  data: ""
+
+# ── Listener TLS (client → NanoMask) ─────────────────────────────────
+tls:
+  # -- Enable TLS termination on the listener.
+  enabled: false
+  # -- Base64-encoded PEM certificate.
+  certData: ""
+  # -- Base64-encoded PEM private key.
+  keyData: ""
+  # -- Base64-encoded custom CA bundle PEM for upstream verification.
+  # When set, also enable proxy.tlsNoSystemCa to suppress the default CA bundle.
+  caData: ""
+
+# ── Kubernetes resources ─────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 64Mi
+
+# ── Pod security context (applied at pod level) ─────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+
+# ── Container security context ──────────────────────────────────────
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# ── Service ──────────────────────────────────────────────────────────
+service:
+  # -- Service type.
+  type: ClusterIP
+  # -- Service port (maps to proxy.listenPort).
+  port: 8081
+
+# ── Network policy ───────────────────────────────────────────────────
+networkPolicy:
+  # -- Create a NetworkPolicy restricting egress to the upstream and DNS.
+  enabled: true
+  # -- Optional CIDR to restrict upstream egress (e.g. "10.0.0.0/8").
+  # Leave empty to allow egress to any IP on the target port.
+  egressCIDR: ""
+
+# ── Node scheduling ─────────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}

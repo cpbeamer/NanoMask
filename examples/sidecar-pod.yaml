@@ -1,0 +1,86 @@
+# Example: NanoMask as a sidecar proxy
+#
+# The application container sends requests to localhost:8081 (NanoMask).
+# NanoMask scrubs PII and forwards to the real upstream API.
+# Both containers share the same network namespace (default in K8s pods).
+#
+# Usage:
+#   kubectl apply -f examples/sidecar-pod.yaml
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-nanomask
+  labels:
+    app: app-with-nanomask
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    # ── Your application container ──────────────────────────────────────
+    - name: app
+      image: curlimages/curl:latest
+      # Example: continuously send a request through NanoMask every 10s.
+      command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            echo "Sending request through NanoMask sidecar..."
+            curl -s -X POST http://localhost:8081/post \
+              -H "Content-Type: application/json" \
+              -d '{"patient": "Jane Smith", "ssn": "123-45-6789", "notes": "Routine checkup"}'
+            echo ""
+            sleep 10
+          done
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+    # ── NanoMask sidecar ────────────────────────────────────────────────
+    - name: nanomask
+      image: nanomask:0.1.0
+      env:
+        - name: NANOMASK_LISTEN_PORT
+          value: "8081"
+        - name: NANOMASK_TARGET_HOST
+          value: httpbin.org
+        - name: NANOMASK_TARGET_PORT
+          value: "80"
+        - name: NANOMASK_LOG_LEVEL
+          value: info
+      ports:
+        - containerPort: 8081
+          protocol: TCP
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8081
+        initialDelaySeconds: 5
+        periodSeconds: 15
+        timeoutSeconds: 3
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /healthz
+          port: 8081
+        initialDelaySeconds: 2
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 2
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
