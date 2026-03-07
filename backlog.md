@@ -82,6 +82,8 @@
 
 > ✅ **2.3 — Chunk-aware fuzzy matching**: Complete. `FuzzyMatcher.fuzzyRedactChunked()` processes multi-word boundary overlaps and translates local chunk coordinates with no performance penalty relative to raw baseline speeds (319 MB/s).
 
+> ✅ **2.4 — Streaming proxy pipeline**: Complete. Implemented bidrectional streamed chunking and processing in `proxy.zig` and bound memory footprint to strictly < 64KB per connection.
+
 ---
 
 #### 2.4 — Streaming proxy pipeline
