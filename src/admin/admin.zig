@@ -1,10 +1,10 @@
 const std = @import("std");
 const http = std.http;
 const mem = std.mem;
-const versioned_entity_set = @import("versioned_entity_set.zig");
+const versioned_entity_set = @import("../entity/versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const EntitySnapshot = versioned_entity_set.EntitySnapshot;
-const http_util = @import("http_util.zig");
+const http_util = @import("../net/http_util.zig");
 
 // ---------------------------------------------------------------------------
 // Admin API — REST endpoints for runtime entity management

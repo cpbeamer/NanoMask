@@ -1,15 +1,15 @@
 const std = @import("std");
 const http = std.http;
-const redact = @import("redact.zig");
-const entity_mask = @import("entity_mask.zig");
-const fuzzy_match = @import("fuzzy_match.zig");
-const admin = @import("admin.zig");
-const versioned_entity_set = @import("versioned_entity_set.zig");
+const redact = @import("../redaction/redact.zig");
+const entity_mask = @import("../redaction/entity_mask.zig");
+const fuzzy_match = @import("../redaction/fuzzy_match.zig");
+const admin = @import("../admin/admin.zig");
+const versioned_entity_set = @import("../entity/versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const http_util = @import("http_util.zig");
-const config_mod = @import("config.zig");
+const config_mod = @import("../infra/config.zig");
 const Config = config_mod.Config;
-const logger_mod = @import("logger.zig");
+const logger_mod = @import("../infra/logger.zig");
 const Logger = logger_mod.Logger;
 
 /// Maximum length for the constructed target URL (stack-allocated).

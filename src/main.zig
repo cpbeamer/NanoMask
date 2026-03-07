@@ -1,17 +1,17 @@
 const std = @import("std");
-const proxy = @import("proxy.zig");
-const entity_mask = @import("entity_mask.zig");
-const fuzzy_match = @import("fuzzy_match.zig");
-const config = @import("config.zig");
+const proxy = @import("net/proxy.zig");
+const entity_mask = @import("redaction/entity_mask.zig");
+const fuzzy_match = @import("redaction/fuzzy_match.zig");
+const config = @import("infra/config.zig");
 const Config = config.Config;
-const versioned_entity_set = @import("versioned_entity_set.zig");
+const versioned_entity_set = @import("entity/versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const EntitySnapshot = versioned_entity_set.EntitySnapshot;
-const file_watcher = @import("file_watcher.zig");
+const file_watcher = @import("entity/file_watcher.zig");
 const FileWatcher = file_watcher.FileWatcher;
-const admin = @import("admin.zig");
-const tls_mod = @import("tls.zig");
-const logger_mod = @import("logger.zig");
+const admin = @import("admin/admin.zig");
+const tls_mod = @import("crypto/tls.zig");
+const logger_mod = @import("infra/logger.zig");
 const Logger = logger_mod.Logger;
 
 const ThreadContext = struct {

@@ -28,7 +28,7 @@ The proxy intercepts the HTTP transaction in a bidirectional pipeline:
 2.  **De-pseudonymization**: Entity unmasking (aliases→names) restores original identifiers.
 3.  **Relay**: The restored response is sent back to the client.
 
-## 3. Redaction Rule Engine (`src/redact.zig`)
+## 3. Redaction Rule Engine (`src/redaction/redact.zig`)
 
 The core privacy mechanism lives in an isolated engine module.
 
@@ -48,7 +48,7 @@ For streaming proxy scenarios where the full body is not available at once, `red
 *   A `flush()` method emits the final pending bytes at end-of-stream.
 *   Correctness is verified by a 1 MB fuzz-equivalence test (chunked output == single-pass output for 64-byte chunks).
 
-## 4. Entity Masking Engine (`src/entity_mask.zig`)
+## 4. Entity Masking Engine (`src/redaction/entity_mask.zig`)
 
 The entity masking engine provides dictionary-based name pseudonymization for PII/PHI de-identification — critical for healthcare and government use cases where names (not just SSNs) must be removed before payloads reach LLM APIs.
 
@@ -72,7 +72,7 @@ X-ZPG-Entities: John Doe, Dr. Smith, Jane Williams
 ```
 If present, a per-request `EntityMap` is built from the header values. Otherwise, the session-level default is used.
 
-## 5. Fuzzy Name Matching Engine (`src/fuzzy_match.zig`)
+## 5. Fuzzy Name Matching Engine (`src/redaction/fuzzy_match.zig`)
 
 Stage 3 of the redaction pipeline provides OCR-resilient name matching, catching corrupted or variant name forms that slip past the deterministic Aho-Corasick engine (e.g. "J0hn Doe", "Mr. Doe", "John E. Doe").
 

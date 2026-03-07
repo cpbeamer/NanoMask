@@ -1,14 +1,14 @@
 //! By convention, root.zig is the root source file when making a library.
 //! Re-exports the core NanoMask modules for consumers.
-pub const redact = @import("redact.zig");
-pub const entity_mask = @import("entity_mask.zig");
-pub const fuzzy_match = @import("fuzzy_match.zig");
-pub const versioned_entity_set = @import("versioned_entity_set.zig");
-pub const config = @import("config.zig");
-pub const file_watcher = @import("file_watcher.zig");
-pub const admin = @import("admin.zig");
-pub const tls_server = @import("tls.zig");
-pub const logger = @import("logger.zig");
+pub const redact = @import("redaction/redact.zig");
+pub const entity_mask = @import("redaction/entity_mask.zig");
+pub const fuzzy_match = @import("redaction/fuzzy_match.zig");
+pub const versioned_entity_set = @import("entity/versioned_entity_set.zig");
+pub const config = @import("infra/config.zig");
+pub const file_watcher = @import("entity/file_watcher.zig");
+pub const admin = @import("admin/admin.zig");
+pub const tls_server = @import("crypto/tls.zig");
+pub const logger = @import("infra/logger.zig");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -21,5 +21,5 @@ test {
     _ = admin;
     _ = tls_server;
     _ = logger;
-    _ = @import("http_util.zig");
+    _ = @import("net/http_util.zig");
 }

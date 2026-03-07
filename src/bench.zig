@@ -1,7 +1,7 @@
 const std = @import("std");
-const redact = @import("redact.zig");
-const entity_mask = @import("entity_mask.zig");
-const fuzzy_match = @import("fuzzy_match.zig");
+const redact = @import("redaction/redact.zig");
+const entity_mask = @import("redaction/entity_mask.zig");
+const fuzzy_match = @import("redaction/fuzzy_match.zig");
 
 /// Write a formatted string to stderr via std.debug.print for reliable output.
 fn println(comptime fmt: []const u8, args: anytype) void {

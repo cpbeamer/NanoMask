@@ -1,6 +1,6 @@
 const std = @import("std");
-const entity_mask = @import("entity_mask.zig");
-const fuzzy_match = @import("fuzzy_match.zig");
+const entity_mask = @import("../redaction/entity_mask.zig");
+const fuzzy_match = @import("../redaction/fuzzy_match.zig");
 
 // ---------------------------------------------------------------------------
 // Versioned Entity Set — RCU (Read-Copy-Update) for hot-reload
