@@ -4,13 +4,19 @@ const entity_mask = @import("entity_mask.zig");
 const fuzzy_match = @import("fuzzy_match.zig");
 const config = @import("config.zig");
 const Config = config.Config;
+const versioned_entity_set = @import("versioned_entity_set.zig");
+const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
+const EntitySnapshot = versioned_entity_set.EntitySnapshot;
+const file_watcher = @import("file_watcher.zig");
+const FileWatcher = file_watcher.FileWatcher;
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
     target_host: []const u8,
     target_port: u16,
-    entity_map: ?*const entity_mask.EntityMap,
-    fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+    /// RCU-managed entity set — `null` when running in SSN-only mode.
+    /// Handler threads call acquire() at request start and release() when done.
+    entity_set: ?*VersionedEntitySet,
     /// Shared HTTP client with built-in thread-safe connection pool.
     /// The stdlib ConnectionPool uses std.Thread.Mutex internally,
     /// so concurrent acquire/release from handler threads is safe.
@@ -25,6 +31,14 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         _ = ctx.active_connections.fetchSub(1, .release);
     }
 
+    // Acquire a snapshot at the start of the request. This is lock-free —
+    // just an atomic load + fetchAdd. The snapshot stays valid for the
+    // entire request even if a hot-reload swaps the active version.
+    const snapshot: ?*EntitySnapshot = if (ctx.entity_set) |es| es.acquire() else null;
+    defer if (snapshot) |snap| {
+        if (ctx.entity_set) |es| es.release(snap);
+    };
+
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
 
@@ -38,14 +52,18 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         return;
     };
 
+    // Extract entity_map and fuzzy_matcher from the snapshot for the proxy
+    const em: ?*const entity_mask.EntityMap = if (snapshot) |s| &s.entity_map else null;
+    const fm: ?*const fuzzy_match.FuzzyMatcher = if (snapshot) |s| &s.fuzzy_matcher else null;
+
     proxy.handleRequest(
         ctx.allocator,
         &request,
         ctx.http_client,
         ctx.target_host,
         ctx.target_port,
-        ctx.entity_map,
-        ctx.fuzzy_matcher,
+        em,
+        fm,
     ) catch |err| {
         std.debug.print("[ERR] Proxy request failed: {}\n", .{err});
     };
@@ -84,65 +102,61 @@ pub fn main() !void {
     std.debug.print("  fuzzy_threshold={d:.2} (from {s})\n", .{ cfg.fuzzy_threshold, cfg.fuzzy_threshold_src.asStr() });
     std.debug.print("  max_connections={d} (from {s})\n", .{ cfg.max_connections, cfg.max_connections_src.asStr() });
     std.debug.print("  log_level={s} (from {s})\n", .{ @tagName(cfg.log_level), cfg.log_level_src.asStr() });
+    std.debug.print("  watch_interval_ms={d} (from {s})\n", .{ cfg.watch_interval_ms, cfg.watch_interval_ms_src.asStr() });
     std.debug.print("\n", .{});
 
-    // --- Entity Masking Setup ---
-    var loaded_names: ?[][]const u8 = null;
-    var entity_map_alloc: ?entity_mask.EntityMap = null;
-    var fuzzy_matcher_alloc: ?fuzzy_match.FuzzyMatcher = null;
+    // --- Entity Masking Setup (RCU) ---
+    var entity_set_alloc: ?VersionedEntitySet = null;
+    var watcher: ?FileWatcher = null;
 
     defer {
-        if (fuzzy_matcher_alloc) |*fm| fm.deinit();
-        if (entity_map_alloc) |*em| em.deinit();
-        if (loaded_names) |names| {
-            for (names) |name| allocator.free(name);
-            allocator.free(names);
-        }
+        if (watcher) |*w| w.stop();
+        if (entity_set_alloc) |*es| es.deinit();
     }
 
     if (cfg.entity_file) |ef| {
-        var file = std.fs.cwd().openFile(ef, .{}) catch |err| {
-            std.debug.print("error: cannot open entity file '{s}': {s}\n", .{ ef, @errorName(err) });
+        const initial_snapshot = versioned_entity_set.loadSnapshotFromFile(
+            ef,
+            cfg.fuzzy_threshold,
+            1,
+            allocator,
+        ) catch {
             std.process.exit(1);
         };
-        defer file.close();
-        
-        const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
-        defer allocator.free(content);
 
-        var names_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer names_list.deinit(allocator);
+        std.debug.print("loaded {} entities from {s}\n", .{ initial_snapshot.loaded_names.len, ef });
 
-        var line_it = std.mem.splitScalar(u8, content, '\n');
-        while (line_it.next()) |line| {
-            const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r"), " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == '#') continue;
-            try names_list.append(allocator, try allocator.dupe(u8, trimmed));
-        }
+        entity_set_alloc = VersionedEntitySet.init(initial_snapshot);
 
-        loaded_names = try names_list.toOwnedSlice(allocator);
-        entity_map_alloc = try entity_mask.EntityMap.init(allocator, loaded_names.?);
-        
-        fuzzy_matcher_alloc = try fuzzy_match.FuzzyMatcher.init(
-            allocator,
-            entity_map_alloc.?.getRawNames(),
-            entity_map_alloc.?.getAliases(),
+        // Start watching the entity file for changes (hot-reload via RCU)
+        watcher = FileWatcher.init(
+            ef,
+            cfg.watch_interval_ms,
+            &entity_set_alloc.?,
             cfg.fuzzy_threshold,
+            allocator,
         );
-        std.debug.print("loaded {} entities from {s}\n", .{ loaded_names.?.len, ef });
+        watcher.?.start() catch |err| {
+            std.debug.print("[WARN] Failed to start file watcher: {} — hot-reload disabled\n", .{err});
+            watcher = null;
+        };
     } else {
         std.debug.print("WARNING: No entity file provided. Running in SSN-only mode unless X-ZPG-Entities header is present on requests.\n", .{});
     }
 
     std.debug.print("Listening on http://127.0.0.1:{}\n", .{cfg.listen_port});
     std.debug.print("Forwarding to http://{s}:{}\n", .{ cfg.target_host, cfg.target_port });
-    
-    if (loaded_names) |names| {
-        std.debug.print("Entity masking: {} session names loaded\n", .{ names.len });
-        std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher_alloc.?.variants.len, cfg.fuzzy_threshold * 100.0 });
+
+    if (entity_set_alloc) |*es| {
+        const snap = es.acquire();
+        defer es.release(snap);
+        std.debug.print("Entity masking: {} session names loaded (v{})\n", .{ snap.loaded_names.len, snap.version });
+        std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ snap.fuzzy_matcher.variants.len, cfg.fuzzy_threshold * 100.0 });
+        std.debug.print("Hot-reload: enabled (polling every {}ms)\n", .{cfg.watch_interval_ms});
     } else {
         std.debug.print("Entity masking: disabled (SSN-only mode)\n", .{});
         std.debug.print("Fuzzy matching: disabled (SSN-only mode)\n", .{});
+        std.debug.print("Hot-reload: disabled (no entity file)\n", .{});
     }
 
     std.debug.print("Connection pool: shared client with keep-alive (up to 32 upstream connections)\n", .{});
@@ -170,8 +184,7 @@ pub fn main() !void {
         .allocator = allocator,
         .target_host = cfg.target_host,
         .target_port = cfg.target_port,
-        .entity_map = if (entity_map_alloc) |*em| em else null,
-        .fuzzy_matcher = if (fuzzy_matcher_alloc) |*fm| fm else null,
+        .entity_set = if (entity_set_alloc) |*es| es else null,
         .http_client = &http_client,
         .active_connections = &active_connections,
     };

@@ -44,6 +44,9 @@ pub const Config = struct {
     max_connections_src: ConfigSource = .default,
     log_level: LogLevel = .info,
     log_level_src: ConfigSource = .default,
+    watch_interval_ms: u64 = 1000,
+    watch_interval_ms_src: ConfigSource = .default,
+
 
     allocator: std.mem.Allocator,
 
@@ -54,6 +57,7 @@ pub const Config = struct {
         InvalidThreshold,
         InvalidLogLevel,
         InvalidMaxConnections,
+        InvalidWatchInterval,
         EntityFileNotFound,
         UnknownFlag,
         OutOfMemory,
@@ -80,6 +84,7 @@ pub const Config = struct {
             \\  --fuzzy-threshold <f32>    Threshold for fuzzy matching (0.0 - 1.0) (default: 0.8)
             \\  --max-connections <u32>    Maximum concurrent connections (default: 128)
             \\  --log-level <level>        Logging level: debug, info, warn, error (default: info)
+            \\  --watch-interval <ms>      Entity file poll interval in ms (default: 1000)
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -132,6 +137,13 @@ pub const Config = struct {
                 return error.InvalidLogLevel;
             };
             config.log_level_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_WATCH_INTERVAL")) {
+            config.watch_interval_ms = std.fmt.parseInt(u64, value, 10) catch {
+                std.debug.print("error: NANOMASK_WATCH_INTERVAL must be a positive integer (ms), got '{s}'\n", .{value});
+                return error.InvalidWatchInterval;
+            };
+            if (config.watch_interval_ms == 0) return error.InvalidWatchInterval;
+            config.watch_interval_ms_src = .env_var;
         }
     }
 
@@ -150,6 +162,7 @@ pub const Config = struct {
             "NANOMASK_FUZZY_THRESHOLD",
             "NANOMASK_MAX_CONNECTIONS",
             "NANOMASK_LOG_LEVEL",
+            "NANOMASK_WATCH_INTERVAL",
         };
 
         for (env_keys) |key| {
@@ -263,6 +276,21 @@ pub const Config = struct {
                     return error.InvalidLogLevel;
                 };
                 config.log_level_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--watch-interval")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --watch-interval\n", .{});
+                    return error.MissingValue;
+                }
+                config.watch_interval_ms = std.fmt.parseInt(u64, args[i], 10) catch {
+                    std.debug.print("error: --watch-interval must be a positive integer (ms), got '{s}'\n", .{args[i]});
+                    return error.InvalidWatchInterval;
+                };
+                if (config.watch_interval_ms == 0) {
+                    std.debug.print("error: --watch-interval must be > 0\n", .{});
+                    return error.InvalidWatchInterval;
+                }
+                config.watch_interval_ms_src = .cli_flag;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -286,10 +314,8 @@ test "Config - parse valid arguments" {
         "--log-level", "debug",
     };
 
-    var out_buf: [1024]u8 = undefined;
-    var fba = std.io.fixedBufferStream(&out_buf);
 
-    var config = try Config.parse(std.testing.allocator, &args, fba.writer());
+    var config = try Config.parse(std.testing.allocator, &args);
     defer config.deinit();
 
     try testing.expectEqual(@as(u16, 9090), config.listen_port);

@@ -121,6 +121,8 @@
 
 **Goal**: Remove all hardcoded config from source code. Ops teams must be able to configure the proxy without recompilation.
 
+> **In plain English:** Settings like which port to run on or where to forward traffic are currently baked into the source code. This epic makes everything configurable from the outside so ops teams can adapt the proxy to their environment without touching code.
+
 #### ✅ 3.1 — CLI argument parsing
 
 **Type**: Feature  
@@ -138,6 +140,8 @@
 
 **Acceptance**: `zig-out/bin/nanomask --listen-port 9090 --target-host api.example.com --target-port 443` starts the proxy on port 9090 forwarding to `api.example.com:443`. `--help` prints complete usage. Invalid flags produce descriptive errors and exit with code 1.
 
+> **In plain English:** Lets you control the proxy through command-line flags when starting it. The most basic requirement for any deployable software — ops teams need to configure ports, targets, and settings without recompiling.
+
 ---
 
 #### ✅ 3.2 — Environment variable overrides
@@ -154,6 +158,8 @@
 - Unit tests: env var override with no CLI flag, CLI flag overrides env var, invalid env var values
 
 **Acceptance**: `NANOMASK_LISTEN_PORT=9090 zig build run` starts on port 9090. Adding `-- --listen-port 8080` overrides the env var. Startup log shows which source each config value came from.
+
+> **In plain English:** Lets you configure the proxy using environment variables (the standard way in Docker/Kubernetes). If both an env var and a CLI flag are set, the CLI flag wins. This is how every cloud-native app is configured.
 
 ---
 
@@ -173,6 +179,8 @@
 - Unit tests: file loading, comment skipping, whitespace trimming, missing file error, empty file handling, header override precedence
 
 **Acceptance**: Proxy loads 100+ entities from file and masks them correctly in proxied requests. Per-request `X-ZPG-Entities` header still overrides the file-loaded set. Missing file produces a clear error at startup.
+
+> **In plain English:** Lets you point the proxy at a text file of names to redact instead of sending them on every request. In production you might have hundreds of names — stuffing them into HTTP headers is impractical. A file can be mounted securely from a Kubernetes Secret.
 
 ---
 
@@ -205,6 +213,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: Modifying the entity file while the proxy is running triggers an automatic rebuild. Requests in flight during the rebuild complete successfully. The new automaton is active within 1 second of the file change. No requests are dropped or blocked. A corrupted entity file produces a warning but does not crash the proxy or reset the entity list.
 
+> **In plain English:** When you update the entity file (new patient admitted, employee leaves), the proxy automatically detects the change and rebuilds its search engine in the background. No restart needed, no requests dropped. Like changing a car’s tires while it’s still driving.
+
 ---
 
 #### 3.5 — Entity management REST API
@@ -231,6 +241,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: `curl -X POST localhost:8081/_admin/entities -d '{"add":["New Patient"]}' -H 'Authorization: Bearer <token>'` adds the entity. Subsequent proxied requests mask "New Patient". `GET /_admin/entities` shows the updated list. Rapid consecutive calls are debounced into a single rebuild. Unauthorized requests return 401.
 
+> **In plain English:** HTTP endpoints that let external systems (like an EHR) add or remove entity names in real-time. When a hospital admits a new patient, their EHR webhook calls this API and the proxy immediately starts redacting that name. No files to edit, no restarts.
+
 ---
 
 ### Epic 4: TLS Support
@@ -238,6 +250,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 **Goal**: Enable encrypted connections for GovCloud/HIPAA compliance. Without TLS, the proxy cannot be deployed in any regulated environment where data-in-transit encryption is mandated.
 
 **Context**: HIPAA §164.312(e)(1) requires encryption of ePHI in transit. FedRAMP SC-8 requires confidentiality of transmitted information. NanoMask currently operates over plaintext HTTP, making it non-compliant by default.
+
+> **In plain English:** TLS is the "padlock icon" — it encrypts all data flowing to and from the proxy. Without it, anyone on the network can read patient data in transit. This is a hard legal requirement in healthcare and government — NanoMask literally cannot be deployed without it.
 
 #### 4.1 — TLS termination on the listener
 
@@ -256,6 +270,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Benchmark: measure TLS handshake overhead per connection and throughput impact on the redaction pipeline
 
 **Acceptance**: `curl https://localhost:8081/healthz --cacert ca.pem` returns a valid response over TLS 1.3. `openssl s_client -connect localhost:8081` shows the correct certificate chain. Without cert/key flags, proxy starts in plaintext mode with a warning.
+
+> **In plain English:** Encrypts the connection between the application and NanoMask. HIPAA law literally requires this for health data in transit. Without it, the proxy would be flagged in any security audit.
 
 ---
 
@@ -276,6 +292,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: Proxy successfully forwards requests to `https://api.openai.com` with verified TLS. Custom CA file works for internal PKI. `--tls-skip-verify` logs a warning but connects to self-signed upstreams.
 
+> **In plain English:** Encrypts the connection from NanoMask to the upstream API (e.g., OpenAI). Most production APIs require HTTPS anyway, so without this the proxy simply can’t connect to them. The custom CA flag supports government networks that use their own certificate systems.
+
 ---
 
 ### Epic 5: Structured Logging & Audit Trail
@@ -283,6 +301,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 **Goal**: Provide compliance-grade logging for HIPAA, FedRAMP, and ATO audits. Every proxied request must be traceable, and every redaction event must be auditable without leaking original PII values.
 
 **Context**: HIPAA §164.312(b) requires audit controls. FedRAMP AU-2 requires auditable events. Current NanoMask has zero logging — unsafe for any regulated deployment.
+
+> **In plain English:** The proxy currently processes requests silently with no record of what happened. In regulated environments, every action must be logged and traceable. This epic adds machine-readable logs that compliance tools (Splunk, Elastic, CloudWatch) can ingest.
 
 #### 5.1 — Structured JSON log output
 
@@ -311,6 +331,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: Every proxied request produces at least 3 structured log entries (received, processed, sent). Output is valid JSON parseable by `jq`. `--log-level DEBUG` shows pipeline internals. `--log-level ERROR` is silent for successful requests.
 
+> **In plain English:** Machine-readable JSON logs for every request: what came in, what was redacted, how long it took. Required by HIPAA and FedRAMP audit controls. Feeds into monitoring dashboards and compliance reporting.
+
 ---
 
 #### 5.2 — Redaction audit events
@@ -335,6 +357,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Unit tests: audit events emitted per redaction, no PII in audit output, disabled by default
 
 **Acceptance**: With `--audit-log`, a request containing 2 SSNs and 3 entity names produces 5 audit events. `grep '"event":"redaction"' log.json | jq .original_length` shows lengths but never original values. Without `--audit-log`, zero audit events are emitted.
+
+> **In plain English:** When enabled, logs a detailed record every time something is redacted — what type of PII, where in the document, what it was replaced with. Crucially, *never* logs the actual sensitive value. This is the evidence when an auditor asks "prove patient names were scrubbed."
 
 ---
 
@@ -365,6 +389,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: `curl http://localhost:8081/healthz` returns `200 OK` with `Content-Type: application/json` and a valid JSON body. Uptime increases monotonically. Active connections reflects current load.
 
+> **In plain English:** A simple "am I alive?" URL that Kubernetes and load balancers check. If NanoMask stops responding, the infrastructure automatically restarts it. Without this, a crashed proxy just sits there silently failing until someone notices.
+
 ---
 
 ### Epic 6: Containerization & Hardened Deployment
@@ -372,6 +398,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 **Goal**: Deliver NanoMask as a production-ready container image compatible with Iron Bank / DHI hardened image requirements. The business plan claims "Hardened by Default" — the container must back that claim.
 
 **Context**: DoD Iron Bank requires non-root containers, minimal base images, no package managers in runtime, and CVE-free base layers. Distroless/scratch images satisfy these requirements.
+
+> **In plain English:** Packages NanoMask into a tiny, security-hardened Docker container that can be deployed anywhere — AWS, Azure, GovCloud, on-prem Kubernetes. Hardened to meet DoD Iron Bank requirements so it can be approved for government use.
 
 #### 6.1 — Multi-stage Dockerfile
 
@@ -394,6 +422,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Test: `docker build -t nanomask .`, `docker run --rm -p 8081:8081 nanomask`, verify proxy responds
 
 **Acceptance**: `docker build -t nanomask .` produces a working image under 10 MB. `docker run --read-only --user 65534 nanomask` starts the proxy. `docker scan nanomask` (or `trivy image nanomask`) reports zero CVEs.
+
+> **In plain English:** Creates a Docker image under 10 MB with zero security vulnerabilities, no shell, and no package manager. This is how NanoMask goes from "a binary on your laptop" to "something any team can deploy in 30 seconds."
 
 ---
 
@@ -430,6 +460,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: `helm install nanomask ./charts/nanomask --set target.host=httpbin.org` deploys a working proxy. `kubectl get pods` shows `Running` with passing health checks. `kubectl apply -f examples/sidecar-pod.yaml` creates a pod where the app container's traffic flows through NanoMask.
 
+> **In plain English:** Pre-built Kubernetes deployment templates so enterprise customers can deploy NanoMask with one command (`helm install`). Includes both "sidecar" mode (runs next to your app) and "gateway" mode (centralized proxy). Without this, every customer writes their own deployment config, killing adoption.
+
 ---
 
 ## Phase 5 — Competitive Moat
@@ -441,6 +473,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 **Goal**: Cover all PII types listed in the business plan. Currently only SSNs (formatted) and entity names are supported — every missing pattern type is a sales objection for enterprise buyers.
 
 **Context**: Microsoft Presidio supports 50+ entity types. AWS Comprehend supports 30+. NanoMask's advantage is performing the same detection at 200x lower latency, but it must first support the patterns customers need.
+
+> **In plain English:** NanoMask currently only catches SSNs and known names. Enterprise customers need it to catch emails, phone numbers, credit cards, IP addresses, and healthcare IDs too. Every missing PII type is a reason for a buyer to say "we can't use this yet."
 
 #### 7.1 — Email address redaction
 
@@ -459,6 +493,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Unit tests: standard emails, `+` aliases (`user+tag@gmail.com`), subdomains (`a@b.c.d.com`), long TLDs (`.museum`), invalid formats (no TLD, consecutive dots, missing local part), emails adjacent to punctuation
 
 **Acceptance**: All valid emails in a test payload are replaced with `[EMAIL_REDACTED]`. Zero false positives on non-email `@` usage (e.g., `@mentions`, `@@decorators`). Benchmark exceeds 1 GB/s.
+
+> **In plain English:** Finds and replaces email addresses (`john.doe@hospital.org` → `[EMAIL_REDACTED]`). Emails are a HIPAA identifier and one of the most common PII types in any document.
 
 ---
 
@@ -485,6 +521,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: All US phone numbers in standard formats are detected and replaced. Zero false positives on 10-digit non-phone sequences (ZIP+4, order IDs). Formats with and without country code are handled.
 
+> **In plain English:** Catches phone numbers in all common formats. Smart filtering distinguishes real phone numbers from similar-looking sequences like ZIP codes or order numbers, so it won’t corrupt legitimate data.
+
 ---
 
 #### 7.3 — Credit card number redaction
@@ -503,6 +541,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Unit tests: valid card numbers for each major network, Luhn validation (valid vs. invalid checksums), formatted vs. unformatted, partial card numbers, false positive rejection
 
 **Acceptance**: All valid credit card numbers (Visa, MC, Amex, Discover) are detected and redacted. Luhn checksum eliminates false positives on random 16-digit sequences. Partial card numbers (last 4 digits) are not redacted.
+
+> **In plain English:** Finds credit card numbers and uses the Luhn checksum algorithm to verify they’re real card numbers — not order numbers or tracking IDs that happen to be 16 digits. Required for PCI-DSS compliance.
 
 ---
 
@@ -525,6 +565,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Unit tests: valid IPv4 (all octet ranges), valid IPv6 (full, compressed, mapped), version numbers rejected, CIDR notation handling, loopback addresses
 
 **Acceptance**: All valid IPv4 and IPv6 addresses are detected and replaced. Version numbers (`v2.1.0.3`) and decimal-heavy prose are not falsely matched. CIDR notation is handled.
+
+> **In plain English:** Catches IP addresses, which can identify individuals under GDPR. Smart enough to tell the difference between a real IP address (`192.168.1.1`) and a version number (`v2.1.0.3`).
 
 ---
 
@@ -552,6 +594,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Unit tests: valid MRNs with various prefixes, ICD-10 codes (all categories), insurance IDs with labels, false positive rejection in non-medical text
 
 **Acceptance**: In a sample clinical document, all MRNs, ICD-10 codes, and insurance IDs preceded by labels are detected and replaced. Zero false positives in a general-purpose text payload. Healthcare patterns are disabled by default.
+
+> **In plain English:** Catches healthcare-specific identifiers (medical record numbers, diagnosis codes, insurance IDs) when they appear with recognizable labels like "MRN:" or "Patient ID:". These are core PHI types under HIPAA. Opt-in only, so non-healthcare customers aren’t hit by false positives.
 
 ---
 
@@ -585,6 +629,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: A custom pattern file with 3 patterns is loaded at startup. Each pattern is detected and replaced with its configured label. Invalid pattern syntax produces a clear startup error. Benchmark shows custom patterns add < 5% overhead to the pipeline.
 
+> **In plain English:** Lets customers define their own sensitive data patterns in a config file (e.g., VA claim numbers, internal badge IDs) without needing code changes. Turns NanoMask from "catches common PII" into "catches *our* PII" — the kind of flexibility that wins enterprise contracts.
+
 ---
 
 ### Epic 8: JSON Schema-Aware Redaction
@@ -592,6 +638,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 **Goal**: Use Zig `comptime` to generate optimized, zero-allocation redaction functions from user-defined JSON schemas. This is the single most differentiating feature versus Go/Python competitors — the business plan explicitly calls out "comptime schema optimization" as a key edge.
 
 **Context**: Current NanoMask scans the entire request body through all 3 pipeline stages. For structured JSON payloads (which most LLM API calls are), this is wasteful — if we know that `patient_name` is always PII and `visit_date` is always safe, we can skip scanning 80%+ of the payload.
+
+> **In plain English:** Instead of scanning every character of every request, tell the proxy *which JSON fields* are sensitive. It skips the safe fields entirely and instantly redacts the known-sensitive ones — making it 2–5x faster on structured data. This is NanoMask’s key advantage over competitors because Zig’s compile-time code generation produces custom-built redaction functions that no Go/Python tool can match.
 
 #### 8.1 — Schema definition format
 
@@ -627,6 +675,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: Schema file is loaded and parsed without errors. Schema validation against a sample payload identifies mismatches. Nested key paths resolve correctly.
 
+> **In plain English:** A simple config file where you declare which JSON fields are sensitive (redact), safe (keep), or need scanning. The foundation for the compile-time optimization.
+
 ---
 
 #### 8.2 — Comptime schema codegen
@@ -654,6 +704,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: Schema-aware mode produces correctly redacted JSON for a sample VA claim form payload. Comptime codegen is verifiably faster than runtime matching in benchmarks. `KEEP` fields pass through untouched. `REDACT` fields are replaced without pipeline scanning. `SCAN` fields are processed through all 3 stages.
 
+> **In plain English:** Zig’s `comptime` generates a hyper-optimized redaction function tailored to each customer’s specific JSON format. Field lookups become instant hash computations instead of string searches. This is the marquee differentiator — no Go, Python, or Java competitor can replicate it. 2–5x faster on structured payloads.
+
 ---
 
 #### 8.3 — HASH mode (deterministic pseudonymization)
@@ -679,6 +731,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 **Acceptance**: A `HASH`-tagged field produces a deterministic `PSEUDO_*` token that is stable across requests with the same session key. `unhash()` on the response path restores the original value. A round-trip test (request→hash→upstream→response→unhash) produces the original payload.
 
+> **In plain English:** Instead of obliterating names with `[REDACTED]`, replaces them with consistent pseudonyms (`PSEUDO_a1b2c3d4`). Same name always gets the same pseudonym, so you can run analytics without exposing real identities. The LLM’s response comes back with pseudonyms, and NanoMask transparently restores the real names before returning them to the app.
+
 ---
 
 ### Epic 9: E2E Integration Testing
@@ -686,6 +740,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 **Goal**: Validate the full round-trip proxy pipeline with a mock upstream server, proving zero PII leakage end-to-end. Unit tests validate individual stages; E2E tests validate the complete system including HTTP parsing, pipeline orchestration, and response unmasking.
 
 **Context**: Current test suite (49 tests) covers individual redaction stages thoroughly, but no test exercises the actual proxy path: client → NanoMask → upstream → NanoMask → client. Without E2E tests, integration bugs (header handling, body buffering, entity map lifecycle) can slip through.
+
+> **In plain English:** Individual components are well-tested, but nothing currently proves the *entire system* works end-to-end: app sends PII → proxy scrubs it → upstream API sees clean data → response comes back → proxy restores originals → app gets the answer. These tests prove that promise holds.
 
 #### 9.1 — Mock upstream server
 
@@ -710,6 +766,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Unit tests for the mock server itself: request recording, echo mode, delay mode
 
 **Acceptance**: `zig build test` runs E2E tests alongside existing unit tests. The mock upstream starts and stops cleanly. Request bodies are recorded and assertable.
+
+> **In plain English:** A fake API server that stands in for the real one during testing. It records exactly what it receives so tests can verify that zero PII leaked through. You can’t test against real APIs — they’re slow, expensive, and unreliable.
 
 ---
 
@@ -737,6 +795,8 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - Run as part of `zig build test` — all compliance tests must pass for CI to go green
 
 **Acceptance**: Full compliance suite passes with zero PII leakage across all supported pattern types. Mixed-payload test proves all stages cooperate correctly. False positive rate is documented (target: < 0.1% on general text). CI enforces compliance tests on every PR.
+
+> **In plain English:** The certification test — throws every type of PII at NanoMask simultaneously and verifies nothing leaks. When an auditor asks "prove your product catches all PII types," this is the answer. Runs automatically on every code change so no one can accidentally break PII protection.
 
 ---
 
