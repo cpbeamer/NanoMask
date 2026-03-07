@@ -47,7 +47,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         ctx.entity_map,
         ctx.fuzzy_matcher,
     ) catch |err| {
-        std.debug.print("[ERR] {s} {s}: {}\n", .{ @tagName(request.head.method), request.head.target, err });
+        std.debug.print("[ERR] Proxy request failed: {}\n", .{err});
     };
 }
 
@@ -62,11 +62,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const args = try std.process.argsAlloc(allocator);
-    // SAFETY: We don't free args to prevent dangling target_host pointers since main operates effectively as program lifetime
-    // and args slices point into this pool if passed by user.
-    // However, if process terminates, OS reclaims memory.
 
-    var cfg = Config.parse(allocator, args, std.io.getStdErr().writer()) catch |err| {
+    var cfg = Config.parse(allocator, args) catch |err| {
         if (err == error.HelpRequested) {
             std.process.exit(0);
         } else {
@@ -90,26 +87,64 @@ pub fn main() !void {
     std.debug.print("\n", .{});
 
     // --- Entity Masking Setup ---
-    // Demo name set. In production, these come from case metadata,
-    // API headers (X-ZPG-Entities), or a per-session config file.
-    const demo_names = [_][]const u8{ "John Doe", "Jane Smith", "Dr. Johnson" };
-    var entity_map = try entity_mask.EntityMap.init(allocator, &demo_names);
-    defer entity_map.deinit();
+    var loaded_names: ?[][]const u8 = null;
+    var entity_map_alloc: ?entity_mask.EntityMap = null;
+    var fuzzy_matcher_alloc: ?fuzzy_match.FuzzyMatcher = null;
 
-    // --- Fuzzy Matcher Setup (Stage 3: OCR-resilient name matching) ---
-    // Threshold 0.80 = 80% similarity required. Tunable per deployment.
-    var fuzzy_matcher = try fuzzy_match.FuzzyMatcher.init(
-        allocator,
-        entity_map.getRawNames(),
-        entity_map.getAliases(),
-        cfg.fuzzy_threshold,
-    );
-    defer fuzzy_matcher.deinit();
+    defer {
+        if (fuzzy_matcher_alloc) |*fm| fm.deinit();
+        if (entity_map_alloc) |*em| em.deinit();
+        if (loaded_names) |names| {
+            for (names) |name| allocator.free(name);
+            allocator.free(names);
+        }
+    }
+
+    if (cfg.entity_file) |ef| {
+        var file = std.fs.cwd().openFile(ef, .{}) catch |err| {
+            std.debug.print("error: cannot open entity file '{s}': {s}\n", .{ ef, @errorName(err) });
+            std.process.exit(1);
+        };
+        defer file.close();
+        
+        const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+        defer allocator.free(content);
+
+        var names_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer names_list.deinit(allocator);
+
+        var line_it = std.mem.splitScalar(u8, content, '\n');
+        while (line_it.next()) |line| {
+            const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r"), " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            try names_list.append(allocator, try allocator.dupe(u8, trimmed));
+        }
+
+        loaded_names = try names_list.toOwnedSlice(allocator);
+        entity_map_alloc = try entity_mask.EntityMap.init(allocator, loaded_names.?);
+        
+        fuzzy_matcher_alloc = try fuzzy_match.FuzzyMatcher.init(
+            allocator,
+            entity_map_alloc.?.getRawNames(),
+            entity_map_alloc.?.getAliases(),
+            cfg.fuzzy_threshold,
+        );
+        std.debug.print("loaded {} entities from {s}\n", .{ loaded_names.?.len, ef });
+    } else {
+        std.debug.print("WARNING: No entity file provided. Running in SSN-only mode unless X-ZPG-Entities header is present on requests.\n", .{});
+    }
 
     std.debug.print("Listening on http://127.0.0.1:{}\n", .{cfg.listen_port});
     std.debug.print("Forwarding to http://{s}:{}\n", .{ cfg.target_host, cfg.target_port });
-    std.debug.print("Entity masking: {} session names loaded\n", .{demo_names.len});
-    std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher.variants.len, cfg.fuzzy_threshold * 100.0 });
+    
+    if (loaded_names) |names| {
+        std.debug.print("Entity masking: {} session names loaded\n", .{ names.len });
+        std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher_alloc.?.variants.len, cfg.fuzzy_threshold * 100.0 });
+    } else {
+        std.debug.print("Entity masking: disabled (SSN-only mode)\n", .{});
+        std.debug.print("Fuzzy matching: disabled (SSN-only mode)\n", .{});
+    }
+
     std.debug.print("Connection pool: shared client with keep-alive (up to 32 upstream connections)\n", .{});
     std.debug.print("Bidirectional pipeline: mask request -> unmask response\n", .{});
     std.debug.print("Multi-threaded: up to {} concurrent connections\n\n", .{cfg.max_connections});
@@ -135,8 +170,8 @@ pub fn main() !void {
         .allocator = allocator,
         .target_host = cfg.target_host,
         .target_port = cfg.target_port,
-        .entity_map = &entity_map,
-        .fuzzy_matcher = &fuzzy_matcher,
+        .entity_map = if (entity_map_alloc) |*em| em else null,
+        .fuzzy_matcher = if (fuzzy_matcher_alloc) |*fm| fm else null,
         .http_client = &http_client,
         .active_connections = &active_connections,
     };

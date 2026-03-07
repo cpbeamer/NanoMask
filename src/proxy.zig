@@ -93,11 +93,14 @@ pub fn handleRequest(
 
     const has_body = method.requestHasBody();
 
-    var client_req = try client.request(method, target_uri, .{
+    var client_req = client.request(method, target_uri, .{
         .headers = .{ .content_type = content_type_override },
-        .transfer_encoding = if (has_body) .chunked else .none,
-    });
+    }) catch |e| {
+        std.debug.print("client.request failed: {}\n", .{e});
+        return e;
+    };
     defer client_req.deinit();
+    client_req.transfer_encoding = if (has_body) .chunked else .none;
 
     // --- Request path: apply privacy pipeline to outbound body ---
     if (has_body) {
@@ -107,15 +110,18 @@ pub fn handleRequest(
 
         var ssn_state = redact.SsnChunkState{};
 
-        var fuzzy_state: ?fuzzy_match.FuzzyChunkState = null;
+        var fuzzy_state: ?fuzzy_match.FuzzyMatcher.FuzzyChunkState = null;
         if (session_fuzzy_matcher) |fm| fuzzy_state = fm.initChunkState();
         defer if (fuzzy_state) |*s| s.deinit(allocator);
 
+        var req_body_transfer_buf: [8192]u8 = undefined;
+        var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
+        
         var body_read_buf: [8192]u8 = undefined;
         if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
             var raw_chunk_buf: [8192]u8 = undefined;
             while (true) {
-                const bytes_read = try body_reader.read(&raw_chunk_buf);
+                const bytes_read = try body_reader.readSliceShort(&raw_chunk_buf);
                 if (bytes_read == 0) break;
                 
                 const raw_chunk = raw_chunk_buf[0..bytes_read];
@@ -136,19 +142,23 @@ pub fn handleRequest(
                 if (session_fuzzy_matcher) |fm| {
                     const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
                     if (ssn_res.finalized.len > 0) {
-                        const f1 = try fm.fuzzyRedactChunked(ssn_res.finalized, &fuzzy_state.?, em_aliases, &.{});
+                        const f1 = try fm.fuzzyRedactChunked(ssn_res.finalized, &fuzzy_state.?, em_aliases, &.{}, allocator);
                         defer allocator.free(f1);
-                        if (f1.len > 0) try client_req.writeAll(f1);
+                        if (f1.len > 0) try req_body.writer.writeAll(f1);
                     }
                     if (ssn_res.emitted.len > 0) {
-                        const f2 = try fm.fuzzyRedactChunked(ssn_res.emitted, &fuzzy_state.?, em_aliases, &.{});
+                        const f2 = try fm.fuzzyRedactChunked(ssn_res.emitted, &fuzzy_state.?, em_aliases, &.{}, allocator);
                         defer allocator.free(f2);
-                        if (f2.len > 0) try client_req.writeAll(f2);
+                        if (f2.len > 0) try req_body.writer.writeAll(f2);
                     }
                 } else {
-                    if (ssn_res.finalized.len > 0) try client_req.writeAll(ssn_res.finalized);
-                    if (ssn_res.emitted.len > 0) try client_req.writeAll(ssn_res.emitted);
+                    if (ssn_res.finalized.len > 0) try req_body.writer.writeAll(ssn_res.finalized);
+                    if (ssn_res.emitted.len > 0) try req_body.writer.writeAll(ssn_res.emitted);
                 }
+                
+                // readSliceShort returns < buffer.len if and only if it reached EOF.
+                // Breaking here prevents another read call that panics if the stream is already .ready
+                if (bytes_read < raw_chunk_buf.len) break;
             }
             
             // Flushes
@@ -158,42 +168,45 @@ pub fn handleRequest(
             }
             defer if (ac_flushed) |f| allocator.free(f);
 
-            var ssn_final_emissions = std.ArrayList(u8).init(allocator);
-            defer ssn_final_emissions.deinit();
+            var ssn_final_emissions: std.ArrayListUnmanaged(u8) = .empty;
+            defer ssn_final_emissions.deinit(allocator);
 
             if (ac_flushed) |f| {
                 if (f.len > 0) {
                     const ssn_res = redact.redactSsnChunked(f, &ssn_state);
-                    if (ssn_res.finalized.len > 0) try ssn_final_emissions.appendSlice(ssn_res.finalized);
-                    if (ssn_res.emitted.len > 0) try ssn_final_emissions.appendSlice(ssn_res.emitted);
+                    if (ssn_res.finalized.len > 0) try ssn_final_emissions.appendSlice(allocator, ssn_res.finalized);
+                    if (ssn_res.emitted.len > 0) try ssn_final_emissions.appendSlice(allocator, ssn_res.emitted);
                 }
             }
             
             const ssn_flushed = ssn_state.flush();
             if (ssn_flushed.len > 0) {
-                try ssn_final_emissions.appendSlice(ssn_flushed);
+                try ssn_final_emissions.appendSlice(allocator, ssn_flushed);
             }
 
             if (session_fuzzy_matcher) |fm| {
                 const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
                 if (ssn_final_emissions.items.len > 0) {
-                    const f_res = try fm.fuzzyRedactChunked(ssn_final_emissions.items, &fuzzy_state.?, em_aliases, &.{});
+                    const f_res = try fm.fuzzyRedactChunked(ssn_final_emissions.items, &fuzzy_state.?, em_aliases, &.{}, allocator);
                     defer allocator.free(f_res);
-                    if (f_res.len > 0) try client_req.writeAll(f_res);
+                    if (f_res.len > 0) try req_body.writer.writeAll(f_res);
                 }
                 const fuzzy_flushed = try fuzzy_state.?.flush(fm, em_aliases, &.{}, allocator);
                 defer allocator.free(fuzzy_flushed);
-                if (fuzzy_flushed.len > 0) try client_req.writeAll(fuzzy_flushed);
+                if (fuzzy_flushed.len > 0) try req_body.writer.writeAll(fuzzy_flushed);
             } else {
                 if (ssn_final_emissions.items.len > 0) {
-                    try client_req.writeAll(ssn_final_emissions.items);
+                    try req_body.writer.writeAll(ssn_final_emissions.items);
                 }
             }
         } else |err| {
             std.debug.print("[WARN] Failed to read request body: {}\n", .{err});
         }
         
-        try client_req.finish();
+        try req_body.end();
+        if (client_req.connection) |conn| {
+            try conn.flush();
+        }
     } else {
         try client_req.sendBodilessUnflushed();
         if (client_req.connection) |conn| {
@@ -205,23 +218,20 @@ pub fn handleRequest(
     var redirect_buffer: [4096]u8 = undefined;
     var downstream_res = try client_req.receiveHead(&redirect_buffer);
 
-    var transfer_buf: [8192]u8 = undefined;
-    var downstream_reader = downstream_res.reader(&transfer_buf);
-
     std.debug.print("[PRX] <- {d}\n", .{@intFromEnum(downstream_res.head.status)});
 
-    // Forward upstream Content-Type so the client receives the correct media type.
+    // Extract Content-Type before calling .reader() because .reader() invalidates response.head strings!
     const upstream_ct = downstream_res.head.content_type;
     var ct_headers = [_]http.Header{.{ .name = "Content-Type", .value = "" }};
     var extra_headers: []const http.Header = &.{};
 
-    if (upstream_ct != .default) {
-        ct_headers[0].value = switch (upstream_ct) {
-            .override => |v| v,
-            .default => "",
-        };
+    if (upstream_ct) |ct| {
+        ct_headers[0].value = ct;
         extra_headers = ct_headers[0..1];
     }
+
+    var transfer_buf: [8192]u8 = undefined;
+    var downstream_reader = downstream_res.reader(&transfer_buf);
 
     // --- Response path: unmask aliases back to real names ---
     var resp_buf8: [8192]u8 = undefined;
@@ -232,7 +242,7 @@ pub fn handleRequest(
         },
     });
 
-    if (downstream_res.head.method.responseHasBody()) {
+    if (method.responseHasBody()) {
         var unmask_state: ?entity_mask.AcChunkState = null;
         if (active_entity_map) |em| {
             unmask_state = em.initUnmaskChunkState();
@@ -241,7 +251,7 @@ pub fn handleRequest(
 
         var resp_buf: [8192]u8 = undefined;
         while (true) {
-            const bytes_read = try downstream_reader.read(&resp_buf);
+            const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
             if (bytes_read == 0) break;
             
             const raw_chunk = resp_buf[0..bytes_read];
@@ -249,17 +259,19 @@ pub fn handleRequest(
             if (active_entity_map) |em| {
                 const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
                 defer allocator.free(unmasked);
-                if (unmasked.len > 0) try response_writer.writeAll(unmasked);
+                if (unmasked.len > 0) try response_writer.writer.writeAll(unmasked);
             } else {
-                try response_writer.writeAll(raw_chunk);
+                try response_writer.writer.writeAll(raw_chunk);
             }
+            
+            if (bytes_read < resp_buf.len) break;
         }
         
         // Flush unmask state
         if (active_entity_map) |em| {
             const flushed = try unmask_state.?.flushUnmask(em, allocator);
             defer allocator.free(flushed);
-            if (flushed.len > 0) try response_writer.writeAll(flushed);
+            if (flushed.len > 0) try response_writer.writer.writeAll(flushed);
         }
     }
     

@@ -37,6 +37,9 @@ zig build -Doptimize=ReleaseFast
 # Run with defaults (listens on :8081, forwards to httpbin.org:80)
 zig build run
 
+# Run with an entities file list
+zig build run -- --entity-file entities.txt
+
 # Run benchmarks (ReleaseFast, clean output on Windows)
 zig build bench-all 2>$null
 

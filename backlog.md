@@ -145,7 +145,7 @@
 
 ---
 
-#### 3.3 — Entity file loading
+#### ✅ 3.3 — Entity file loading
 
 **Type**: Feature  
 **Estimate**: 0.5 day  
