@@ -70,6 +70,9 @@ pub const Config = struct {
     log_file_src: ConfigSource = .default,
     audit_log: bool = false,
     audit_log_src: ConfigSource = .default,
+    /// When true, perform a health check probe against localhost and exit.
+    /// Used by Docker HEALTHCHECK in scratch containers with no curl/wget.
+    healthcheck: bool = false,
 
     allocator: std.mem.Allocator,
 
@@ -144,6 +147,7 @@ pub const Config = struct {
             \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
             \\  --log-file <path>            Write structured JSON logs to file (default: stderr)
             \\  --audit-log                  Enable per-redaction audit events in log output
+            \\  --healthcheck                Probe /healthz on localhost and exit (for Docker HEALTHCHECK)
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -554,6 +558,8 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--audit-log")) {
                 config.audit_log = true;
                 config.audit_log_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--healthcheck")) {
+                config.healthcheck = true;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -968,4 +974,16 @@ test "Config - tls-no-system-ca + ca-file is valid (complementary)" {
 
     try testing.expect(cfg.tls_no_system_ca);
     try testing.expectEqualStrings(tmp_ca, cfg.ca_file.?);
+}
+
+test "Config - healthcheck flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--healthcheck",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.healthcheck);
 }

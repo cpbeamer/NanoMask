@@ -143,6 +143,32 @@ pub fn main() !void {
     };
     defer cfg.deinit();
 
+    // --- Healthcheck probe mode ---
+    // When --healthcheck is set, act as a client: probe /healthz on localhost
+    // and exit 0 (healthy) or 1 (unhealthy). Used by Docker HEALTHCHECK in
+    // scratch containers that have no curl or wget.
+    if (cfg.healthcheck) {
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+
+        // Build the health check URL targeting the configured listen port.
+        var url_buf: [64]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/healthz", .{cfg.listen_port}) catch {
+            std.process.exit(1);
+        };
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+        }) catch {
+            std.process.exit(1);
+        };
+
+        if (result.status == .ok) {
+            std.process.exit(0);
+        }
+        std.process.exit(1);
+    }
+
     // --- Structured Logger ---
     var log = Logger.init(cfg.log_level, cfg.audit_log, cfg.log_file) catch |err| {
         std.debug.print("error: failed to initialise logger: {}\n", .{err});

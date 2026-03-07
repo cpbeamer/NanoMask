@@ -1,0 +1,11 @@
+.git
+.github
+.zig-cache
+zig-cache
+zig-out
+*.md
+*.pdb
+*.obj
+*.o
+*.exe
+LICENSE

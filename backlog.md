@@ -407,7 +407,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 > **In plain English:** Packages NanoMask into a tiny, security-hardened Docker container that can be deployed anywhere — AWS, Azure, GovCloud, on-prem Kubernetes. Hardened to meet DoD Iron Bank requirements so it can be approved for government use.
 
-#### 6.1 — Multi-stage Dockerfile
+#### ✅ 6.1 — Multi-stage Dockerfile
 
 **Type**: Feature  
 **Estimate**: 1 day  
