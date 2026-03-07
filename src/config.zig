@@ -47,7 +47,6 @@ pub const Config = struct {
     watch_interval_ms: u64 = 1000,
     watch_interval_ms_src: ConfigSource = .default,
 
-
     allocator: std.mem.Allocator,
 
     pub const ParseError = error{
@@ -387,3 +386,35 @@ test "Config - invalid max connections zero" {
     try testing.expectError(error.InvalidMaxConnections, res);
 }
 
+test "Config - valid watch interval" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--watch-interval", "5000",
+    };
+
+    var config = try Config.parse(std.testing.allocator, &args);
+    defer config.deinit();
+
+    try testing.expectEqual(@as(u64, 5000), config.watch_interval_ms);
+    try testing.expectEqual(ConfigSource.cli_flag, config.watch_interval_ms_src);
+}
+
+test "Config - invalid watch interval zero" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--watch-interval", "0",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidWatchInterval, res);
+}
+
+test "Config - invalid watch interval non-numeric" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--watch-interval", "abc",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidWatchInterval, res);
+}

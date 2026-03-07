@@ -106,12 +106,18 @@ pub fn main() !void {
     std.debug.print("\n", .{});
 
     // --- Entity Masking Setup (RCU) ---
-    var entity_set_alloc: ?VersionedEntitySet = null;
+    // Heap-allocate so the pointer is stable for the FileWatcher's background
+    // thread — avoids dangling pointer risk from stack-local optionals.
+    var entity_set: ?*VersionedEntitySet = null;
     var watcher: ?FileWatcher = null;
 
     defer {
-        if (watcher) |*w| w.stop();
-        if (entity_set_alloc) |*es| es.deinit();
+        // Join the watcher thread before freeing the entity set it references.
+        if (watcher) |*w| w.join();
+        if (entity_set) |es| {
+            es.deinit();
+            allocator.destroy(es);
+        }
     }
 
     if (cfg.entity_file) |ef| {
@@ -126,13 +132,15 @@ pub fn main() !void {
 
         std.debug.print("loaded {} entities from {s}\n", .{ initial_snapshot.loaded_names.len, ef });
 
-        entity_set_alloc = VersionedEntitySet.init(initial_snapshot);
+        const es = try allocator.create(VersionedEntitySet);
+        es.* = VersionedEntitySet.init(initial_snapshot);
+        entity_set = es;
 
         // Start watching the entity file for changes (hot-reload via RCU)
         watcher = FileWatcher.init(
             ef,
             cfg.watch_interval_ms,
-            &entity_set_alloc.?,
+            es,
             cfg.fuzzy_threshold,
             allocator,
         );
@@ -147,7 +155,7 @@ pub fn main() !void {
     std.debug.print("Listening on http://127.0.0.1:{}\n", .{cfg.listen_port});
     std.debug.print("Forwarding to http://{s}:{}\n", .{ cfg.target_host, cfg.target_port });
 
-    if (entity_set_alloc) |*es| {
+    if (entity_set) |es| {
         const snap = es.acquire();
         defer es.release(snap);
         std.debug.print("Entity masking: {} session names loaded (v{})\n", .{ snap.loaded_names.len, snap.version });
@@ -184,7 +192,7 @@ pub fn main() !void {
         .allocator = allocator,
         .target_host = cfg.target_host,
         .target_port = cfg.target_port,
-        .entity_set = if (entity_set_alloc) |*es| es else null,
+        .entity_set = entity_set,
         .http_client = &http_client,
         .active_connections = &active_connections,
     };

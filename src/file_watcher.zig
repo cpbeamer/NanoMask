@@ -18,15 +18,16 @@ pub const FileWatcher = struct {
     last_mtime: i128,
     last_size: u64,
     entity_set: *VersionedEntitySet,
-    fuzzy_threshold: f64,
+    fuzzy_threshold: f32,
     allocator: std.mem.Allocator,
     running: std.atomic.Value(bool),
+    thread: ?std.Thread = null,
 
     pub fn init(
         path: []const u8,
         poll_interval_ms: u64,
         entity_set: *VersionedEntitySet,
-        fuzzy_threshold: f64,
+        fuzzy_threshold: f32,
         allocator: std.mem.Allocator,
     ) FileWatcher {
         // Get initial file stat for baseline comparison
@@ -65,15 +66,20 @@ pub const FileWatcher = struct {
         };
     }
 
-    /// Start the watcher loop on a new detached thread.
+    /// Start the watcher loop on a background thread.
     pub fn start(self: *FileWatcher) !void {
-        const thread = try std.Thread.spawn(.{}, pollLoop, .{self});
-        thread.detach();
+        self.thread = try std.Thread.spawn(.{}, pollLoop, .{self});
     }
 
-    /// Signal the watcher to stop on the next poll cycle.
-    pub fn stop(self: *FileWatcher) void {
+    /// Signal the watcher to stop and wait for the background thread to exit.
+    /// Safe to call from a defer block — guarantees the poll loop has terminated
+    /// before any resources it references (e.g. the VersionedEntitySet) are freed.
+    pub fn join(self: *FileWatcher) void {
         self.running.store(false, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
     }
 
     /// Main poll loop — runs on a background thread.
@@ -136,3 +142,38 @@ pub const FileWatcher = struct {
         self.last_size = new_stat.size;
     }
 };
+
+// ===========================================================================
+// Unit Tests
+// ===========================================================================
+
+test "getFileStat - valid file returns non-zero mtime and size" {
+    const stat = FileWatcher.getFileStat("entities.txt");
+    try std.testing.expect(stat.mtime != 0);
+    try std.testing.expect(stat.size > 0);
+}
+
+test "getFileStat - missing file returns zeroes" {
+    const stat = FileWatcher.getFileStat("nonexistent_file_12345.txt");
+    try std.testing.expectEqual(@as(i128, 0), stat.mtime);
+    try std.testing.expectEqual(@as(u64, 0), stat.size);
+}
+
+test "FileWatcher - start and join lifecycle" {
+    const allocator = std.testing.allocator;
+
+    const snapshot = try versioned_entity_set.loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    var set = VersionedEntitySet.init(snapshot);
+    defer set.deinit();
+
+    // Use a very short poll interval — the test only needs one cycle
+    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, allocator);
+    try watcher.start();
+
+    // Let it run briefly, then join — verifies clean thread cleanup
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    watcher.join();
+
+    // Thread should be null after join
+    try std.testing.expect(watcher.thread == null);
+}

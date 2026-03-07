@@ -113,7 +113,7 @@ pub const VersionedEntitySet = struct {
 /// The returned snapshot has ref_count = 1 (the "owner" reference).
 pub fn loadSnapshotFromFile(
     path: []const u8,
-    fuzzy_threshold: f64,
+    fuzzy_threshold: f32,
     version: u32,
     allocator: std.mem.Allocator,
 ) !*EntitySnapshot {

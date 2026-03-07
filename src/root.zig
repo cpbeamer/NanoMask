@@ -5,6 +5,7 @@ pub const entity_mask = @import("entity_mask.zig");
 pub const fuzzy_match = @import("fuzzy_match.zig");
 pub const versioned_entity_set = @import("versioned_entity_set.zig");
 pub const config = @import("config.zig");
+pub const file_watcher = @import("file_watcher.zig");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -13,4 +14,5 @@ test {
     _ = fuzzy_match;
     _ = versioned_entity_set;
     _ = config;
+    _ = file_watcher;
 }
