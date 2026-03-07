@@ -95,7 +95,7 @@ On the response path:
 
 ## 6. State Management
 
-Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers, HTTP server instance, and its own `std.http.Client` for upstream requests (avoiding shared mutable state). An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context; both are optional, enabling SSN-only proxy mode without entity masking.
+Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers and HTTP server instance. A single `std.http.Client` is shared across all handler threads; its built-in `ConnectionPool` is thread-safe (uses `std.Thread.Mutex`) and reuses TCP connections with keep-alive (default 32 pooled connections). This eliminates per-request TCP handshake overhead. An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context; both are optional, enabling SSN-only proxy mode without entity masking.
 
-**Phase 3 Scalability**: The current thread-per-connection model is a deliberate simplicity trade-off. A thread pool or `io_uring`-based event loop would be the natural evolution for high-connection-count workloads.
+**Phase 3 Scalability**: The current thread-per-connection model is a deliberate simplicity trade-off. An `io_uring`/IOCP-based event loop via `std.Io` would be the natural evolution for 10K+ concurrent connection workloads.
 

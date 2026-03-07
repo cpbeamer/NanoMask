@@ -13,6 +13,11 @@ const ThreadContext = struct {
     target_port: u16,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+    /// Shared HTTP client with built-in thread-safe connection pool.
+    /// The stdlib ConnectionPool uses std.Thread.Mutex internally,
+    /// so concurrent acquire/release from handler threads is safe.
+    /// Individual Request objects are per-handler (not thread-safe).
+    http_client: *std.http.Client,
     active_connections: *std.atomic.Value(u32),
 };
 
@@ -21,10 +26,6 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         connection.stream.close();
         _ = ctx.active_connections.fetchSub(1, .release);
     }
-
-    // Per-thread HTTP client — avoids data races from sharing mutable client state.
-    var client = std.http.Client{ .allocator = ctx.allocator };
-    defer client.deinit();
 
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -42,7 +43,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     proxy.handleRequest(
         ctx.allocator,
         &request,
-        &client,
+        ctx.http_client,
         ctx.target_host,
         ctx.target_port,
         ctx.entity_map,
@@ -86,11 +87,12 @@ pub fn main() !void {
     );
     defer fuzzy_matcher.deinit();
 
-    std.debug.print("Starting ZPG Proxy - Phase 2\n", .{});
+    std.debug.print("Starting ZPG Proxy - Phase 3\n", .{});
     std.debug.print("Listening on http://127.0.0.1:{}\n", .{listen_port});
     std.debug.print("Forwarding to http://{s}:{}\n", .{ target_host, target_port });
     std.debug.print("Entity masking: {} session names loaded\n", .{demo_names.len});
     std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher.variants.len, 0.80 * 100.0 });
+    std.debug.print("Connection pool: shared client with keep-alive (up to 32 upstream connections)\n", .{});
     std.debug.print("Bidirectional pipeline: mask request -> unmask response\n", .{});
     std.debug.print("Multi-threaded: up to {} concurrent connections\n\n", .{max_concurrent_connections});
 
@@ -98,6 +100,12 @@ pub fn main() !void {
         .reuse_address = true,
     });
     defer net_server.deinit();
+
+    // Shared HTTP client: the stdlib ConnectionPool is thread-safe (uses Mutex).
+    // All handler threads share this client, enabling TCP connection reuse with
+    // keep-alive. Eliminates per-request TCP handshake overhead (5-10ms savings).
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
 
     // NOTE: Upstream request timeouts are not yet configurable via std.http.Client.
     // Long-running upstream calls will block the handler thread until completion.
@@ -111,6 +119,7 @@ pub fn main() !void {
         .target_port = target_port,
         .entity_map = &entity_map,
         .fuzzy_matcher = &fuzzy_matcher,
+        .http_client = &http_client,
         .active_connections = &active_connections,
     };
 
