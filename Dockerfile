@@ -38,7 +38,7 @@ USER 65534:65534
 EXPOSE 8081
 
 # The binary itself acts as the health check client (scratch has no curl).
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/nanomask", "--healthcheck"]
 
 ENTRYPOINT ["/nanomask"]

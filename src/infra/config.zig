@@ -616,7 +616,6 @@ test "Config - parse valid arguments" {
         "--log-level", "debug",
     };
 
-
     var config = try Config.parse(std.testing.allocator, &args);
     defer config.deinit();
 
