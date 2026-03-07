@@ -230,6 +230,7 @@ src/
 ├── file_watcher.zig          # Poll-based entity file watcher for hot-reload
 ├── admin.zig                 # REST API for entity management (/_admin/entities)
 ├── tls.zig                   # TLS 1.3 server handshake, record layer, encrypted I/O
+├── logger.zig                # Thread-safe structured JSON logger (NDJSON output)
 ├── http_util.zig             # HTTP response helpers
 ├── bench.zig                 # Standalone benchmark runner
 ├── root.zig                  # Module root for test discovery
@@ -239,7 +240,7 @@ src/
 ## Testing
 
 ```bash
-# Run all 49 tests
+# Run all 60+ tests
 zig build test
 
 # Run benchmarks (ReleaseFast, clean output on Windows)
@@ -275,12 +276,28 @@ NanoMask supports a strict configuration precedence:
 | Target TLS | `--target-tls` | `NANOMASK_TARGET_TLS` | disabled | Enable HTTPS for upstream connections |
 | CA file | `--ca-file` | `NANOMASK_CA_FILE` | system CAs | Custom CA bundle PEM for upstream TLS verification |
 | Suppress system CAs | `--tls-no-system-ca` | `NANOMASK_TLS_NO_SYSTEM_CA` | disabled | Suppress system CA bundle; use with `--ca-file` for self-signed certs |
+| Log file | `--log-file` | `NANOMASK_LOG_FILE` | stderr | Write structured JSON logs to file (append mode) |
+| Audit log | `--audit-log` | `NANOMASK_AUDIT_LOG` | disabled | Enable per-redaction audit events in log output |
 
 *Note: Per-request `X-ZPG-Entities` header overrides the entity names loaded from the file or compiled defaults.*
 
 > **Listener TLS**: When both `--tls-cert` and `--tls-key` are provided, NanoMask performs a full TLS 1.3 handshake on each accepted connection using AES-128-GCM-SHA256 with X25519 key exchange. The encrypted reader/writer wraps the raw socket transparently — the HTTP server and redaction pipeline operate on plaintext. Supports ECDSA P-256 and Ed25519 private keys in PKCS#8 PEM format.
 
 > **Upstream TLS**: When `--target-tls` is enabled, NanoMask connects to the upstream server over HTTPS. By default the system CA bundle is used for certificate verification. Use `--ca-file` to specify a custom CA bundle (e.g., for internal PKI or GovCloud environments). Use `--tls-no-system-ca` to suppress the system CA bundle and rely solely on `--ca-file` for trust anchors (e.g., self-signed certificates).
+
+### Structured Logging
+
+NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include: `request_received`, `upstream_forwarded`, `response_sent`. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
+
+### Health Check
+
+`GET /healthz` returns HTTP 200 with a JSON body:
+
+```json
+{"status":"ok","uptime_s":3600,"connections_active":5,"connections_total":1200,"version":"0.1.0"}
+```
+
+Usable as a K8s liveness/readiness probe. Health checks are logged at `DEBUG` level only to avoid log noise.
 
 ## License
 

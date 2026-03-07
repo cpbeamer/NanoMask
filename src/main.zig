@@ -11,6 +11,8 @@ const file_watcher = @import("file_watcher.zig");
 const FileWatcher = file_watcher.FileWatcher;
 const admin = @import("admin.zig");
 const tls_mod = @import("tls.zig");
+const logger_mod = @import("logger.zig");
+const Logger = logger_mod.Logger;
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
@@ -33,6 +35,12 @@ const ThreadContext = struct {
     target_tls: bool,
     /// Maximum request body size in bytes for the proxy pipeline.
     max_body_size: usize,
+    /// Structured JSON logger — thread-safe, shared across all handlers.
+    logger: *Logger,
+    /// Lifetime connection counter for /healthz endpoint.
+    connections_total: *std.atomic.Value(u64),
+    /// Server start timestamp (epoch seconds) for uptime calculation.
+    start_time: i64,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -40,6 +48,10 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         connection.stream.close();
         _ = ctx.active_connections.fetchSub(1, .release);
     }
+
+    // Generate a unique session ID for request correlation in structured logs.
+    var sid_buf: [8]u8 = undefined;
+    const session_id = logger_mod.generateSessionId(&sid_buf);
 
     // Acquire a snapshot at the start of the request. This is lock-free —
     // just an atomic load + fetchAdd. The snapshot stays valid for the
@@ -61,7 +73,9 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     const raw_reader_iface = stream_reader.interface();
     if (ctx.tls_context) |tls_ctx| {
         tls_stream = tls_mod.accept(tls_ctx, raw_reader_iface, &stream_writer.interface, &tls_stream_buf) catch |err| {
-            std.debug.print("[ERR] TLS handshake failed: {}\n", .{err});
+            ctx.logger.log(.error_, "tls_handshake_failed", session_id, &.{
+                .{ .key = "error", .value = .{ .string = @errorName(err) } },
+            });
             return;
         };
     }
@@ -72,7 +86,9 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     var server = std.http.Server.init(&final_reader, &final_writer);
 
     var request = server.receiveHead() catch |err| {
-        std.debug.print("[ERR] Receiving head: {}\n", .{err});
+        ctx.logger.log(.error_, "receive_head_failed", session_id, &.{
+            .{ .key = "error", .value = .{ .string = @errorName(err) } },
+        });
         return;
     };
 
@@ -81,19 +97,28 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     const fm: ?*const fuzzy_match.FuzzyMatcher = if (snapshot) |s| &s.fuzzy_matcher else null;
 
     proxy.handleRequest(
-        ctx.allocator,
         &request,
-        ctx.http_client,
-        ctx.target_host,
-        ctx.target_port,
-        ctx.target_tls,
-        em,
-        fm,
-        ctx.entity_set,
-        ctx.admin_config,
-        ctx.max_body_size,
+        .{
+            .allocator = ctx.allocator,
+            .client = ctx.http_client,
+            .target_host = ctx.target_host,
+            .target_port = ctx.target_port,
+            .target_tls = ctx.target_tls,
+            .session_entity_map = em,
+            .session_fuzzy_matcher = fm,
+            .entity_set = ctx.entity_set,
+            .admin_config = ctx.admin_config,
+            .max_body_size = ctx.max_body_size,
+            .log = ctx.logger,
+            .session_id = session_id,
+            .active_connections = ctx.active_connections,
+            .connections_total = ctx.connections_total,
+            .start_time = ctx.start_time,
+        },
     ) catch |err| {
-        std.debug.print("[ERR] Proxy request failed: {}\n", .{err});
+        ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{
+            .{ .key = "error", .value = .{ .string = @errorName(err) } },
+        });
     };
 }
 
@@ -118,38 +143,19 @@ pub fn main() !void {
     };
     defer cfg.deinit();
 
-    std.debug.print("Config resolved:\n", .{});
-    std.debug.print("  listen_port={d} (from {s})\n", .{ cfg.listen_port, cfg.listen_port_src.asStr() });
-    std.debug.print("  target_host={s} (from {s})\n", .{ cfg.target_host, cfg.target_host_src.asStr() });
-    std.debug.print("  target_port={d} (from {s})\n", .{ cfg.target_port, cfg.target_port_src.asStr() });
-    if (cfg.entity_file) |ef| {
-        std.debug.print("  entity_file={s} (from {s})\n", .{ ef, cfg.entity_file_src.asStr() });
-    } else {
-        std.debug.print("  entity_file=null (from {s})\n", .{cfg.entity_file_src.asStr()});
-    }
-    std.debug.print("  fuzzy_threshold={d:.2} (from {s})\n", .{ cfg.fuzzy_threshold, cfg.fuzzy_threshold_src.asStr() });
-    std.debug.print("  max_connections={d} (from {s})\n", .{ cfg.max_connections, cfg.max_connections_src.asStr() });
-    std.debug.print("  log_level={s} (from {s})\n", .{ @tagName(cfg.log_level), cfg.log_level_src.asStr() });
-    std.debug.print("  watch_interval_ms={d} (from {s})\n", .{ cfg.watch_interval_ms, cfg.watch_interval_ms_src.asStr() });
-    if (cfg.tls_cert) |tc| {
-        std.debug.print("  tls_cert={s} (from {s})\n", .{ tc, cfg.tls_cert_src.asStr() });
-    } else {
-        std.debug.print("  tls_cert=null (from {s})\n", .{cfg.tls_cert_src.asStr()});
-    }
-    if (cfg.tls_key) |tk| {
-        std.debug.print("  tls_key={s} (from {s})\n", .{ tk, cfg.tls_key_src.asStr() });
-    } else {
-        std.debug.print("  tls_key=null (from {s})\n", .{cfg.tls_key_src.asStr()});
-    }
-    std.debug.print("  target_tls={} (from {s})\n", .{ cfg.target_tls, cfg.target_tls_src.asStr() });
-    if (cfg.ca_file) |ca| {
-        std.debug.print("  ca_file={s} (from {s})\n", .{ ca, cfg.ca_file_src.asStr() });
-    } else {
-        std.debug.print("  ca_file=null (from {s})\n", .{cfg.ca_file_src.asStr()});
-    }
-    std.debug.print("  tls_no_system_ca={} (from {s})\n", .{ cfg.tls_no_system_ca, cfg.tls_no_system_ca_src.asStr() });
-    std.debug.print("  max_body_size={d} (from {s})\n", .{ cfg.max_body_size, cfg.max_body_size_src.asStr() });
-    std.debug.print("\n", .{});
+    // --- Structured Logger ---
+    var log = Logger.init(cfg.log_level, cfg.audit_log, cfg.log_file) catch |err| {
+        std.debug.print("error: failed to initialise logger: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer log.deinit();
+
+    log.log(.info, "config_resolved", null, &.{
+        .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
+        .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
+        .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
+        .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
+    });
 
     // --- Entity Masking Setup (RCU) ---
     // Heap-allocate so the pointer is stable for the FileWatcher's background
@@ -176,7 +182,10 @@ pub fn main() !void {
             std.process.exit(1);
         };
 
-        std.debug.print("loaded {} entities from {s}\n", .{ initial_snapshot.loaded_names.len, ef });
+        log.log(.info, "entities_loaded", null, &.{
+            .{ .key = "count", .value = .{ .uint = initial_snapshot.loaded_names.len } },
+            .{ .key = "file", .value = .{ .string = ef } },
+        });
 
         const es = try allocator.create(VersionedEntitySet);
         es.* = VersionedEntitySet.init(initial_snapshot);
@@ -190,13 +199,11 @@ pub fn main() !void {
             cfg.fuzzy_threshold,
             allocator,
         );
-        watcher.?.start() catch |err| {
-            std.debug.print("[WARN] Failed to start file watcher: {} — hot-reload disabled\n", .{err});
+        watcher.?.start() catch {
+            log.warn("file_watcher_start_failed", null);
             watcher = null;
         };
     } else if (cfg.admin_api) {
-        // Admin API is enabled but no entity file — create an empty entity set
-        // so the admin API can populate it from scratch via POST/PUT.
         const empty_names = [_][]const u8{};
         const initial_snapshot = versioned_entity_set.loadSnapshotFromNames(
             &empty_names,
@@ -204,15 +211,15 @@ pub fn main() !void {
             1,
             allocator,
         ) catch {
-            std.debug.print("error: failed to create empty entity set for admin API\n", .{});
+            log.err("empty_entity_set_failed", null);
             std.process.exit(1);
         };
-        std.debug.print("Admin API enabled with empty entity set (populate via POST /_admin/entities)\n", .{});
+        log.info("admin_api_enabled", null);
         const es = try allocator.create(VersionedEntitySet);
         es.* = VersionedEntitySet.init(initial_snapshot);
         entity_set = es;
     } else {
-        std.debug.print("WARNING: No entity file provided. Running in SSN-only mode unless X-ZPG-Entities header is present on requests.\n", .{});
+        log.warn("ssn_only_mode", null);
     }
 
     // --- TLS setup ---
@@ -225,71 +232,40 @@ pub fn main() !void {
                 std.debug.print("error: failed to load TLS certificate/key: {}\n", .{err});
                 std.process.exit(1);
             };
-            std.debug.print("TLS: loaded certificate from {s}\n", .{cert_path});
+            log.log(.info, "tls_loaded", null, &.{
+                .{ .key = "cert", .value = .{ .string = cert_path } },
+            });
         }
     }
 
     const tls_enabled = tls_context != null;
     const protocol = if (tls_enabled) "https" else "http";
     const upstream_protocol = if (cfg.target_tls) "https" else "http";
-    std.debug.print("Listening on {s}://127.0.0.1:{}\n", .{ protocol, cfg.listen_port });
-    std.debug.print("Forwarding to {s}://{s}:{}\n", .{ upstream_protocol, cfg.target_host, cfg.target_port });
+    log.log(.info, "server_starting", null, &.{
+        .{ .key = "protocol", .value = .{ .string = protocol } },
+        .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
+        .{ .key = "upstream_protocol", .value = .{ .string = upstream_protocol } },
+        .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
+        .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
+        .{ .key = "max_connections", .value = .{ .uint = cfg.max_connections } },
+        .{ .key = "tls_enabled", .value = .{ .boolean = tls_enabled } },
+    });
 
-    if (entity_set) |es| {
-        const snap = es.acquire();
-        defer es.release(snap);
-        std.debug.print("Entity masking: {} session names loaded (v{})\n", .{ snap.loaded_names.len, snap.version });
-        std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ snap.fuzzy_matcher.variants.len, cfg.fuzzy_threshold * 100.0 });
-        if (watcher != null) {
-            std.debug.print("Hot-reload: enabled (polling every {}ms)\n", .{cfg.watch_interval_ms});
-        } else {
-            std.debug.print("Hot-reload: disabled (admin-only, no file watcher)\n", .{});
-        }
-    } else {
-        std.debug.print("Entity masking: disabled (SSN-only mode)\n", .{});
-        std.debug.print("Fuzzy matching: disabled (SSN-only mode)\n", .{});
-        std.debug.print("Hot-reload: disabled (no entity file)\n", .{});
+    if (!tls_enabled) {
+        log.warn("no_tls_warning", null);
     }
-
-    std.debug.print("Connection pool: shared client with keep-alive (up to 32 upstream connections)\n", .{});
-    std.debug.print("Bidirectional pipeline: mask request -> unmask response\n", .{});
-    std.debug.print("Multi-threaded: up to {} concurrent connections\n", .{cfg.max_connections});
-    if (cfg.admin_api) {
-        std.debug.print("Admin API: enabled at /_admin/entities", .{});
-        if (cfg.admin_token != null) {
-            std.debug.print(" (auth required)", .{});
-        } else {
-            std.debug.print(" (WARNING: no auth token set)", .{});
-        }
-        if (cfg.entity_file_sync) {
-            std.debug.print(" [file-sync on]", .{});
-        }
-        std.debug.print("\n", .{});
-    } else {
-        std.debug.print("Admin API: disabled\n", .{});
-    }
-    if (tls_enabled) {
-        std.debug.print("TLS: enabled (TLS 1.3, AES-128-GCM-SHA256)\n", .{});
-    } else {
-        std.debug.print("WARNING: running without TLS -- not suitable for production\n", .{});
-    }
-    std.debug.print("\n", .{});
 
     // --- Upstream TLS status ---
     if (cfg.target_tls) {
-        std.debug.print("Upstream TLS: enabled\n", .{});
         if (cfg.ca_file) |ca| {
-            std.debug.print("  CA bundle: {s} (from {s})\n", .{ ca, cfg.ca_file_src.asStr() });
-        } else {
-            std.debug.print("  CA bundle: system default\n", .{});
+            log.log(.info, "upstream_tls_ca", null, &.{
+                .{ .key = "ca_file", .value = .{ .string = ca } },
+            });
         }
         if (cfg.tls_no_system_ca) {
-            std.debug.print("  NOTE: system CA bundle suppressed (--tls-no-system-ca) — only --ca-file CAs are trusted\n", .{});
+            log.warn("system_ca_suppressed", null);
         }
-    } else {
-        std.debug.print("Upstream TLS: disabled (plaintext HTTP to upstream)\n", .{});
     }
-    std.debug.print("\n", .{});
 
     var net_server = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", cfg.listen_port), .{
         .reuse_address = true,
@@ -325,8 +301,11 @@ pub fn main() !void {
             // CAs (from --ca-file) will be trusted.
             http_client.next_https_rescan_certs = false;
         } else if (cfg.ca_file != null) {
-            // Custom CAs loaded above; also suppress system rescan so only
-            // our custom CAs are trusted.
+            // When a custom CA is provided without --tls-no-system-ca, we
+            // still suppress the system rescan. This is intentional: mixing
+            // a custom internal CA with the system bundle risks trusting
+            // unexpected public CAs in a compliance-sensitive proxy. Use
+            // --ca-file as the sole trust anchor for deterministic behavior.
             http_client.next_https_rescan_certs = false;
         }
         // When neither flag is set, the default system CA scan applies.
@@ -337,6 +316,8 @@ pub fn main() !void {
     // This is a known limitation to address when the stdlib exposes timeout options.
 
     var active_connections = std.atomic.Value(u32).init(0);
+    var connections_total = std.atomic.Value(u64).init(0);
+    const start_time = std.time.timestamp();
 
     const admin_config = admin.AdminConfig{
         .enabled = cfg.admin_api,
@@ -357,26 +338,31 @@ pub fn main() !void {
         .tls_context = if (tls_context) |*tc| tc else null,
         .target_tls = cfg.target_tls,
         .max_body_size = cfg.max_body_size,
+        .logger = &log,
+        .connections_total = &connections_total,
+        .start_time = start_time,
     };
 
     while (true) {
-        const connection = net_server.accept() catch |err| {
-            std.debug.print("[ERR] Accepting connection: {}\n", .{err});
+        const connection = net_server.accept() catch {
+            log.err("accept_failed", null);
             continue;
         };
+
+        _ = connections_total.fetchAdd(1, .monotonic);
 
         // Enforce connection limit to prevent thread exhaustion under load.
         const current = active_connections.fetchAdd(1, .acquire);
         if (current >= cfg.max_connections) {
-            std.debug.print("[WARN] Connection limit reached ({}/{}), rejecting\n", .{ current + 1, cfg.max_connections });
+            log.warn("connection_limit_reached", null);
             _ = active_connections.fetchSub(1, .release);
             connection.stream.close();
             continue;
         }
 
         // Spawn a thread per connection for concurrent request handling.
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ connection, ctx }) catch |err| {
-            std.debug.print("[ERR] Spawning thread: {}\n", .{err});
+        const thread = std.Thread.spawn(.{}, handleConnection, .{ connection, ctx }) catch {
+            log.err("thread_spawn_failed", null);
             _ = active_connections.fetchSub(1, .release);
             connection.stream.close();
             continue;

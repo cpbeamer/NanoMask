@@ -30,6 +30,8 @@ pub const ConfigSource = enum {
 };
 
 pub const Config = struct {
+    /// Centralised version string — referenced by /healthz and future endpoints.
+    pub const version = "0.1.0";
     listen_port: u16 = 8081,
     listen_port_src: ConfigSource = .default,
     target_host: []const u8 = "httpbin.org",
@@ -64,6 +66,10 @@ pub const Config = struct {
     tls_no_system_ca_src: ConfigSource = .default,
     max_body_size: usize = 10 * 1024 * 1024,
     max_body_size_src: ConfigSource = .default,
+    log_file: ?[]const u8 = null,
+    log_file_src: ConfigSource = .default,
+    audit_log: bool = false,
+    audit_log_src: ConfigSource = .default,
 
     allocator: std.mem.Allocator,
 
@@ -85,6 +91,7 @@ pub const Config = struct {
         InvalidNoSystemCaFlag,
         InvalidMaxBodySize,
         MissingAdminToken,
+        InvalidAuditLogFlag,
         UnknownFlag,
         OutOfMemory,
     };
@@ -107,6 +114,9 @@ pub const Config = struct {
         }
         if (self.ca_file != null and self.ca_file_src == .env_var) {
             self.allocator.free(self.ca_file.?);
+        }
+        if (self.log_file != null and self.log_file_src == .env_var) {
+            self.allocator.free(self.log_file.?);
         }
     }
 
@@ -132,6 +142,8 @@ pub const Config = struct {
             \\  --ca-file <path>            Custom CA bundle PEM for upstream TLS verification
             \\  --tls-no-system-ca          Suppress system CA bundle loading (use with --ca-file for self-signed certs)
             \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
+            \\  --log-file <path>            Write structured JSON logs to file (default: stderr)
+            \\  --audit-log                  Enable per-redaction audit events in log output
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -268,6 +280,19 @@ pub const Config = struct {
             };
             if (config.max_body_size == 0) return error.InvalidMaxBodySize;
             config.max_body_size_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_LOG_FILE")) {
+            config.log_file = try allocator.dupe(u8, value);
+            config.log_file_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_AUDIT_LOG")) {
+            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                config.audit_log = true;
+            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+                config.audit_log = false;
+            } else {
+                std.debug.print("error: NANOMASK_AUDIT_LOG must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidAuditLogFlag;
+            }
+            config.audit_log_src = .env_var;
         }
     }
 
@@ -296,6 +321,8 @@ pub const Config = struct {
             "NANOMASK_CA_FILE",
             "NANOMASK_TLS_NO_SYSTEM_CA",
             "NANOMASK_MAX_BODY_SIZE",
+            "NANOMASK_LOG_FILE",
+            "NANOMASK_AUDIT_LOG",
         };
 
         for (env_keys) |key| {
@@ -513,6 +540,20 @@ pub const Config = struct {
                     return error.InvalidMaxBodySize;
                 }
                 config.max_body_size_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--log-file")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --log-file\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.log_file != null and config.log_file_src == .env_var) {
+                    allocator.free(config.log_file.?);
+                }
+                config.log_file = args[i];
+                config.log_file_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--audit-log")) {
+                config.audit_log = true;
+                config.audit_log_src = .cli_flag;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;

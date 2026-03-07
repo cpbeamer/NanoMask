@@ -310,7 +310,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 > **In plain English:** The proxy currently processes requests silently with no record of what happened. In regulated environments, every action must be logged and traceable. This epic adds machine-readable logs that compliance tools (Splunk, Elastic, CloudWatch) can ingest.
 
-#### 5.1 — Structured JSON log output
+#### ✅ 5.1 — Structured JSON log output
 
 **Type**: Feature  
 **Estimate**: 1.5 days  
@@ -341,7 +341,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 5.2 — Redaction audit events
+#### ✅ 5.2 — Redaction audit events
 
 **Type**: Feature  
 **Estimate**: 1 day  
@@ -368,7 +368,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 5.3 — Health check endpoint
+#### ✅ 5.3 — Health check endpoint
 
 **Type**: Feature  
 **Estimate**: 0.5 day  

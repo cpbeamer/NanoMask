@@ -7,6 +7,10 @@ const admin = @import("admin.zig");
 const versioned_entity_set = @import("versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const http_util = @import("http_util.zig");
+const config_mod = @import("config.zig");
+const Config = config_mod.Config;
+const logger_mod = @import("logger.zig");
+const Logger = logger_mod.Logger;
 
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
@@ -41,9 +45,10 @@ fn parseEntityHeader(header_value: []const u8, allocator: std.mem.Allocator) ![]
     return try names.toOwnedSlice(allocator);
 }
 
-pub fn handleRequest(
+/// Bundles all context needed by the proxy pipeline, replacing the previous
+/// 14-parameter function signature for clarity and maintainability.
+pub const ProxyContext = struct {
     allocator: std.mem.Allocator,
-    request: *http.Server.Request,
     client: *std.http.Client,
     target_host: []const u8,
     target_port: u16,
@@ -53,17 +58,74 @@ pub fn handleRequest(
     entity_set: ?*VersionedEntitySet,
     admin_config: admin.AdminConfig,
     max_body_size: usize,
+    log: *Logger,
+    session_id: []const u8,
+    active_connections: *std.atomic.Value(u32),
+    connections_total: *std.atomic.Value(u64),
+    start_time: i64,
+};
+
+pub fn handleRequest(
+    request: *http.Server.Request,
+    ctx: ProxyContext,
 ) !void {
+    const allocator = ctx.allocator;
+    const target_host = ctx.target_host;
+    const target_port = ctx.target_port;
+    const target_tls = ctx.target_tls;
+    const max_body_size = ctx.max_body_size;
+    const log = ctx.log;
+    const session_id = ctx.session_id;
+    const client = ctx.client;
+    const session_fuzzy_matcher = ctx.session_fuzzy_matcher;
+    const entity_set = ctx.entity_set;
+    const admin_config = ctx.admin_config;
+    const request_start = std.time.nanoTimestamp();
     const method = request.head.method;
     const uri_str = request.head.target;
 
-    // --- Admin API interception (before proxying) ---
-    if (try admin.handleAdminRequest(request, entity_set, admin_config, allocator)) {
-        std.debug.print("[ADM] {s} {s} -> handled\n", .{ @tagName(method), uri_str });
+    // --- Health check endpoint (before admin and proxying) ---
+    if (method == .GET and std.mem.eql(u8, uri_str, "/healthz")) {
+        log.debug("healthz", session_id);
+        // Clamp to zero if system clock jumped backward (NTP correction)
+        // to avoid @intCast panic on negative delta.
+        const raw_uptime = std.time.timestamp() - ctx.start_time;
+        const uptime_s: u64 = if (raw_uptime < 0) 0 else @intCast(raw_uptime);
+        const active = ctx.active_connections.load(.acquire);
+        const total = ctx.connections_total.load(.acquire);
+
+        var json_buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&json_buf,
+            \\{{"status":"ok","uptime_s":{d},"connections_active":{d},"connections_total":{d},"version":"{s}"}}
+        , .{ uptime_s, active, total, Config.version }) catch unreachable;
+
+        var resp_buf: [2048]u8 = undefined;
+        var response_writer = try request.respondStreaming(&resp_buf, .{
+            .respond_options = .{
+                .status = .ok,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                },
+            },
+        });
+        try response_writer.writer.writeAll(body);
+        try response_writer.end();
         return;
     }
 
-    std.debug.print("[PRX] {s} {s}\n", .{ @tagName(method), uri_str });
+    // --- Admin API interception (before proxying) ---
+    if (try admin.handleAdminRequest(request, entity_set, admin_config, allocator)) {
+        log.log(.info, "admin_request", session_id, &.{
+            .{ .key = "method", .value = .{ .string = @tagName(method) } },
+            .{ .key = "path", .value = .{ .string = uri_str } },
+        });
+        return;
+    }
+
+    log.log(.info, "request_received", session_id, &.{
+        .{ .key = "method", .value = .{ .string = @tagName(method) } },
+        .{ .key = "path", .value = .{ .string = uri_str } },
+    });
 
     // --- Security: reject absolute-form URIs and non-path targets ---
     if (uri_str.len == 0 or uri_str[0] != '/') {
@@ -86,25 +148,32 @@ pub fn handleRequest(
         // Check for X-ZPG-Entities header
         if (findHeader(request.head_buffer, "X-ZPG-Entities")) |header_val| {
             const names = parseEntityHeader(header_val, allocator) catch |err| {
-                std.debug.print("[WARN] Failed to parse X-ZPG-Entities header: {}\n", .{err});
-                break :blk session_entity_map;
+                log.log(.warn, "entity_header_parse_failed", session_id, &.{
+                    .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                });
+                break :blk ctx.session_entity_map;
             };
             defer allocator.free(names);
 
             if (names.len > max_header_entities) {
-                std.debug.print("[WARN] X-ZPG-Entities header contains {d} entities, capping at {d}\n", .{ names.len, max_header_entities });
+                log.log(.warn, "entity_header_capped", session_id, &.{
+                    .{ .key = "provided", .value = .{ .uint = names.len } },
+                    .{ .key = "max", .value = .{ .uint = max_header_entities } },
+                });
             }
 
             const capped_len = @min(names.len, max_header_entities);
             if (capped_len > 0) {
                 per_request_map = entity_mask.EntityMap.init(allocator, names[0..capped_len]) catch |err| {
-                    std.debug.print("[WARN] Failed to build entity map from header: {}\n", .{err});
-                    break :blk session_entity_map;
+                    log.log(.warn, "entity_map_build_failed", session_id, &.{
+                        .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                    });
+                    break :blk ctx.session_entity_map;
                 };
                 break :blk &per_request_map.?;
             }
         }
-        break :blk session_entity_map;
+        break :blk ctx.session_entity_map;
     };
 
     // --- Forward request to upstream ---
@@ -126,7 +195,7 @@ pub fn handleRequest(
     var client_req = client.request(method, target_uri, .{
         .headers = .{ .content_type = content_type_override },
     }) catch |e| {
-        std.debug.print("client.request failed: {}\n", .{e});
+        log.log(.error_, "upstream_connect_failed", session_id, &.{});
         return e;
     };
     defer client_req.deinit();
@@ -157,7 +226,9 @@ pub fn handleRequest(
 
                 bytes_forwarded += bytes_read;
                 if (bytes_forwarded > max_body_size) {
-                    std.debug.print("[WARN] Request body exceeds max size ({d} bytes), aborting\n", .{max_body_size});
+                    log.log(.warn, "body_too_large", session_id, &.{
+                        .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
+                    });
                     return error.PayloadTooLarge;
                 }
                 
@@ -237,7 +308,9 @@ pub fn handleRequest(
                 }
             }
         } else |err| {
-            std.debug.print("[WARN] Failed to read request body: {}\n", .{err});
+            log.log(.warn, "body_read_failed", session_id, &.{
+                .{ .key = "error", .value = .{ .string = @errorName(err) } },
+            });
         }
         
         try req_body.end();
@@ -255,7 +328,13 @@ pub fn handleRequest(
     var redirect_buffer: [4096]u8 = undefined;
     var downstream_res = try client_req.receiveHead(&redirect_buffer);
 
-    std.debug.print("[PRX] <- {d}\n", .{@intFromEnum(downstream_res.head.status)});
+    const upstream_latency_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - request_start, 1000));
+
+    log.log(.info, "upstream_forwarded", session_id, &.{
+        .{ .key = "status", .value = .{ .uint = @intFromEnum(downstream_res.head.status) } },
+        .{ .key = "target_host", .value = .{ .string = target_host } },
+        .{ .key = "upstream_latency_us", .value = .{ .uint = upstream_latency_us } },
+    });
 
     // Extract Content-Type before calling .reader() because .reader() invalidates response.head strings!
     const upstream_ct = downstream_res.head.content_type;
@@ -313,6 +392,11 @@ pub fn handleRequest(
     }
     
     try response_writer.end();
+
+    const total_latency_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - request_start, 1000));
+    log.log(.info, "response_sent", session_id, &.{
+        .{ .key = "total_latency_us", .value = .{ .uint = total_latency_us } },
+    });
 }
 
 // ===========================================================================
