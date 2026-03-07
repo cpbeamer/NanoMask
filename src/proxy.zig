@@ -78,50 +78,6 @@ pub fn handleRequest(
         break :blk session_entity_map;
     };
 
-    // --- Read incoming request body (if present) ---
-    var req_body: std.ArrayListUnmanaged(u8) = .empty;
-    defer req_body.deinit(allocator);
-
-    const has_body = method.requestHasBody();
-    if (has_body) {
-        var body_read_buf: [8192]u8 = undefined;
-        if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
-            try body_reader.appendRemainingUnlimited(allocator, &req_body);
-        } else |err| {
-            std.debug.print("[WARN] Failed to read request body: {}\n", .{err});
-        }
-    }
-
-    // --- Request path: apply privacy pipeline to outbound body ---
-    // sanitized_body is always a mutable owned allocation so that
-    // sendBodyComplete (which requires []u8) can use it directly
-    // without @constCast.
-    var sanitized_body: ?[]u8 = null;
-    defer if (sanitized_body) |sb| allocator.free(sb);
-
-    if (req_body.items.len > 0) {
-        // 1. Entity mask: names -> aliases
-        if (active_entity_map) |em| {
-            const masked = try em.mask(req_body.items, allocator);
-            // 2. SSN redact: digits -> * (in-place on the masked buffer)
-            redact.redactSsn(masked);
-            // 3. Fuzzy name redact: catch OCR variants missed by exact match
-            const active_fuzzy = session_fuzzy_matcher;
-            if (active_fuzzy) |fm| {
-                const fuzzy_result = try fm.fuzzyRedact(masked, em.getAliases(), &.{}, allocator);
-                allocator.free(masked);
-                sanitized_body = fuzzy_result;
-            } else {
-                sanitized_body = masked;
-            }
-        } else {
-            // No entity map — SSN redact in-place on a mutable copy
-            const duped = try allocator.dupe(u8, req_body.items);
-            redact.redactSsn(duped);
-            sanitized_body = duped;
-        }
-    }
-
     // --- Forward request to upstream ---
     var url_buf: [max_url_len]u8 = undefined;
     const target_url_str = try std.fmt.bufPrint(&url_buf, "http://{s}:{d}{s}", .{ target_host, target_port, uri_str });
@@ -135,17 +91,110 @@ pub fn handleRequest(
         break :blk .default;
     };
 
+    const has_body = method.requestHasBody();
+
     var client_req = try client.request(method, target_uri, .{
         .headers = .{ .content_type = content_type_override },
+        .transfer_encoding = if (has_body) .chunked else .none,
     });
     defer client_req.deinit();
 
-    if (has_body and sanitized_body != null) {
-        // Send with body — sendBodyComplete sets content-length and flushes.
-        // sanitized_body is always a mutable owned []u8, satisfying the API.
-        try client_req.sendBodyComplete(sanitized_body.?);
+    // --- Request path: apply privacy pipeline to outbound body ---
+    if (has_body) {
+        var ac_state: ?entity_mask.AcChunkState = null;
+        if (active_entity_map) |em| ac_state = em.initChunkState();
+        defer if (ac_state) |*s| s.deinit(allocator);
+
+        var ssn_state = redact.SsnChunkState{};
+
+        var fuzzy_state: ?fuzzy_match.FuzzyChunkState = null;
+        if (session_fuzzy_matcher) |fm| fuzzy_state = fm.initChunkState();
+        defer if (fuzzy_state) |*s| s.deinit(allocator);
+
+        var body_read_buf: [8192]u8 = undefined;
+        if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
+            var raw_chunk_buf: [8192]u8 = undefined;
+            while (true) {
+                const bytes_read = try body_reader.read(&raw_chunk_buf);
+                if (bytes_read == 0) break;
+                
+                const raw_chunk = raw_chunk_buf[0..bytes_read];
+                
+                var masked_chunk: []u8 = undefined;
+                var masked_allocated = false;
+                if (active_entity_map) |em| {
+                    masked_chunk = try em.maskChunked(raw_chunk, &ac_state.?, allocator);
+                    masked_allocated = true;
+                } else {
+                    masked_chunk = try allocator.dupe(u8, raw_chunk);
+                    masked_allocated = true;
+                }
+                defer if (masked_allocated) allocator.free(masked_chunk);
+
+                const ssn_res = redact.redactSsnChunked(masked_chunk, &ssn_state);
+
+                if (session_fuzzy_matcher) |fm| {
+                    const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
+                    if (ssn_res.finalized.len > 0) {
+                        const f1 = try fm.fuzzyRedactChunked(ssn_res.finalized, &fuzzy_state.?, em_aliases, &.{});
+                        defer allocator.free(f1);
+                        if (f1.len > 0) try client_req.writeAll(f1);
+                    }
+                    if (ssn_res.emitted.len > 0) {
+                        const f2 = try fm.fuzzyRedactChunked(ssn_res.emitted, &fuzzy_state.?, em_aliases, &.{});
+                        defer allocator.free(f2);
+                        if (f2.len > 0) try client_req.writeAll(f2);
+                    }
+                } else {
+                    if (ssn_res.finalized.len > 0) try client_req.writeAll(ssn_res.finalized);
+                    if (ssn_res.emitted.len > 0) try client_req.writeAll(ssn_res.emitted);
+                }
+            }
+            
+            // Flushes
+            var ac_flushed: ?[]u8 = null;
+            if (active_entity_map) |em| {
+                ac_flushed = try ac_state.?.flush(em, allocator);
+            }
+            defer if (ac_flushed) |f| allocator.free(f);
+
+            var ssn_final_emissions = std.ArrayList(u8).init(allocator);
+            defer ssn_final_emissions.deinit();
+
+            if (ac_flushed) |f| {
+                if (f.len > 0) {
+                    const ssn_res = redact.redactSsnChunked(f, &ssn_state);
+                    if (ssn_res.finalized.len > 0) try ssn_final_emissions.appendSlice(ssn_res.finalized);
+                    if (ssn_res.emitted.len > 0) try ssn_final_emissions.appendSlice(ssn_res.emitted);
+                }
+            }
+            
+            const ssn_flushed = ssn_state.flush();
+            if (ssn_flushed.len > 0) {
+                try ssn_final_emissions.appendSlice(ssn_flushed);
+            }
+
+            if (session_fuzzy_matcher) |fm| {
+                const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
+                if (ssn_final_emissions.items.len > 0) {
+                    const f_res = try fm.fuzzyRedactChunked(ssn_final_emissions.items, &fuzzy_state.?, em_aliases, &.{});
+                    defer allocator.free(f_res);
+                    if (f_res.len > 0) try client_req.writeAll(f_res);
+                }
+                const fuzzy_flushed = try fuzzy_state.?.flush(fm, em_aliases, &.{}, allocator);
+                defer allocator.free(fuzzy_flushed);
+                if (fuzzy_flushed.len > 0) try client_req.writeAll(fuzzy_flushed);
+            } else {
+                if (ssn_final_emissions.items.len > 0) {
+                    try client_req.writeAll(ssn_final_emissions.items);
+                }
+            }
+        } else |err| {
+            std.debug.print("[WARN] Failed to read request body: {}\n", .{err});
+        }
+        
+        try client_req.finish();
     } else {
-        // Bodiless request (GET, DELETE, etc.)
         try client_req.sendBodilessUnflushed();
         if (client_req.connection) |conn| {
             try conn.flush();
@@ -159,45 +208,62 @@ pub fn handleRequest(
     var transfer_buf: [8192]u8 = undefined;
     var downstream_reader = downstream_res.reader(&transfer_buf);
 
-    var resp_body: std.ArrayListUnmanaged(u8) = .empty;
-    defer resp_body.deinit(allocator);
-    try downstream_reader.appendRemainingUnlimited(allocator, &resp_body);
-
-    // --- Response path: unmask aliases back to real names ---
-    var final_response: []const u8 = resp_body.items;
-    var unmasked_buf: ?[]u8 = null;
-    defer if (unmasked_buf) |ub| allocator.free(ub);
-
-    if (active_entity_map) |em| {
-        if (resp_body.items.len > 0) {
-            unmasked_buf = try em.unmask(resp_body.items, allocator);
-            final_response = unmasked_buf.?;
-        }
-    }
-
-    std.debug.print("[PRX] <- {d} ({} bytes)\n", .{
-        @intFromEnum(downstream_res.head.status),
-        final_response.len,
-    });
+    std.debug.print("[PRX] <- {d}\n", .{@intFromEnum(downstream_res.head.status)});
 
     // Forward upstream Content-Type so the client receives the correct media type.
     const upstream_ct = downstream_res.head.content_type;
     var ct_headers = [_]http.Header{.{ .name = "Content-Type", .value = "" }};
+    var extra_headers: []const http.Header = &.{};
 
     if (upstream_ct != .default) {
         ct_headers[0].value = switch (upstream_ct) {
             .override => |v| v,
             .default => "",
         };
-        try request.respond(final_response, .{
-            .status = downstream_res.head.status,
-            .extra_headers = &ct_headers,
-        });
-    } else {
-        try request.respond(final_response, .{
-            .status = downstream_res.head.status,
-        });
+        extra_headers = ct_headers[0..1];
     }
+
+    // --- Response path: unmask aliases back to real names ---
+    var resp_buf8: [8192]u8 = undefined;
+    var response_writer = try request.respondStreaming(&resp_buf8, .{
+        .respond_options = .{
+            .status = downstream_res.head.status,
+            .extra_headers = extra_headers,
+        },
+    });
+
+    if (downstream_res.head.method.responseHasBody()) {
+        var unmask_state: ?entity_mask.AcChunkState = null;
+        if (active_entity_map) |em| {
+            unmask_state = em.initUnmaskChunkState();
+        }
+        defer if (unmask_state) |*s| s.deinit(allocator);
+
+        var resp_buf: [8192]u8 = undefined;
+        while (true) {
+            const bytes_read = try downstream_reader.read(&resp_buf);
+            if (bytes_read == 0) break;
+            
+            const raw_chunk = resp_buf[0..bytes_read];
+            
+            if (active_entity_map) |em| {
+                const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
+                defer allocator.free(unmasked);
+                if (unmasked.len > 0) try response_writer.writeAll(unmasked);
+            } else {
+                try response_writer.writeAll(raw_chunk);
+            }
+        }
+        
+        // Flush unmask state
+        if (active_entity_map) |em| {
+            const flushed = try unmask_state.?.flushUnmask(em, allocator);
+            defer allocator.free(flushed);
+            if (flushed.len > 0) try response_writer.writeAll(flushed);
+        }
+    }
+    
+    try response_writer.end();
 }
 
 // ===========================================================================

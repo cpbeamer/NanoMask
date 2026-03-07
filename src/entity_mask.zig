@@ -98,10 +98,14 @@ pub const AhoCorasick = struct {
             map[c] = idx;
             idx += 1;
         }
-        map[' '] = idx; idx += 1;
-        map['.'] = idx; idx += 1;
-        map['-'] = idx; idx += 1;
-        map['\''] = idx; idx += 1;
+        map[' '] = idx;
+        idx += 1;
+        map['.'] = idx;
+        idx += 1;
+        map['-'] = idx;
+        idx += 1;
+        map['\''] = idx;
+        idx += 1;
         // all mapped characters fit under 64. Unmapped bytes use index 0.
         break :blk map;
     };
@@ -425,6 +429,19 @@ pub const AcChunkState = struct {
         self.len = 0;
         return result;
     }
+
+    /// Emit remaining pending bytes after the last unmask chunk.
+    /// Returns an owned slice — caller must free it.
+    pub fn flushUnmask(
+        self: *AcChunkState,
+        em: *const EntityMap,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (self.len == 0) return try allocator.alloc(u8, 0);
+        const result = try em.unmask(self.pending[0..self.len], allocator);
+        self.len = 0;
+        return result;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -611,6 +628,79 @@ pub const EntityMap = struct {
             &self.forward_ac,
             combined,
             self.alias_const_slices,
+            safe_end,
+            &consumed,
+            allocator,
+        );
+
+        // Save raw tail (from consumed onward) as new pending.
+        const actual_pending = total - consumed;
+        state.len = actual_pending;
+        if (actual_pending > 0) {
+            @memcpy(state.pending[0..actual_pending], combined[consumed..][0..actual_pending]);
+        }
+
+        return result;
+    }
+
+    /// Create initial chunk state for streaming unmasking.
+    /// Caller MUST call `state.deinit(allocator)` when finished to free internal buffers.
+    pub fn initUnmaskChunkState(self: *const EntityMap) AcChunkState {
+        var max_len: usize = 0;
+        for (self.reverse_ac.pattern_lengths) |pl| {
+            if (pl > max_len) max_len = pl;
+        }
+        return AcChunkState{
+            .overlap = if (max_len > 0) max_len - 1 else 0,
+        };
+    }
+
+    /// Process one chunk for entity unmasking in streaming mode.
+    ///
+    /// Scans the full `pending ++ chunk` buffer for reverse matches.
+    /// Patterns spanning the safe/pending boundary are deferred to the next call.
+    ///
+    /// Returns an owned output slice — caller must free it.
+    /// After all chunks, call `state.flushUnmask(&em, allocator)` for the tail.
+    pub fn unmaskChunked(
+        self: *const EntityMap,
+        chunk: []const u8,
+        state: *AcChunkState,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (chunk.len == 0) {
+            return try allocator.alloc(u8, 0);
+        }
+
+        const old_pending_len = state.len;
+        const total = old_pending_len + chunk.len;
+
+        // If combined data is smaller than the overlap window, just accumulate.
+        if (total <= state.overlap) {
+            @memcpy(state.pending[old_pending_len..][0..chunk.len], chunk);
+            state.len = total;
+            return try allocator.alloc(u8, 0);
+        }
+
+        // Zero-allocation path: reuse the buffer inside state
+        try state.combined_buf.resize(allocator, total);
+        const combined = state.combined_buf.items;
+
+        if (old_pending_len > 0) {
+            @memcpy(combined[0..old_pending_len], state.pending[0..old_pending_len]);
+        }
+        @memcpy(combined[old_pending_len..], chunk);
+
+        // safe_end: raw position up to which we emit unmasked output.
+        // Everything from safe_end onward becomes new pending.
+        const new_pending_len = @min(state.overlap, total);
+        const safe_end = total - new_pending_len;
+
+        var consumed: usize = undefined;
+        const result = try replaceAllBounded(
+            &self.reverse_ac,
+            combined,
+            self.name_const_slices,
             safe_end,
             &consumed,
             allocator,
@@ -836,7 +926,7 @@ test "bench - EntityMap mask throughput" {
     const allocator = std.testing.allocator;
 
     const names = [_][]const u8{
-        "John Doe",      "Jane Smith",    "Dr. Johnson",
+        "John Doe",      "Jane Smith",   "Dr. Johnson",
         "Mary Williams", "Robert Brown",
     };
     var em = try EntityMap.init(allocator, &names);
