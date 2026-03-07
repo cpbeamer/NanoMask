@@ -143,14 +143,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
-    //
-    // The Zig build system is entirely implemented in userland, which means
-    // that it cannot hook into private compiler APIs. All compilation work
-    // orchestrated by the build system will result in other Zig compiler
-    // subcommands being invoked with the right flags defined. You can observe
-    // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
-    //
-    // Lastly, the Zig build system is relatively simple and self-contained,
-    // and reading its source code will allow you to master it.
+
+    // --- Benchmark step (opt-in: `zig build bench`) ---
+    // Creates a test executable with is_benchmark=true so benchmark tests run.
+    const bench_options = b.addOptions();
+    bench_options.addOption(bool, "is_benchmark", true);
+
+    const bench_mod = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    bench_mod.root_module.addOptions("build_options", bench_options);
+    const run_bench = b.addRunArtifact(bench_mod);
+    const bench_step = b.step("bench", "Run benchmarks (opt-in, ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }
