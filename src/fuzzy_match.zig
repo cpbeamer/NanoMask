@@ -80,12 +80,33 @@ fn isPunctuation(ch: u8) bool {
 /// Pattern must be ≤ 64 characters; text can be any length.
 /// Returns the exact edit distance.
 pub fn myersDistance(pattern: []const u8, text: []const u8) error{PatternTooLong}!usize {
+    return myersDistanceBounded(pattern, text, std.math.maxInt(usize));
+}
+
+/// Compute edit distance with Ukkonen cut-off: if the running score
+/// exceeds `max_distance` at any column, returns `max_distance + 1`
+/// immediately without processing the remaining text. This is the
+/// key optimization for threshold-based fuzzy matching — most
+/// non-matching windows terminate after just 2-3 characters.
+pub fn myersDistanceBounded(
+    pattern: []const u8,
+    text: []const u8,
+    max_distance: usize,
+) error{PatternTooLong}!usize {
     const m = pattern.len;
     const n = text.len;
 
-    if (m == 0) return n;
-    if (n == 0) return m;
+    // Saturating sentinel: max_distance + 1 without overflow
+    const sentinel = max_distance +| 1;
+
+    if (m == 0) return @min(n, sentinel);
+    if (n == 0) return @min(m, sentinel);
     if (m > 64) return error.PatternTooLong;
+
+    // Quick lower-bound check: if the length difference alone exceeds
+    // max_distance, we can't possibly match.
+    const len_diff = if (m > n) m - n else n - m;
+    if (len_diff > max_distance) return sentinel;
 
     // Build position bitmasks: peq[c] has bit i set if pattern[i] == c
     var peq: [256]u64 = .{0} ** 256;
@@ -94,25 +115,21 @@ pub fn myersDistance(pattern: []const u8, text: []const u8) error{PatternTooLong
     }
 
     // Myers' bit-vector state
-    var pv: u64 = std.math.maxInt(u64); // positive vertical delta = all 1s
-    var mv: u64 = 0; // negative vertical delta = all 0s
-    var score: usize = m; // current distance (starts at pattern length)
+    var pv: u64 = std.math.maxInt(u64);
+    var mv: u64 = 0;
+    var score: usize = m;
 
-    // High bit mask for the pattern length
     const last_bit: u64 = @as(u64, 1) << @intCast(m - 1);
 
-    for (text) |ch| {
+    for (text, 0..) |ch, j| {
         var eq = peq[std.ascii.toLower(ch)];
 
-        // Step 1: compute horizontal deltas
         const xv = eq | mv;
         eq |= ((eq & pv) +% pv) ^ pv;
 
-        // Step 2: compute new positive/negative vertical deltas
         var ph = mv | ~(eq | pv);
         var mh = pv & eq;
 
-        // Step 3: update score
         if ((ph & last_bit) != 0) {
             score += 1;
         }
@@ -120,7 +137,12 @@ pub fn myersDistance(pattern: []const u8, text: []const u8) error{PatternTooLong
             score -= 1;
         }
 
-        // Step 4: shift deltas for next column
+        // Ukkonen cut-off for Myers' bit-vector: the score at column j
+        // can still improve by at most (n - j - 1) from remaining text.
+        // If even that best case exceeds max_distance, abort early.
+        const remaining = n - j - 1;
+        if (score > max_distance +| remaining) return sentinel;
+
         ph = (ph << 1) | 1;
         mh = mh << 1;
         pv = mh | ~(xv | ph);
@@ -137,6 +159,64 @@ pub fn similarity(pattern: []const u8, text: []const u8) error{PatternTooLong}!f
     const max_len = @max(pattern.len, text.len);
     if (max_len == 0) return 1.0;
     return 1.0 - @as(f64, @floatFromInt(dist)) / @as(f64, @floatFromInt(max_len));
+}
+
+/// Compute similarity with early termination: uses bounded Myers to
+/// avoid processing the full text when the result cannot meet threshold.
+pub fn similarityBounded(
+    pattern: []const u8,
+    text: []const u8,
+    threshold: f64,
+) error{PatternTooLong}!f64 {
+    const max_len = @max(pattern.len, text.len);
+    if (max_len == 0) return 1.0;
+    // max_distance is the largest edit distance that still meets threshold
+    const max_dist_f = @floor(@as(f64, @floatFromInt(max_len)) * (1.0 - threshold));
+    const max_distance: usize = @intFromFloat(max_dist_f);
+    const dist = try myersDistanceBounded(pattern, text, max_distance);
+    if (dist > max_distance) return 0.0; // early-terminated, below threshold
+    return 1.0 - @as(f64, @floatFromInt(dist)) / @as(f64, @floatFromInt(max_len));
+}
+
+// ---------------------------------------------------------------------------
+// Stack-Buffer Normalization
+// ---------------------------------------------------------------------------
+
+/// Maximum buffer size for stack-based normalization. Names are always
+/// well under 128 characters, so this covers all realistic windows.
+const stack_norm_max = 128;
+
+/// Normalize text into a caller-provided stack buffer. Returns the
+/// slice of `buf` that was written to, or null if the input exceeds
+/// the buffer capacity. Zero heap allocations.
+fn normalizeStackBuf(input: []const u8, buf: *[stack_norm_max]u8) ?[]const u8 {
+    var len: usize = 0;
+    var last_was_space = true;
+
+    for (input) |ch| {
+        if (isPunctuation(ch)) continue;
+
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+            if (!last_was_space) {
+                if (len >= stack_norm_max) return null;
+                buf[len] = ' ';
+                len += 1;
+                last_was_space = true;
+            }
+        } else {
+            if (len >= stack_norm_max) return null;
+            buf[len] = std.ascii.toLower(ch);
+            len += 1;
+            last_was_space = false;
+        }
+    }
+
+    // Trim trailing space
+    if (len > 0 and buf[len - 1] == ' ') {
+        len -= 1;
+    }
+
+    return buf[0..len];
 }
 
 // ---------------------------------------------------------------------------
@@ -446,9 +526,9 @@ pub const FuzzyMatcher = struct {
                     const window_filter = buildRawTrigramFilter(window_text);
                     if ((window_filter & variant.trigram_filter) == 0) continue;
 
-                    // --- Full comparison (allocates normalized copy) ---
-                    const window_norm = try normalize(window_text, allocator);
-                    defer allocator.free(window_norm);
+                    // --- Full comparison (stack-buffer, zero alloc) ---
+                    var norm_buf: [stack_norm_max]u8 = undefined;
+                    const window_norm = normalizeStackBuf(window_text, &norm_buf) orelse continue;
 
                     const norm_max = @max(variant.normalized.len, window_norm.len);
                     const norm_min = @min(variant.normalized.len, window_norm.len);
@@ -457,7 +537,8 @@ pub const FuzzyMatcher = struct {
                     const len_ratio = @as(f64, @floatFromInt(norm_min)) / @as(f64, @floatFromInt(norm_max));
                     if (len_ratio < self.threshold) continue;
 
-                    const sim = similarity(variant.normalized, window_norm) catch continue;
+                    // Use bounded similarity for Ukkonen early-exit
+                    const sim = similarityBounded(variant.normalized, window_norm, self.threshold) catch continue;
 
                     if (sim >= self.threshold) {
                         try matches.append(allocator, .{
