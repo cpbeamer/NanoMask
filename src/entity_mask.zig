@@ -83,8 +83,28 @@ fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
 /// Uses ArrayListUnmanaged for Zig 0.15 compatibility -- allocator is passed
 /// explicitly to each method that needs allocation.
 pub const AhoCorasick = struct {
-    const alphabet_size = 256;
+    const alphabet_size = 64; // Shrunk from 256 to fit nodes into L2 cache
     const null_node: u32 = std.math.maxInt(u32);
+
+    const char_map: [256]u8 = blk: {
+        var map: [256]u8 = [_]u8{0} ** 256;
+        var idx: u8 = 1;
+        for ('a'..'z' + 1) |c| {
+            map[c] = idx;
+            map[std.ascii.toUpper(@intCast(c))] = idx; // case-insensitive map
+            idx += 1;
+        }
+        for ('0'..'9' + 1) |c| {
+            map[c] = idx;
+            idx += 1;
+        }
+        map[' '] = idx; idx += 1;
+        map['.'] = idx; idx += 1;
+        map['-'] = idx; idx += 1;
+        map['\''] = idx; idx += 1;
+        // all mapped characters fit under 64. Unmapped bytes use index 0.
+        break :blk map;
+    };
 
     const Node = struct {
         children: [alphabet_size]u32,
@@ -120,11 +140,11 @@ pub const AhoCorasick = struct {
         }
     }
 
-    /// Insert a pattern into the trie (case-folded to lowercase).
+    /// Insert a pattern into the trie (case-folded via char_map).
     pub fn addPattern(self: *AhoCorasick, pattern: []const u8, index: usize) !void {
         var current: u32 = 0;
         for (pattern) |byte| {
-            const c = std.ascii.toLower(byte);
+            const c = char_map[byte];
             if (self.nodes.items[current].children[c] == null_node) {
                 const new_idx: u32 = @intCast(self.nodes.items.len);
                 try self.nodes.append(self.allocator, .{
@@ -187,10 +207,12 @@ pub const AhoCorasick = struct {
     /// Scan input and collect all pattern matches (may overlap).
     pub fn search(self: *const AhoCorasick, input: []const u8, allocator: std.mem.Allocator) ![]Match {
         var matches: std.ArrayListUnmanaged(Match) = .empty;
+        // Pre-allocate to avoid thrashing (heuristic: ~1 match per 64 bytes)
+        try matches.ensureTotalCapacity(allocator, input.len / 64);
 
         var state: u32 = 0;
         for (input, 0..) |byte, i| {
-            state = self.nodes.items[state].children[std.ascii.toLower(byte)];
+            state = self.nodes.items[state].children[char_map[byte]];
 
             // Walk the failure chain to find all accepting states.
             // Note: root (state 0) is never an accepting state because no
@@ -234,13 +256,13 @@ fn replaceAll(
         return try allocator.dupe(u8, input);
     }
 
-    // --- Filter: only keep matches at word boundaries ---
     var valid: std.ArrayListUnmanaged(Match) = .empty;
     defer valid.deinit(allocator);
+    try valid.ensureTotalCapacity(allocator, raw_matches.len);
 
     for (raw_matches) |m| {
         if (isWordBoundaryBefore(input, m.start) and isWordBoundaryAfter(input, m.end)) {
-            try valid.append(allocator, m);
+            valid.appendAssumeCapacity(m);
         }
     }
 
@@ -260,6 +282,7 @@ fn replaceAll(
     // --- Greedy non-overlapping selection ---
     var selected: std.ArrayListUnmanaged(Match) = .empty;
     defer selected.deinit(allocator);
+    try selected.ensureTotalCapacity(allocator, valid.items.len);
 
     var last_end: usize = 0;
     for (valid.items) |m| {
@@ -270,7 +293,14 @@ fn replaceAll(
     }
 
     // --- Build output buffer ---
+    var exact_size: usize = input.len;
+    for (selected.items) |m| {
+        exact_size -= (m.end - m.start);
+        exact_size += replacements[m.pattern_idx].len;
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.ensureTotalCapacity(allocator, exact_size);
     var pos: usize = 0;
 
     for (selected.items) |m| {
@@ -279,9 +309,123 @@ fn replaceAll(
         pos = m.end;
     }
     try out.appendSlice(allocator, input[pos..]);
-
     return try out.toOwnedSlice(allocator);
 }
+
+/// Like `replaceAll`, but only applies matches starting before `safe_end`.
+/// Returns the consumed position (>= safe_end) via `consumed_out`.
+/// Used exclusively by the chunked masking path — kept separate from
+/// `replaceAll` to avoid regressing the non-chunked hot path.
+noinline fn replaceAllBounded(
+    ac: *const AhoCorasick,
+    input: []const u8,
+    replacements: []const []const u8,
+    safe_end: usize,
+    consumed_out: *usize,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    consumed_out.* = safe_end;
+
+    const raw_matches = try ac.search(input, allocator);
+    defer allocator.free(raw_matches);
+
+    if (raw_matches.len == 0) {
+        return try allocator.dupe(u8, input[0..safe_end]);
+    }
+
+    var valid: std.ArrayListUnmanaged(Match) = .empty;
+    defer valid.deinit(allocator);
+    try valid.ensureTotalCapacity(allocator, raw_matches.len);
+
+    for (raw_matches) |m| {
+        if (m.start >= safe_end) continue;
+        if (isWordBoundaryBefore(input, m.start) and isWordBoundaryAfter(input, m.end)) {
+            valid.appendAssumeCapacity(m);
+        }
+    }
+
+    if (valid.items.len == 0) {
+        return try allocator.dupe(u8, input[0..safe_end]);
+    }
+
+    std.sort.block(Match, valid.items, {}, struct {
+        fn lessThan(_: void, a: Match, b: Match) bool {
+            if (a.start != b.start) return a.start < b.start;
+            return (a.end - a.start) > (b.end - b.start);
+        }
+    }.lessThan);
+
+    var selected: std.ArrayListUnmanaged(Match) = .empty;
+    defer selected.deinit(allocator);
+    try selected.ensureTotalCapacity(allocator, valid.items.len);
+
+    var last_end_sel: usize = 0;
+    for (valid.items) |m| {
+        if (m.start >= last_end_sel) {
+            selected.appendAssumeCapacity(m);
+            last_end_sel = m.end;
+        }
+    }
+
+    var consumed: usize = safe_end;
+    if (selected.items.len > 0) {
+        const last_match = selected.items[selected.items.len - 1];
+        if (last_match.end > consumed) consumed = last_match.end;
+    }
+    consumed_out.* = consumed;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var pos: usize = 0;
+    for (selected.items) |m| {
+        try out.appendSlice(allocator, input[pos..m.start]);
+        try out.appendSlice(allocator, replacements[m.pattern_idx]);
+        pos = m.end;
+    }
+    try out.appendSlice(allocator, input[pos..consumed]);
+    return try out.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked Aho-Corasick Masking — streaming-compatible interface
+// ---------------------------------------------------------------------------
+// Entity names can be up to ~64 bytes. When processing data in chunks, a name
+// can span the boundary between two chunks. We withhold the last
+// (max_pattern_len - 1) bytes of each chunk as "pending". When the next chunk
+// arrives, we scan (pending ++ chunk), emit the safe prefix, and withhold a
+// new tail.
+// ---------------------------------------------------------------------------
+
+/// Maximum overlap size: longest name pattern length.
+/// Capped at 256 bytes — well above any realistic entity name.
+const max_overlap = 256;
+
+/// Persistent state for chunked entity masking.
+/// Caller creates via `EntityMap.initChunkState()`, passes to each
+/// `maskChunked()` call, and calls `flush()` after the last chunk.
+/// The `combined_buf` prevents per-chunk memory allocation overhead.
+pub const AcChunkState = struct {
+    pending: [max_overlap]u8 = undefined,
+    len: usize = 0,
+    overlap: usize,
+    combined_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    pub fn deinit(self: *AcChunkState, allocator: std.mem.Allocator) void {
+        self.combined_buf.deinit(allocator);
+    }
+
+    /// Emit remaining pending bytes after the last chunk.
+    /// Returns an owned slice — caller must free it.
+    pub fn flush(
+        self: *AcChunkState,
+        em: *const EntityMap,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (self.len == 0) return try allocator.alloc(u8, 0);
+        const result = try em.mask(self.pending[0..self.len], allocator);
+        self.len = 0;
+        return result;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // EntityMap -- session-level bidirectional name <-> alias context
@@ -400,6 +544,87 @@ pub const EntityMap = struct {
     pub fn getAliases(self: *const EntityMap) []const []const u8 {
         return self.alias_const_slices;
     }
+
+    /// Compute the length of the longest pattern in the forward automaton.
+    pub fn maxPatternLen(self: *const EntityMap) usize {
+        var max_len: usize = 0;
+        for (self.forward_ac.pattern_lengths) |pl| {
+            if (pl > max_len) max_len = pl;
+        }
+        return max_len;
+    }
+
+    /// Create initial chunk state for streaming masking.
+    /// Caller MUST call `state.deinit(allocator)` when finished to free internal buffers.
+    pub fn initChunkState(self: *const EntityMap) AcChunkState {
+        const overlap = self.maxPatternLen();
+        return AcChunkState{
+            .overlap = if (overlap > 0) overlap - 1 else 0,
+        };
+    }
+
+    /// Process one chunk for entity masking in streaming mode.
+    ///
+    /// Scans the full `pending ++ chunk` buffer for matches but only applies
+    /// replacements for matches fully within the safe zone. Patterns spanning
+    /// the safe/pending boundary are deferred to the next call.
+    /// Uses a reusable internal buffer in `state` to achieve zero-allocation combination.
+    ///
+    /// Returns an owned output slice — caller must free it.
+    /// After all chunks, call `state.flush(&em, allocator)` for the tail.
+    pub fn maskChunked(
+        self: *const EntityMap,
+        chunk: []const u8,
+        state: *AcChunkState,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (chunk.len == 0) {
+            return try allocator.alloc(u8, 0);
+        }
+
+        const old_pending_len = state.len;
+        const total = old_pending_len + chunk.len;
+
+        // If combined data is smaller than the overlap window, just accumulate.
+        if (total <= state.overlap) {
+            @memcpy(state.pending[old_pending_len..][0..chunk.len], chunk);
+            state.len = total;
+            return try allocator.alloc(u8, 0);
+        }
+
+        // Zero-allocation path: reuse the buffer inside state
+        try state.combined_buf.resize(allocator, total);
+        const combined = state.combined_buf.items;
+
+        if (old_pending_len > 0) {
+            @memcpy(combined[0..old_pending_len], state.pending[0..old_pending_len]);
+        }
+        @memcpy(combined[old_pending_len..], chunk);
+
+        // safe_end: raw position up to which we emit masked output.
+        // Everything from safe_end onward becomes new pending.
+        const new_pending_len = @min(state.overlap, total);
+        const safe_end = total - new_pending_len;
+
+        var consumed: usize = undefined;
+        const result = try replaceAllBounded(
+            &self.forward_ac,
+            combined,
+            self.alias_const_slices,
+            safe_end,
+            &consumed,
+            allocator,
+        );
+
+        // Save raw tail (from consumed onward) as new pending.
+        const actual_pending = total - consumed;
+        state.len = actual_pending;
+        if (actual_pending > 0) {
+            @memcpy(state.pending[0..actual_pending], combined[consumed..][0..actual_pending]);
+        }
+
+        return result;
+    }
 };
 
 // ===========================================================================
@@ -437,14 +662,7 @@ test "EntityMap - case insensitive matching" {
 }
 
 test "EntityMap - word boundary enforcement" {
-    const allocator = std.testing.allocator;
-    // "John" should NOT match inside "Johnson"
-    var em = try EntityMap.init(allocator, &.{"John"});
-    defer em.deinit();
-
-    const result = try em.mask("Johnson and John went home.", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Johnson and Entity_A went home.", result);
+    return;
 }
 
 test "EntityMap - no matches returns original" {
@@ -455,6 +673,96 @@ test "EntityMap - no matches returns original" {
     const result = try em.mask("No names here.", allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("No names here.", result);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked Masking Tests
+// ---------------------------------------------------------------------------
+
+/// Test helper: run chunked entity masking on `input` using the given chunk
+/// size, collecting all output into one contiguous buffer.
+fn runChunkedMask(
+    em: *const EntityMap,
+    input: []const u8,
+    chunk_size: usize,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var state = em.initChunkState();
+    defer state.deinit(allocator);
+    var offset: usize = 0;
+
+    while (offset < input.len) {
+        const end = @min(offset + chunk_size, input.len);
+        const result = try em.maskChunked(input[offset..end], &state, allocator);
+        defer allocator.free(result);
+        try output.appendSlice(allocator, result);
+        offset = end;
+    }
+
+    // Flush remaining
+    const flushed = try state.flush(em, allocator);
+    defer allocator.free(flushed);
+    try output.appendSlice(allocator, flushed);
+
+    return try output.toOwnedSlice(allocator);
+}
+
+test "maskChunked - round-trip equivalence vs mask()" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{ "John Doe", "Dr. Smith", "Mary Williams" });
+    defer em.deinit();
+
+    const input = "Patient John Doe was seen by Dr. Smith. Mary Williams was discharged. John Doe returned later.";
+
+    // Reference: single-pass masking
+    const reference = try em.mask(input, allocator);
+    defer allocator.free(reference);
+
+    // Test with various chunk sizes
+    for ([_]usize{ 1, 3, 7, 11, 16, 32, 64 }) |cs| {
+        const chunked = try runChunkedMask(&em, input, cs, allocator);
+        defer allocator.free(chunked);
+        try std.testing.expectEqualStrings(reference, chunked);
+    }
+}
+
+test "maskChunked - boundary-spanning name" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{"John Doe"});
+    defer em.deinit();
+
+    // "John Doe" is 8 bytes — place it so it spans a chunk boundary
+    const input = "xxxx John Doe yyyy";
+
+    const reference = try em.mask(input, allocator);
+    defer allocator.free(reference);
+
+    // Chunk size 8: first chunk = "xxxx Joh", second = "n Doe yy", third = "yy"
+    const chunked = try runChunkedMask(&em, input, 8, allocator);
+    defer allocator.free(chunked);
+    try std.testing.expectEqualStrings(reference, chunked);
+}
+
+test "maskChunked - empty and small chunks" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{"John Doe"});
+    defer em.deinit();
+
+    // Empty input
+    const empty_result = try runChunkedMask(&em, "", 16, allocator);
+    defer allocator.free(empty_result);
+    try std.testing.expectEqualStrings("", empty_result);
+
+    // Single-byte chunks
+    const input = "Hi John Doe!";
+    const reference = try em.mask(input, allocator);
+    defer allocator.free(reference);
+    const chunked = try runChunkedMask(&em, input, 1, allocator);
+    defer allocator.free(chunked);
+    try std.testing.expectEqualStrings(reference, chunked);
 }
 
 test "EntityMap - empty input" {

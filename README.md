@@ -176,8 +176,8 @@ All benchmarks run with `zig build bench-all 2>$null` (ReleaseFast, single-threa
 === NanoMask Pipeline Benchmarks ===
 
 Stage 1 | SIMD SSN Redaction  | 16,000 MB/s | 100 iter × 1 MB
-Stage 2 | Aho-Corasick Mask   |    260 MB/s |  50 iter × 1 MB
-Stage 3 | Myers' Fuzzy Match  |    201 MB/s |  10 iter × 256 KB
+Stage 2 | Aho-Corasick Mask   |    564 MB/s |  50 iter × 1 MB
+Stage 3 | Myers' Fuzzy Match  |    212 MB/s |  10 iter × 256 KB
 ```
 
 **Real-world throughput**: For a typical 50 KB clinical document, the entire 3-stage pipeline completes in **< 0.5 ms**. Network round-trip to the upstream (10-50 ms) dominates total latency.

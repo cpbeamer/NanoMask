@@ -551,6 +551,186 @@ pub const FuzzyMatcher = struct {
             }
         }
     }
+
+    /// Compute the maximum word count across all name variants.
+    /// Used to size the overlap buffer for chunked processing.
+    pub fn maxVariantWordCount(self: *const FuzzyMatcher) usize {
+        var max_wc: usize = 0;
+        for (self.variants) |v| {
+            if (v.word_count > max_wc) max_wc = v.word_count;
+        }
+        return max_wc;
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunked fuzzy redaction — streaming-compatible interface
+    // -----------------------------------------------------------------------
+
+    /// Maximum overlap size for chunked fuzzy processing.
+    const fuzzy_max_overlap = 256;
+
+    /// Persistent state for chunked fuzzy redaction.
+    pub const FuzzyChunkState = struct {
+        pending: [fuzzy_max_overlap]u8 = undefined,
+        len: usize = 0,
+        overlap: usize,
+        combined_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+        pub fn deinit(self: *FuzzyChunkState, allocator: std.mem.Allocator) void {
+            self.combined_buf.deinit(allocator);
+        }
+
+        /// Emit remaining pending bytes after the last chunk.
+        pub fn flush(
+            self: *FuzzyChunkState,
+            fm: *const FuzzyMatcher,
+            aliases: []const []const u8,
+            masked_regions: []const MaskedRegion,
+            allocator: std.mem.Allocator,
+        ) ![]u8 {
+            if (self.len == 0) return try allocator.alloc(u8, 0);
+            const result = try fm.fuzzyRedact(self.pending[0..self.len], aliases, masked_regions, allocator);
+            self.len = 0;
+            return result;
+        }
+    };
+
+    /// Create initial chunk state for streaming fuzzy redaction.
+    pub fn initChunkState(self: *const FuzzyMatcher) FuzzyChunkState {
+        const max_wc = self.maxVariantWordCount();
+        const overlap = @min((max_wc + 1) * 20, fuzzy_max_overlap);
+        return FuzzyChunkState{
+            .overlap = if (overlap > 0) overlap else 20,
+        };
+    }
+
+    /// Like `fuzzyRedact`, but only applies matches starting before `safe_end`.
+    fn fuzzyRedactBounded(
+        self: *const FuzzyMatcher,
+        input: []const u8,
+        aliases: []const []const u8,
+        masked_regions: []const MaskedRegion,
+        safe_end: usize,
+        consumed_out: *usize,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        consumed_out.* = safe_end;
+
+        var matches: std.ArrayListUnmanaged(FuzzyMatch) = .empty;
+        defer matches.deinit(allocator);
+
+        const gaps = try buildGaps(input.len, masked_regions, allocator);
+        defer allocator.free(gaps);
+
+        for (gaps) |gap| {
+            const gap_text = input[gap.start..gap.end];
+            try self.scanGap(gap_text, gap.start, allocator, &matches);
+        }
+
+        var filtered: std.ArrayListUnmanaged(FuzzyMatch) = .empty;
+        defer filtered.deinit(allocator);
+
+        for (matches.items) |m| {
+            if (m.start < safe_end) {
+                try filtered.append(allocator, m);
+            }
+        }
+
+        if (filtered.items.len == 0) {
+            return try allocator.dupe(u8, input[0..safe_end]);
+        }
+
+        std.sort.block(FuzzyMatch, filtered.items, {}, struct {
+            fn lessThan(_: void, a: FuzzyMatch, b: FuzzyMatch) bool {
+                if (a.start != b.start) return a.start < b.start;
+                return (a.end - a.start) > (b.end - b.start);
+            }
+        }.lessThan);
+
+        var selected: std.ArrayListUnmanaged(FuzzyMatch) = .empty;
+        defer selected.deinit(allocator);
+
+        var last_end: usize = 0;
+        for (filtered.items) |m| {
+            if (m.start >= last_end) {
+                try selected.append(allocator, m);
+                last_end = m.end;
+            }
+        }
+
+        var consumed: usize = safe_end;
+        if (selected.items.len > 0) {
+            const last_match = selected.items[selected.items.len - 1];
+            if (last_match.end > consumed) consumed = last_match.end;
+        }
+        consumed_out.* = consumed;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var pos: usize = 0;
+
+        for (selected.items) |m| {
+            try out.appendSlice(allocator, input[pos..m.start]);
+            if (m.variant_owner < aliases.len) {
+                try out.appendSlice(allocator, aliases[m.variant_owner]);
+            }
+            pos = m.end;
+        }
+        try out.appendSlice(allocator, input[pos..consumed]);
+
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Process one chunk for fuzzy redaction in streaming mode.
+    pub fn fuzzyRedactChunked(
+        self: *const FuzzyMatcher,
+        chunk: []const u8,
+        state: *FuzzyChunkState,
+        aliases: []const []const u8,
+        masked_regions: []const MaskedRegion,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        if (chunk.len == 0) {
+            return try allocator.alloc(u8, 0);
+        }
+
+        const old_pending_len = state.len;
+        const total = old_pending_len + chunk.len;
+
+        if (total <= state.overlap) {
+            @memcpy(state.pending[old_pending_len..][0..chunk.len], chunk);
+            state.len = total;
+            return try allocator.alloc(u8, 0);
+        }
+
+        try state.combined_buf.resize(allocator, total);
+        const combined = state.combined_buf.items;
+
+        if (old_pending_len > 0) {
+            @memcpy(combined[0..old_pending_len], state.pending[0..old_pending_len]);
+        }
+        @memcpy(combined[old_pending_len..], chunk);
+
+        const new_pending_len = @min(state.overlap, total);
+        const safe_end = total - new_pending_len;
+
+        var consumed: usize = undefined;
+        const result = try self.fuzzyRedactBounded(
+            combined,
+            aliases,
+            masked_regions,
+            safe_end,
+            &consumed,
+            allocator,
+        );
+
+        const actual_pending = total - consumed;
+        state.len = actual_pending;
+        if (actual_pending > 0) {
+            @memcpy(state.pending[0..actual_pending], combined[consumed..][0..actual_pending]);
+        }
+
+        return result;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -855,6 +1035,107 @@ test "FuzzyMatcher - name with middle initial variants" {
 
     // The 3-word window "John E Doe" should fuzzy-match against "john doe"
     try std.testing.expectEqualStrings("Patient Entity_A was seen.", result);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked Fuzzy Matching Tests
+// ---------------------------------------------------------------------------
+
+/// Test helper: run chunked fuzzy redaction collecting all output.
+fn runChunkedFuzzy(
+    fm: *const FuzzyMatcher,
+    input: []const u8,
+    aliases: []const []const u8,
+    chunk_size: usize,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var state = fm.initChunkState();
+    defer state.deinit(allocator); // Cleanup memory
+    var offset: usize = 0;
+
+    while (offset < input.len) {
+        const end = @min(offset + chunk_size, input.len);
+        const result = try fm.fuzzyRedactChunked(input[offset..end], &state, aliases, &.{}, allocator);
+        defer allocator.free(result);
+        try output.appendSlice(allocator, result);
+        offset = end;
+    }
+
+    const flushed = try state.flush(fm, aliases, &.{}, allocator);
+    defer allocator.free(flushed);
+    try output.appendSlice(allocator, flushed);
+
+    return try output.toOwnedSlice(allocator);
+}
+
+test "fuzzyRedactChunked - round-trip equivalence vs fuzzyRedact()" {
+    const allocator = std.testing.allocator;
+
+    const names = [_][]const u8{ "John Doe", "Dr. Smith" };
+    const aliases = [_][]const u8{ "Entity_A", "Entity_B" };
+
+    var fm = try FuzzyMatcher.init(allocator, &names, &aliases, 0.80);
+    defer fm.deinit();
+
+    const input = "Patient J0hn Doe was seen by Dr Smlth. J0hn Doe returned later.";
+
+    // Reference: single-pass fuzzy redaction
+    const reference = try fm.fuzzyRedact(input, &aliases, &.{}, allocator);
+    defer allocator.free(reference);
+
+    // Test with various chunk sizes
+    for ([_]usize{ 7, 16, 32, 64 }) |cs| {
+        const chunked = try runChunkedFuzzy(&fm, input, &aliases, cs, allocator);
+        defer allocator.free(chunked);
+        try std.testing.expectEqualStrings(reference, chunked);
+    }
+}
+
+test "fuzzyRedactChunked - boundary-spanning multi-word match" {
+    const allocator = std.testing.allocator;
+
+    const names = [_][]const u8{"John Doe"};
+    const aliases = [_][]const u8{"Entity_A"};
+
+    var fm = try FuzzyMatcher.init(allocator, &names, &aliases, 0.80);
+    defer fm.deinit();
+
+    // Place "J0hn Doe" so "J0hn" is at end of one chunk and "Doe" at start of next
+    const input = "xxxxxxxxx J0hn Doe yyyyy";
+
+    const reference = try fm.fuzzyRedact(input, &aliases, &.{}, allocator);
+    defer allocator.free(reference);
+
+    // Chunk size 14: first chunk = "xxxxxxxxx J0hn", second = " Doe yyyyy"
+    const chunked = try runChunkedFuzzy(&fm, input, &aliases, 14, allocator);
+    defer allocator.free(chunked);
+    try std.testing.expectEqualStrings(reference, chunked);
+}
+
+test "fuzzyRedactChunked - empty and small chunks" {
+    const allocator = std.testing.allocator;
+
+    const names = [_][]const u8{"John Doe"};
+    const aliases = [_][]const u8{"Entity_A"};
+
+    var fm = try FuzzyMatcher.init(allocator, &names, &aliases, 0.80);
+    defer fm.deinit();
+
+    // Empty input
+    const empty_result = try runChunkedFuzzy(&fm, "", &aliases, 16, allocator);
+    defer allocator.free(empty_result);
+    try std.testing.expectEqualStrings("", empty_result);
+
+    // Input with no matches, small chunks
+    const input = "The weather is nice today.";
+    const reference = try fm.fuzzyRedact(input, &aliases, &.{}, allocator);
+    defer allocator.free(reference);
+    const chunked = try runChunkedFuzzy(&fm, input, &aliases, 5, allocator);
+    defer allocator.free(chunked);
+    try std.testing.expectEqualStrings(reference, chunked);
 }
 
 // ---------------------------------------------------------------------------
