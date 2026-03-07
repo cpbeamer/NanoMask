@@ -31,6 +31,8 @@ const ThreadContext = struct {
     tls_context: ?*tls_mod.TlsContext,
     /// When true, the proxy uses HTTPS to connect to the upstream target.
     target_tls: bool,
+    /// Maximum request body size in bytes for the proxy pipeline.
+    max_body_size: usize,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -89,6 +91,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         fm,
         ctx.entity_set,
         ctx.admin_config,
+        ctx.max_body_size,
     ) catch |err| {
         std.debug.print("[ERR] Proxy request failed: {}\n", .{err});
     };
@@ -145,6 +148,7 @@ pub fn main() !void {
         std.debug.print("  ca_file=null (from {s})\n", .{cfg.ca_file_src.asStr()});
     }
     std.debug.print("  tls_no_system_ca={} (from {s})\n", .{ cfg.tls_no_system_ca, cfg.tls_no_system_ca_src.asStr() });
+    std.debug.print("  max_body_size={d} (from {s})\n", .{ cfg.max_body_size, cfg.max_body_size_src.asStr() });
     std.debug.print("\n", .{});
 
     // --- Entity Masking Setup (RCU) ---
@@ -352,6 +356,7 @@ pub fn main() !void {
         .admin_config = admin_config,
         .tls_context = if (tls_context) |*tc| tc else null,
         .target_tls = cfg.target_tls,
+        .max_body_size = cfg.max_body_size,
     };
 
     while (true) {

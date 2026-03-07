@@ -705,9 +705,11 @@ pub fn accept(
 
     // ----- Step 2: Generate server key pair & compute shared secret -----
     var server_privkey: [32]u8 = undefined;
+    defer std.crypto.utils.secureZero(u8, &server_privkey);
     crypto.random.bytes(&server_privkey);
     const server_kp = crypto.dh.X25519.recoverPublicKey(server_privkey) catch return error.HandshakeFailed;
-    const shared_secret = crypto.dh.X25519.scalarmult(server_privkey, client_x25519_key.?) catch return error.HandshakeFailed;
+    var shared_secret = crypto.dh.X25519.scalarmult(server_privkey, client_x25519_key.?) catch return error.HandshakeFailed;
+    defer std.crypto.utils.secureZero(u8, &shared_secret);
 
     // ----- Step 3: Transcript hash -----
     var transcript = Sha256.init(.{});
@@ -794,10 +796,17 @@ pub fn accept(
     const server_hs_secret = hkdfExpandLabel(Hkdf, handshake_secret, "s hs traffic", &hello_hash, Sha256.digest_length);
     const client_hs_secret = hkdfExpandLabel(Hkdf, handshake_secret, "c hs traffic", &hello_hash, Sha256.digest_length);
 
-    const server_hs_key = hkdfExpandLabel(Hkdf, server_hs_secret, "key", "", Aes128Gcm.key_length);
-    const server_hs_iv = hkdfExpandLabel(Hkdf, server_hs_secret, "iv", "", Aes128Gcm.nonce_length);
-    const client_hs_key = hkdfExpandLabel(Hkdf, client_hs_secret, "key", "", Aes128Gcm.key_length);
-    const client_hs_iv = hkdfExpandLabel(Hkdf, client_hs_secret, "iv", "", Aes128Gcm.nonce_length);
+    var server_hs_key = hkdfExpandLabel(Hkdf, server_hs_secret, "key", "", Aes128Gcm.key_length);
+    var server_hs_iv = hkdfExpandLabel(Hkdf, server_hs_secret, "iv", "", Aes128Gcm.nonce_length);
+    var client_hs_key = hkdfExpandLabel(Hkdf, client_hs_secret, "key", "", Aes128Gcm.key_length);
+    var client_hs_iv = hkdfExpandLabel(Hkdf, client_hs_secret, "iv", "", Aes128Gcm.nonce_length);
+
+    // Securely zero all handshake keys when the function exits —
+    // these are ephemeral and must not persist on the stack.
+    defer std.crypto.utils.secureZero(u8, &server_hs_key);
+    defer std.crypto.utils.secureZero(u8, &server_hs_iv);
+    defer std.crypto.utils.secureZero(u8, &client_hs_key);
+    defer std.crypto.utils.secureZero(u8, &client_hs_iv);
 
     const server_finished_key = hkdfExpandLabel(Hkdf, server_hs_secret, "finished", "", Hmac.key_length);
     const client_finished_key = hkdfExpandLabel(Hkdf, client_hs_secret, "finished", "", Hmac.key_length);

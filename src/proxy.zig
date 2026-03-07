@@ -11,6 +11,10 @@ const http_util = @import("http_util.zig");
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
 
+/// Maximum number of entities accepted via the X-ZPG-Entities header.
+/// Prevents Aho-Corasick construction DoS from oversized entity lists.
+const max_header_entities: usize = 100;
+
 /// Find a custom header value by name (case-insensitive).
 /// Delegates to the shared http_util implementation.
 const findHeader = http_util.findHeader;
@@ -48,6 +52,7 @@ pub fn handleRequest(
     session_fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
     entity_set: ?*VersionedEntitySet,
     admin_config: admin.AdminConfig,
+    max_body_size: usize,
 ) !void {
     const method = request.head.method;
     const uri_str = request.head.target;
@@ -59,6 +64,19 @@ pub fn handleRequest(
     }
 
     std.debug.print("[PRX] {s} {s}\n", .{ @tagName(method), uri_str });
+
+    // --- Security: reject absolute-form URIs and non-path targets ---
+    if (uri_str.len == 0 or uri_str[0] != '/') {
+        var err_buf: [2048]u8 = undefined;
+        var err_writer = try request.respondStreaming(&err_buf, .{
+            .respond_options = .{
+                .status = .bad_request,
+            },
+        });
+        try err_writer.writer.writeAll("Bad Request: invalid URI\n");
+        try err_writer.end();
+        return;
+    }
 
     // --- Determine entity map: per-request header overrides session default ---
     var per_request_map: ?entity_mask.EntityMap = null;
@@ -73,8 +91,13 @@ pub fn handleRequest(
             };
             defer allocator.free(names);
 
-            if (names.len > 0) {
-                per_request_map = entity_mask.EntityMap.init(allocator, names) catch |err| {
+            if (names.len > max_header_entities) {
+                std.debug.print("[WARN] X-ZPG-Entities header contains {d} entities, capping at {d}\n", .{ names.len, max_header_entities });
+            }
+
+            const capped_len = @min(names.len, max_header_entities);
+            if (capped_len > 0) {
+                per_request_map = entity_mask.EntityMap.init(allocator, names[0..capped_len]) catch |err| {
                     std.debug.print("[WARN] Failed to build entity map from header: {}\n", .{err});
                     break :blk session_entity_map;
                 };
@@ -125,11 +148,18 @@ pub fn handleRequest(
         var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
         
         var body_read_buf: [8192]u8 = undefined;
+        var bytes_forwarded: usize = 0;
         if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
             var raw_chunk_buf: [8192]u8 = undefined;
             while (true) {
                 const bytes_read = try body_reader.readSliceShort(&raw_chunk_buf);
                 if (bytes_read == 0) break;
+
+                bytes_forwarded += bytes_read;
+                if (bytes_forwarded > max_body_size) {
+                    std.debug.print("[WARN] Request body exceeds max size ({d} bytes), aborting\n", .{max_body_size});
+                    return error.PayloadTooLarge;
+                }
                 
                 const raw_chunk = raw_chunk_buf[0..bytes_read];
                 

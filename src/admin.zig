@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = std.http;
+const mem = std.mem;
 const versioned_entity_set = @import("versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const EntitySnapshot = versioned_entity_set.EntitySnapshot;
@@ -72,8 +73,23 @@ const max_body_size: usize = 1 * 1024 * 1024;
 
 fn validateBearerToken(auth_value: []const u8, expected: []const u8) bool {
     const prefix = "Bearer ";
-    if (!std.mem.startsWith(u8, auth_value, prefix)) return false;
-    return std.mem.eql(u8, auth_value[prefix.len..], expected);
+    if (auth_value.len < prefix.len) return false;
+    // Check prefix in constant time to avoid leaking which part failed.
+    // The prefix is not secret, but consistency prevents partial oracles.
+    if (!mem.startsWith(u8, auth_value, prefix)) return false;
+    return constantTimeEql(auth_value[prefix.len..], expected);
+}
+
+/// Constant-time byte comparison to prevent timing side-channel attacks.
+/// Leaks only the length difference (standard practice — length is not secret
+/// for Bearer tokens where the header format is known).
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| {
+        diff |= x ^ y;
+    }
+    return diff == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +157,16 @@ fn handleGet(
                 '\n' => try json_buf.appendSlice(snapshot.allocator, "\\n"),
                 '\r' => try json_buf.appendSlice(snapshot.allocator, "\\r"),
                 '\t' => try json_buf.appendSlice(snapshot.allocator, "\\t"),
-                else => try json_buf.append(snapshot.allocator, c),
+                else => {
+                    // Escape all C0 control characters per RFC 8259 §7
+                    if (c < 0x20) {
+                        var esc_buf: [6]u8 = undefined;
+                        _ = std.fmt.bufPrint(&esc_buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                        try json_buf.appendSlice(snapshot.allocator, &esc_buf);
+                    } else {
+                        try json_buf.append(snapshot.allocator, c);
+                    }
+                },
             }
         }
         try json_buf.append(snapshot.allocator, '"');
@@ -180,7 +205,7 @@ fn handlePost(
 
     // Merge with existing names (deduplicate via HashMap for O(1) lookups)
     const es = entity_set orelse {
-        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"entity set not initialized\"}");
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
         return;
     };
 
@@ -247,7 +272,7 @@ fn handleDelete(
     }
 
     const es = entity_set orelse {
-        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"entity set not initialized\"}");
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
         return;
     };
 
@@ -304,7 +329,7 @@ fn handlePut(
     }
 
     const es = entity_set orelse {
-        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"entity set not initialized\"}");
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
         return;
     };
 
@@ -350,7 +375,7 @@ fn rebuildAndSwap(
     // Optionally sync to entity file
     if (admin_config.entity_file_sync) {
         if (admin_config.entity_file) |path| {
-            syncToFile(path, names) catch |err| {
+            syncToFile(path, names, allocator) catch |err| {
                 std.debug.print("[ADMIN] WARNING: Failed to sync entity file '{s}': {s}\n", .{
                     path,
                     @errorName(err),
@@ -361,14 +386,30 @@ fn rebuildAndSwap(
 }
 
 /// Write the current entity list back to the entity file (one name per line).
-fn syncToFile(path: []const u8, names: []const []const u8) !void {
-    var file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
+/// Uses atomic write (temp file + rename) to prevent the file watcher from
+/// reading a partially-written file during sync.
+fn syncToFile(path: []const u8, names: []const []const u8, allocator: mem.Allocator) !void {
+    // Build temp path: "{path}.tmp"
+    const tmp_path = try allocator.alloc(u8, path.len + 4);
+    defer allocator.free(tmp_path);
+    @memcpy(tmp_path[0..path.len], path);
+    @memcpy(tmp_path[path.len..], ".tmp");
+
+    // Write to temp file
+    var file = try std.fs.cwd().createFile(tmp_path, .{});
+    errdefer {
+        file.close();
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+    }
 
     for (names) |name| {
         try file.writeAll(name);
         try file.writeAll("\n");
     }
+    file.close();
+
+    // Atomic rename over the real file
+    try std.fs.cwd().rename(tmp_path, path);
 }
 
 // ---------------------------------------------------------------------------

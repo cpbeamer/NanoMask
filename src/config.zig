@@ -62,6 +62,8 @@ pub const Config = struct {
     ca_file_src: ConfigSource = .default,
     tls_no_system_ca: bool = false,
     tls_no_system_ca_src: ConfigSource = .default,
+    max_body_size: usize = 10 * 1024 * 1024,
+    max_body_size_src: ConfigSource = .default,
 
     allocator: std.mem.Allocator,
 
@@ -81,6 +83,8 @@ pub const Config = struct {
         CaFileNotFound,
         InvalidTargetTlsFlag,
         InvalidNoSystemCaFlag,
+        InvalidMaxBodySize,
+        MissingAdminToken,
         UnknownFlag,
         OutOfMemory,
     };
@@ -127,6 +131,7 @@ pub const Config = struct {
             \\  --target-tls                Enable TLS for upstream connections (default: disabled)
             \\  --ca-file <path>            Custom CA bundle PEM for upstream TLS verification
             \\  --tls-no-system-ca          Suppress system CA bundle loading (use with --ca-file for self-signed certs)
+            \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -256,6 +261,13 @@ pub const Config = struct {
                 return error.InvalidNoSystemCaFlag;
             }
             config.tls_no_system_ca_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MAX_BODY_SIZE")) {
+            config.max_body_size = std.fmt.parseInt(usize, value, 10) catch {
+                std.debug.print("error: NANOMASK_MAX_BODY_SIZE must be a positive integer, got '{s}'\n", .{value});
+                return error.InvalidMaxBodySize;
+            };
+            if (config.max_body_size == 0) return error.InvalidMaxBodySize;
+            config.max_body_size_src = .env_var;
         }
     }
 
@@ -283,6 +295,7 @@ pub const Config = struct {
             "NANOMASK_TARGET_TLS",
             "NANOMASK_CA_FILE",
             "NANOMASK_TLS_NO_SYSTEM_CA",
+            "NANOMASK_MAX_BODY_SIZE",
         };
 
         for (env_keys) |key| {
@@ -485,6 +498,21 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--tls-no-system-ca")) {
                 config.tls_no_system_ca = true;
                 config.tls_no_system_ca_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--max-body-size")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --max-body-size\n", .{});
+                    return error.MissingValue;
+                }
+                config.max_body_size = std.fmt.parseInt(usize, args[i], 10) catch {
+                    std.debug.print("error: --max-body-size must be a positive integer, got '{s}'\n", .{args[i]});
+                    return error.InvalidMaxBodySize;
+                };
+                if (config.max_body_size == 0) {
+                    std.debug.print("error: --max-body-size must be > 0\n", .{});
+                    return error.InvalidMaxBodySize;
+                }
+                config.max_body_size_src = .cli_flag;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -515,6 +543,13 @@ pub const Config = struct {
         if (config.tls_no_system_ca and config.ca_file == null and config.target_tls) {
             std.debug.print("WARNING: --tls-no-system-ca without --ca-file means NO certificates are trusted — upstream HTTPS will fail\n", .{});
             std.debug.print("  hint: use --ca-file <path> to provide your self-signed CA bundle\n", .{});
+        }
+
+        // Require --admin-token when --admin-api is enabled to prevent
+        // unauthenticated access to entity management endpoints.
+        if (config.admin_api and config.admin_token == null) {
+            std.debug.print("error: --admin-api requires --admin-token <secret> for authentication\n", .{});
+            return error.MissingAdminToken;
         }
 
         return config;
@@ -644,6 +679,7 @@ test "Config - admin-api flag" {
     const args = [_][]const u8{
         "nanomask",
         "--admin-api",
+        "--admin-token", "test-secret",
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -651,6 +687,16 @@ test "Config - admin-api flag" {
 
     try testing.expect(cfg.admin_api);
     try testing.expectEqual(ConfigSource.cli_flag, cfg.admin_api_src);
+}
+
+test "Config - admin-api without token fails" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--admin-api",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingAdminToken, res);
 }
 
 test "Config - admin-token flag" {

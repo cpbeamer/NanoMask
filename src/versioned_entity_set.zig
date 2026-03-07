@@ -115,6 +115,10 @@ pub const VersionedEntitySet = struct {
 // Entity file loading — reusable builder for snapshots
 // ---------------------------------------------------------------------------
 
+/// Maximum supported entity name length in bytes. Names exceeding this
+/// are skipped to prevent excessive Aho-Corasick automaton memory usage.
+const max_entity_name_len = 256;
+
 /// Load entities from a newline-delimited text file and build a new snapshot.
 /// Skips blank lines and lines starting with `#`. Trims whitespace.
 /// The returned snapshot has ref_count = 1 (the "owner" reference).
@@ -140,6 +144,13 @@ pub fn loadSnapshotFromFile(
     while (line_it.next()) |line| {
         const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r"), " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        if (trimmed.len > max_entity_name_len) {
+            std.debug.print("[WARN] Skipping entity name exceeding {d} bytes ({d} bytes)\n", .{
+                max_entity_name_len,
+                trimmed.len,
+            });
+            continue;
+        }
         try names_list.append(allocator, try allocator.dupe(u8, trimmed));
     }
 
