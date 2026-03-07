@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = std.http;
+const redact = @import("redact.zig");
 
 pub fn handleRequest(allocator: std.mem.Allocator, request: *http.Server.Request, target_host: []const u8, target_port: u16) !void {
     const method = request.head.method;
@@ -18,11 +19,8 @@ pub fn handleRequest(allocator: std.mem.Allocator, request: *http.Server.Request
     var client_req = try client.request(method, target_uri, .{});
     defer client_req.deinit();
 
-    if (method.requestHasBody()) {
-        try client_req.sendBodilessUnflushed(); // Not sending body yet for MVP
-    } else {
-        try client_req.sendBodilessUnflushed();
-    }
+    // MVP: always send bodiless regardless of method — body forwarding is Phase 2.
+    try client_req.sendBodilessUnflushed();
     try client_req.connection.?.flush();
 
     var redirect_buffer: [4096]u8 = undefined;
@@ -36,8 +34,7 @@ pub fn handleRequest(allocator: std.mem.Allocator, request: *http.Server.Request
 
     try downstream_reader.appendRemainingUnlimited(allocator, &body_alloc);
 
-    // Apply ZPG Rules immediately to the buffered body
-    const redact = @import("redact.zig");
+    // Apply ZPG redaction rules to the buffered body
     redact.redactSsn(body_alloc.items);
 
     try request.respond(body_alloc.items, .{
