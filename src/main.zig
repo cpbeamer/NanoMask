@@ -34,7 +34,7 @@ pub fn main() !void {
         var stream_writer = connection.stream.writer(&write_buf);
 
         var server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
-        
+
         var request = server.receiveHead() catch |err| {
             std.debug.print("Error receiving head: {}\n", .{err});
             continue;

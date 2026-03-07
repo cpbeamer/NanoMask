@@ -12,7 +12,7 @@ pub fn main() !void {
 
     var reader = connection.stream.reader();
     var writer = connection.stream.writer();
-    
+
     // Test if we can init the server
     var http_server = std.http.Server.init(&reader, &writer);
     _ = http_server;
