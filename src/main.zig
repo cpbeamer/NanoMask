@@ -2,10 +2,8 @@ const std = @import("std");
 const proxy = @import("proxy.zig");
 const entity_mask = @import("entity_mask.zig");
 const fuzzy_match = @import("fuzzy_match.zig");
-
-/// Maximum number of concurrent connections. Incoming connections beyond this
-/// limit are closed immediately with a log warning.
-const max_concurrent_connections = 128;
+const config = @import("config.zig");
+const Config = config.Config;
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
@@ -63,12 +61,18 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const listen_port: u16 = 8081;
-    // SAFETY: target_host is a comptime string literal — the slice pointer is
-    // valid for the program's entire lifetime. If this is ever loaded from a
-    // config file or CLI arg (heap-allocated), it must be duped or pinned.
-    const target_host = "httpbin.org";
-    const target_port: u16 = 80;
+    const args = try std.process.argsAlloc(allocator);
+    // SAFETY: We don't free args to prevent dangling target_host pointers since main operates effectively as program lifetime
+    // and args slices point into this pool if passed by user.
+    // However, if process terminates, OS reclaims memory.
+
+    const cfg = Config.parse(args, std.io.getStdErr().writer()) catch |err| {
+        if (err == error.HelpRequested) {
+            std.process.exit(0);
+        } else {
+            std.process.exit(1);
+        }
+    };
 
     // --- Entity Masking Setup ---
     // Demo name set. In production, these come from case metadata,
@@ -83,20 +87,19 @@ pub fn main() !void {
         allocator,
         entity_map.getRawNames(),
         entity_map.getAliases(),
-        0.80,
+        cfg.fuzzy_threshold,
     );
     defer fuzzy_matcher.deinit();
 
-    std.debug.print("Starting ZPG Proxy - Phase 3\n", .{});
-    std.debug.print("Listening on http://127.0.0.1:{}\n", .{listen_port});
-    std.debug.print("Forwarding to http://{s}:{}\n", .{ target_host, target_port });
+    std.debug.print("Listening on http://127.0.0.1:{}\n", .{cfg.listen_port});
+    std.debug.print("Forwarding to http://{s}:{}\n", .{ cfg.target_host, cfg.target_port });
     std.debug.print("Entity masking: {} session names loaded\n", .{demo_names.len});
-    std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher.variants.len, 0.80 * 100.0 });
+    std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher.variants.len, cfg.fuzzy_threshold * 100.0 });
     std.debug.print("Connection pool: shared client with keep-alive (up to 32 upstream connections)\n", .{});
     std.debug.print("Bidirectional pipeline: mask request -> unmask response\n", .{});
-    std.debug.print("Multi-threaded: up to {} concurrent connections\n\n", .{max_concurrent_connections});
+    std.debug.print("Multi-threaded: up to {} concurrent connections\n\n", .{cfg.max_connections});
 
-    var net_server = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", listen_port), .{
+    var net_server = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", cfg.listen_port), .{
         .reuse_address = true,
     });
     defer net_server.deinit();
@@ -115,8 +118,8 @@ pub fn main() !void {
 
     const ctx = ThreadContext{
         .allocator = allocator,
-        .target_host = target_host,
-        .target_port = target_port,
+        .target_host = cfg.target_host,
+        .target_port = cfg.target_port,
         .entity_map = &entity_map,
         .fuzzy_matcher = &fuzzy_matcher,
         .http_client = &http_client,
@@ -131,8 +134,8 @@ pub fn main() !void {
 
         // Enforce connection limit to prevent thread exhaustion under load.
         const current = active_connections.fetchAdd(1, .acquire);
-        if (current >= max_concurrent_connections) {
-            std.debug.print("[WARN] Connection limit reached ({}/{}), rejecting\n", .{ current + 1, max_concurrent_connections });
+        if (current >= cfg.max_connections) {
+            std.debug.print("[WARN] Connection limit reached ({}/{}), rejecting\n", .{ current + 1, cfg.max_connections });
             _ = active_connections.fetchSub(1, .release);
             connection.stream.close();
             continue;
