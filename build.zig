@@ -160,4 +160,18 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_mod);
     const bench_step = b.step("bench", "Run benchmarks (opt-in, ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // --- Standalone benchmark runner: `zig build bench-all` ---
+    // Runs all three pipeline stages in a standalone binary for clean output.
+    const bench_exe = b.addExecutable(.{
+        .name = "NanoMask-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_all = b.addRunArtifact(bench_exe);
+    const bench_all_step = b.step("bench-all", "Run all pipeline benchmarks (standalone, ReleaseFast)");
+    bench_all_step.dependOn(&run_bench_all.step);
 }

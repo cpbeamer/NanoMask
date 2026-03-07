@@ -237,7 +237,7 @@ test "bench - redactSsn throughput" {
     const ns_per_byte = elapsed_ns / total_bytes;
     const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
 
-    std.debug.print("\n[BENCH] SIMD redactSsn: {d} ns/byte, {d:.1} MB/s ({} iterations x {} bytes)\n", .{
+    std.debug.print("\n\n\n[BENCH] SIMD redactSsn: {d} ns/byte, {d:.1} MB/s ({} iterations x {} bytes)\n", .{
         ns_per_byte,
         mb_per_sec,
         iterations,

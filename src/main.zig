@@ -1,6 +1,7 @@
 const std = @import("std");
 const proxy = @import("proxy.zig");
 const entity_mask = @import("entity_mask.zig");
+const fuzzy_match = @import("fuzzy_match.zig");
 
 /// Maximum number of concurrent connections. Incoming connections beyond this
 /// limit are closed immediately with a log warning.
@@ -11,6 +12,7 @@ const ThreadContext = struct {
     target_host: []const u8,
     target_port: u16,
     entity_map: ?*const entity_mask.EntityMap,
+    fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
     active_connections: *std.atomic.Value(u32),
 };
 
@@ -44,6 +46,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         ctx.target_host,
         ctx.target_port,
         ctx.entity_map,
+        ctx.fuzzy_matcher,
     ) catch |err| {
         std.debug.print("[ERR] {s} {s}: {}\n", .{ @tagName(request.head.method), request.head.target, err });
     };
@@ -73,10 +76,21 @@ pub fn main() !void {
     var entity_map = try entity_mask.EntityMap.init(allocator, &demo_names);
     defer entity_map.deinit();
 
+    // --- Fuzzy Matcher Setup (Stage 3: OCR-resilient name matching) ---
+    // Threshold 0.80 = 80% similarity required. Tunable per deployment.
+    var fuzzy_matcher = try fuzzy_match.FuzzyMatcher.init(
+        allocator,
+        entity_map.getRawNames(),
+        entity_map.getAliases(),
+        0.80,
+    );
+    defer fuzzy_matcher.deinit();
+
     std.debug.print("Starting ZPG Proxy - Phase 2\n", .{});
     std.debug.print("Listening on http://127.0.0.1:{}\n", .{listen_port});
     std.debug.print("Forwarding to http://{s}:{}\n", .{ target_host, target_port });
     std.debug.print("Entity masking: {} session names loaded\n", .{demo_names.len});
+    std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ fuzzy_matcher.variants.len, 0.80 * 100.0 });
     std.debug.print("Bidirectional pipeline: mask request -> unmask response\n", .{});
     std.debug.print("Multi-threaded: up to {} concurrent connections\n\n", .{max_concurrent_connections});
 
@@ -96,6 +110,7 @@ pub fn main() !void {
         .target_host = target_host,
         .target_port = target_port,
         .entity_map = &entity_map,
+        .fuzzy_matcher = &fuzzy_matcher,
         .active_connections = &active_connections,
     };
 

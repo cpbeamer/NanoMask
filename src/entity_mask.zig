@@ -390,6 +390,16 @@ pub const EntityMap = struct {
     pub fn unmask(self: *const EntityMap, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         return replaceAll(&self.reverse_ac, input, self.name_const_slices, allocator);
     }
+
+    /// Read-only access to raw name strings for use by the fuzzy matcher.
+    pub fn getRawNames(self: *const EntityMap) []const []const u8 {
+        return self.name_const_slices;
+    }
+
+    /// Read-only access to alias strings for use by the fuzzy matcher.
+    pub fn getAliases(self: *const EntityMap) []const []const u8 {
+        return self.alias_const_slices;
+    }
 };
 
 // ===========================================================================
@@ -552,7 +562,7 @@ test "bench - EntityMap mask throughput" {
     const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
         @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
 
-    std.debug.print("\n[BENCH] EntityMap mask: {d:.1} MB/s ({} iterations x {} bytes)\n", .{
+    std.debug.print("\n\n\n[BENCH] EntityMap mask: {d:.1} MB/s ({} iterations x {} bytes)\n", .{
         mb_per_sec,
         iterations,
         payload_size,

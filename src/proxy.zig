@@ -2,6 +2,7 @@ const std = @import("std");
 const http = std.http;
 const redact = @import("redact.zig");
 const entity_mask = @import("entity_mask.zig");
+const fuzzy_match = @import("fuzzy_match.zig");
 
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
@@ -46,6 +47,7 @@ pub fn handleRequest(
     target_host: []const u8,
     target_port: u16,
     session_entity_map: ?*const entity_mask.EntityMap,
+    session_fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
 ) !void {
     const method = request.head.method;
     const uri_str = request.head.target;
@@ -103,7 +105,15 @@ pub fn handleRequest(
             const masked = try em.mask(req_body.items, allocator);
             // 2. SSN redact: digits -> * (in-place on the masked buffer)
             redact.redactSsn(masked);
-            sanitized_body = masked;
+            // 3. Fuzzy name redact: catch OCR variants missed by exact match
+            const active_fuzzy = session_fuzzy_matcher;
+            if (active_fuzzy) |fm| {
+                const fuzzy_result = try fm.fuzzyRedact(masked, em.getAliases(), &.{}, allocator);
+                allocator.free(masked);
+                sanitized_body = fuzzy_result;
+            } else {
+                sanitized_body = masked;
+            }
         } else {
             // No entity map — SSN redact in-place on a mutable copy
             const duped = try allocator.dupe(u8, req_body.items);

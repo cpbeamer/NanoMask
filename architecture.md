@@ -61,17 +61,41 @@ X-ZPG-Entities: John Doe, Dr. Smith, Jane Williams
 ```
 If present, a per-request `EntityMap` is built from the header values. Otherwise, the session-level default is used.
 
+## 5. Fuzzy Name Matching Engine (`src/fuzzy_match.zig`)
+
+Stage 3 of the redaction pipeline provides OCR-resilient name matching, catching corrupted or variant name forms that slip past the deterministic Aho-Corasick engine (e.g. "J0hn Doe", "Mr. Doe", "John E. Doe").
+
+### Myers' Bit-Vector Levenshtein Algorithm
+*   **Algorithm**: Computes edit distance between two strings in O(n) time using bitwise operations on a single `u64` register. For patterns ≤ 64 characters (covers all realistic names), this runs in a handful of CPU instructions per character.
+*   **Threshold-Based**: Matches are accepted when normalized similarity ≥ configurable threshold (default 0.80 / 80%). Similarity is computed as `1 - (edit_distance / max_length)`.
+
+### Text Normalization
+Before comparison, both the pattern and input window are normalized: lowercased, punctuation stripped, and whitespace collapsed. This means `"John E. Doe"` and `"john  e doe"` are treated identically.
+
+### Name Variant Generation
+For each entity, the matcher auto-generates variants:
+*   **Full name**: `"john doe"`
+*   **First name only**: `"john"` (≥ 3 chars to avoid false positives)
+*   **Last name only**: `"doe"` (≥ 3 chars to avoid false positives)
+
+### Sliding Window Scanning
+Words are extracted from the input and grouped into windows matching each variant's word count (and +1 to catch middle-initial insertions). Each window is normalized and compared using Myers' distance.
+
+### Gap-Aware Processing
+The fuzzy matcher receives a list of regions already masked by Stage 2 (Aho-Corasick) and only scans the gaps between them, avoiding double-redaction and wasted work.
+
 ### Privacy Pipeline Order
 The proxy applies redaction rules in sequence on the request path:
 1.  **Entity Masking** (names → aliases) — Aho-Corasick scan
 2.  **SSN Redaction** (digits → `*`) — SIMD scan
+3.  **Fuzzy Name Matching** (OCR variants → aliases) — Myers' bit-vector scan
 
 On the response path:
 1.  **Entity Unmasking** (aliases → names) — Aho-Corasick reverse scan
 
-## 5. State Management
+## 6. State Management
 
-Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers, HTTP server instance, and its own `std.http.Client` for upstream requests (avoiding shared mutable state). An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap is passed as read-only thread context; it is optional, enabling SSN-only proxy mode without entity masking.
+Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers, HTTP server instance, and its own `std.http.Client` for upstream requests (avoiding shared mutable state). An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context; both are optional, enabling SSN-only proxy mode without entity masking.
 
 **Phase 3 Scalability**: The current thread-per-connection model is a deliberate simplicity trade-off. A thread pool or `io_uring`-based event loop would be the natural evolution for high-connection-count workloads.
 
