@@ -56,6 +56,12 @@ pub const Config = struct {
     tls_cert_src: ConfigSource = .default,
     tls_key: ?[]const u8 = null,
     tls_key_src: ConfigSource = .default,
+    target_tls: bool = false,
+    target_tls_src: ConfigSource = .default,
+    ca_file: ?[]const u8 = null,
+    ca_file_src: ConfigSource = .default,
+    tls_no_system_ca: bool = false,
+    tls_no_system_ca_src: ConfigSource = .default,
 
     allocator: std.mem.Allocator,
 
@@ -72,6 +78,9 @@ pub const Config = struct {
         MissingTlsPair,
         TlsCertNotFound,
         TlsKeyNotFound,
+        CaFileNotFound,
+        InvalidTargetTlsFlag,
+        InvalidNoSystemCaFlag,
         UnknownFlag,
         OutOfMemory,
     };
@@ -91,6 +100,9 @@ pub const Config = struct {
         }
         if (self.tls_key != null and self.tls_key_src == .env_var) {
             self.allocator.free(self.tls_key.?);
+        }
+        if (self.ca_file != null and self.ca_file_src == .env_var) {
+            self.allocator.free(self.ca_file.?);
         }
     }
 
@@ -112,6 +124,9 @@ pub const Config = struct {
             \\  --entity-file-sync          Write API entity changes back to entity file
             \\  --tls-cert <path>           PEM certificate file for TLS (requires --tls-key)
             \\  --tls-key <path>            PEM private key file for TLS (requires --tls-cert)
+            \\  --target-tls                Enable TLS for upstream connections (default: disabled)
+            \\  --ca-file <path>            Custom CA bundle PEM for upstream TLS verification
+            \\  --tls-no-system-ca          Suppress system CA bundle loading (use with --ca-file for self-signed certs)
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -212,6 +227,35 @@ pub const Config = struct {
                 std.debug.print("error: cannot open TLS key file '{s}': {s}\n", .{ value, @errorName(err) });
                 return error.TlsKeyNotFound;
             }
+        } else if (std.mem.eql(u8, name, "NANOMASK_TARGET_TLS")) {
+            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                config.target_tls = true;
+            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+                config.target_tls = false;
+            } else {
+                std.debug.print("error: NANOMASK_TARGET_TLS must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidTargetTlsFlag;
+            }
+            config.target_tls_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_CA_FILE")) {
+            config.ca_file = try allocator.dupe(u8, value);
+            config.ca_file_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open CA file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.CaFileNotFound;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_TLS_NO_SYSTEM_CA")) {
+            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                config.tls_no_system_ca = true;
+            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+                config.tls_no_system_ca = false;
+            } else {
+                std.debug.print("error: NANOMASK_TLS_NO_SYSTEM_CA must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidNoSystemCaFlag;
+            }
+            config.tls_no_system_ca_src = .env_var;
         }
     }
 
@@ -236,6 +280,9 @@ pub const Config = struct {
             "NANOMASK_ENTITY_FILE_SYNC",
             "NANOMASK_TLS_CERT",
             "NANOMASK_TLS_KEY",
+            "NANOMASK_TARGET_TLS",
+            "NANOMASK_CA_FILE",
+            "NANOMASK_TLS_NO_SYSTEM_CA",
         };
 
         for (env_keys) |key| {
@@ -415,6 +462,29 @@ pub const Config = struct {
                     std.debug.print("error: cannot open TLS key file '{s}': {s}\n", .{ args[i], @errorName(err) });
                     return error.TlsKeyNotFound;
                 }
+            } else if (std.mem.eql(u8, arg, "--target-tls")) {
+                config.target_tls = true;
+                config.target_tls_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--ca-file")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --ca-file\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.ca_file != null and config.ca_file_src == .env_var) {
+                    allocator.free(config.ca_file.?);
+                }
+                config.ca_file = args[i];
+                config.ca_file_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open CA file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.CaFileNotFound;
+                }
+            } else if (std.mem.eql(u8, arg, "--tls-no-system-ca")) {
+                config.tls_no_system_ca = true;
+                config.tls_no_system_ca_src = .cli_flag;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -429,6 +499,22 @@ pub const Config = struct {
         if (config.tls_key != null and config.tls_cert == null) {
             std.debug.print("error: --tls-key requires --tls-cert\n", .{});
             return error.MissingTlsPair;
+        }
+
+        // Warn if --ca-file or --tls-no-system-ca given without --target-tls
+        if (!config.target_tls and config.ca_file != null) {
+            std.debug.print("WARNING: --ca-file has no effect without --target-tls\n", .{});
+        }
+        if (!config.target_tls and config.tls_no_system_ca) {
+            std.debug.print("WARNING: --tls-no-system-ca has no effect without --target-tls\n", .{});
+        }
+
+        // When --tls-no-system-ca is set without --ca-file, no CAs will be
+        // trusted at all — every upstream HTTPS handshake will fail. Warn
+        // the user to pair it with --ca-file.
+        if (config.tls_no_system_ca and config.ca_file == null and config.target_tls) {
+            std.debug.print("WARNING: --tls-no-system-ca without --ca-file means NO certificates are trusted — upstream HTTPS will fail\n", .{});
+            std.debug.print("  hint: use --ca-file <path> to provide your self-signed CA bundle\n", .{});
         }
 
         return config;
@@ -699,4 +785,100 @@ test "Config - tls-key file not found" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.TlsKeyNotFound, res);
+}
+
+test "Config - target-tls flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--target-tls",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.target_tls);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.target_tls_src);
+}
+
+test "Config - tls-no-system-ca flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--tls-no-system-ca",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.tls_no_system_ca);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.tls_no_system_ca_src);
+}
+
+test "Config - ca-file with valid file" {
+    const tmp_ca = "test_ca_bundle.pem";
+    {
+        var f = try std.fs.cwd().createFile(tmp_ca, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_ca) catch {};
+
+    const args = [_][]const u8{
+        "nanomask",
+        "--ca-file", tmp_ca,
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings(tmp_ca, cfg.ca_file.?);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.ca_file_src);
+}
+
+test "Config - ca-file not found" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--ca-file", "nonexistent_ca_12345.pem",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.CaFileNotFound, res);
+}
+
+test "Config - target-tls + tls-no-system-ca combo" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--target-tls",
+        "--tls-no-system-ca",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.target_tls);
+    try testing.expect(cfg.tls_no_system_ca);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.target_tls_src);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.tls_no_system_ca_src);
+}
+
+test "Config - tls-no-system-ca + ca-file is valid (complementary)" {
+    const tmp_ca = "test_ca_combo.pem";
+    {
+        var f = try std.fs.cwd().createFile(tmp_ca, .{});
+        defer f.close();
+        try f.writeAll("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_ca) catch {};
+
+    const args = [_][]const u8{
+        "nanomask",
+        "--target-tls",
+        "--tls-no-system-ca",
+        "--ca-file", tmp_ca,
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.tls_no_system_ca);
+    try testing.expectEqualStrings(tmp_ca, cfg.ca_file.?);
 }

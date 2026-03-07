@@ -43,6 +43,7 @@ pub fn handleRequest(
     client: *std.http.Client,
     target_host: []const u8,
     target_port: u16,
+    target_tls: bool,
     session_entity_map: ?*const entity_mask.EntityMap,
     session_fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
     entity_set: ?*VersionedEntitySet,
@@ -85,7 +86,8 @@ pub fn handleRequest(
 
     // --- Forward request to upstream ---
     var url_buf: [max_url_len]u8 = undefined;
-    const target_url_str = try std.fmt.bufPrint(&url_buf, "http://{s}:{d}{s}", .{ target_host, target_port, uri_str });
+    const scheme = if (target_tls) "https" else "http";
+    const target_url_str = try std.fmt.bufPrint(&url_buf, "{s}://{s}:{d}{s}", .{ scheme, target_host, target_port, uri_str });
     const target_uri = try std.Uri.parse(target_url_str);
 
     // Forward Content-Type so upstream APIs receive the correct media type.

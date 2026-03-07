@@ -29,6 +29,8 @@ const ThreadContext = struct {
     /// Optional TLS context — when present, each accepted connection performs
     /// a TLS 1.3 handshake before HTTP processing.
     tls_context: ?*tls_mod.TlsContext,
+    /// When true, the proxy uses HTTPS to connect to the upstream target.
+    target_tls: bool,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -82,6 +84,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         ctx.http_client,
         ctx.target_host,
         ctx.target_port,
+        ctx.target_tls,
         em,
         fm,
         ctx.entity_set,
@@ -135,6 +138,13 @@ pub fn main() !void {
     } else {
         std.debug.print("  tls_key=null (from {s})\n", .{cfg.tls_key_src.asStr()});
     }
+    std.debug.print("  target_tls={} (from {s})\n", .{ cfg.target_tls, cfg.target_tls_src.asStr() });
+    if (cfg.ca_file) |ca| {
+        std.debug.print("  ca_file={s} (from {s})\n", .{ ca, cfg.ca_file_src.asStr() });
+    } else {
+        std.debug.print("  ca_file=null (from {s})\n", .{cfg.ca_file_src.asStr()});
+    }
+    std.debug.print("  tls_no_system_ca={} (from {s})\n", .{ cfg.tls_no_system_ca, cfg.tls_no_system_ca_src.asStr() });
     std.debug.print("\n", .{});
 
     // --- Entity Masking Setup (RCU) ---
@@ -217,8 +227,9 @@ pub fn main() !void {
 
     const tls_enabled = tls_context != null;
     const protocol = if (tls_enabled) "https" else "http";
+    const upstream_protocol = if (cfg.target_tls) "https" else "http";
     std.debug.print("Listening on {s}://127.0.0.1:{}\n", .{ protocol, cfg.listen_port });
-    std.debug.print("Forwarding to http://{s}:{}\n", .{ cfg.target_host, cfg.target_port });
+    std.debug.print("Forwarding to {s}://{s}:{}\n", .{ upstream_protocol, cfg.target_host, cfg.target_port });
 
     if (entity_set) |es| {
         const snap = es.acquire();
@@ -260,6 +271,22 @@ pub fn main() !void {
     }
     std.debug.print("\n", .{});
 
+    // --- Upstream TLS status ---
+    if (cfg.target_tls) {
+        std.debug.print("Upstream TLS: enabled\n", .{});
+        if (cfg.ca_file) |ca| {
+            std.debug.print("  CA bundle: {s} (from {s})\n", .{ ca, cfg.ca_file_src.asStr() });
+        } else {
+            std.debug.print("  CA bundle: system default\n", .{});
+        }
+        if (cfg.tls_no_system_ca) {
+            std.debug.print("  NOTE: system CA bundle suppressed (--tls-no-system-ca) — only --ca-file CAs are trusted\n", .{});
+        }
+    } else {
+        std.debug.print("Upstream TLS: disabled (plaintext HTTP to upstream)\n", .{});
+    }
+    std.debug.print("\n", .{});
+
     var net_server = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", cfg.listen_port), .{
         .reuse_address = true,
     });
@@ -270,6 +297,36 @@ pub fn main() !void {
     // keep-alive. Eliminates per-request TCP handshake overhead (5-10ms savings).
     var http_client = std.http.Client{ .allocator = allocator };
     defer http_client.deinit();
+
+    // Configure upstream TLS CA bundle.
+    //
+    // By default, std.http.Client rescans system CAs on the first HTTPS
+    // request (next_https_rescan_certs = true). We override this only when
+    // the user requests a custom CA file or suppresses system CAs.
+    //
+    // --tls-no-system-ca prevents system CA loading. On its own this means
+    // the CA bundle stays empty and ALL upstream HTTPS will fail (the TLS
+    // client requires at least one trusted root). Pair it with --ca-file
+    // to provide the self-signed CA that should be trusted instead.
+    if (cfg.target_tls) {
+        if (cfg.ca_file) |ca_path| {
+            // Load a custom CA bundle PEM file for internal PKI / GovCloud.
+            http_client.ca_bundle.addCertsFromFilePath(allocator, std.fs.cwd(), ca_path) catch |err| {
+                std.debug.print("error: failed to load CA file '{s}': {}\n", .{ ca_path, err });
+                std.process.exit(1);
+            };
+        }
+        if (cfg.tls_no_system_ca) {
+            // Prevent the default system CA rescan — only explicitly loaded
+            // CAs (from --ca-file) will be trusted.
+            http_client.next_https_rescan_certs = false;
+        } else if (cfg.ca_file != null) {
+            // Custom CAs loaded above; also suppress system rescan so only
+            // our custom CAs are trusted.
+            http_client.next_https_rescan_certs = false;
+        }
+        // When neither flag is set, the default system CA scan applies.
+    }
 
     // NOTE: Upstream request timeouts are not yet configurable via std.http.Client.
     // Long-running upstream calls will block the handler thread until completion.
@@ -294,6 +351,7 @@ pub fn main() !void {
         .active_connections = &active_connections,
         .admin_config = admin_config,
         .tls_context = if (tls_context) |*tc| tc else null,
+        .target_tls = cfg.target_tls,
     };
 
     while (true) {

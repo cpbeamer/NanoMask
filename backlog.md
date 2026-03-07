@@ -1,6 +1,12 @@
 # NanoMask — Backlog
 
-> **Status**: Phase 2 complete (3-stage pipeline + connection pooling ✅). Chunked SSN redaction (2.1) ✅ complete. Epic 3 (Configuration) ✅ complete. Epic 4.1 (TLS listener) ✅ complete. Phase 3 Epics 1-2 (remaining tickets), Phase 4 (remaining), and Phase 5 (Competitive Moat) are open.
+> **Status**:
+> - Phase 2 complete (3-stage pipeline + connection pooling ✅)
+> - Chunked SSN redaction (2.1) ✅
+> - Epic 3 (Configuration) ✅
+> - Epic 4.1 (TLS listener) ✅
+> - Epic 4.2 (Upstream TLS) ✅
+> - Phase 3 Epics 1–2, Phase 4 (remaining), and Phase 5 (Competitive Moat) are open
 
 ---
 
@@ -94,7 +100,7 @@
 
 > ✅ **2.3 — Chunk-aware fuzzy matching**: Complete. `FuzzyMatcher.fuzzyRedactChunked()` processes multi-word boundary overlaps and translates local chunk coordinates with no performance penalty relative to raw baseline speeds (319 MB/s).
 
-> ✅ **2.4 — Streaming proxy pipeline**: Complete. Implemented bidrectional streamed chunking and processing in `proxy.zig` and bound memory footprint to strictly < 64KB per connection.
+> ✅ **2.4 — Streaming proxy pipeline**: Complete. Implemented bidirectional streamed chunking and processing in `proxy.zig` and bound memory footprint to strictly < 64KB per connection.
 
 ---
 
@@ -275,7 +281,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 4.2 — TLS for upstream connections
+#### ✅ 4.2 — TLS for upstream connections
 
 **Type**: Feature  
 **Estimate**: 1–2 days  
@@ -285,12 +291,12 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 - When enabled, configure `std.http.Client` to use TLS when connecting to the upstream host
 - Use the system CA certificate bundle by default for certificate verification
 - Add `--ca-file <path>` flag for custom CA bundles (common in GovCloud environments with internal PKI)
-- Add `--tls-skip-verify` flag (off by default) for development/testing only — log a `CAUTION` warning when enabled
+- Add `--tls-no-system-ca` flag (off by default) to suppress system CA loading — log a `WARNING` when used without `--ca-file`
 - Handle TLS handshake failures gracefully with descriptive error messages: `error: TLS handshake with upstream failed: CertificateVerifyFailed`
 - Test against a real HTTPS endpoint (e.g., `https://httpbin.org/post`) and a self-signed upstream
-- Unit tests: flag parsing, CA file loading, skip-verify warning
+- Unit tests: flag parsing, CA file loading, no-system-ca warning
 
-**Acceptance**: Proxy successfully forwards requests to `https://api.openai.com` with verified TLS. Custom CA file works for internal PKI. `--tls-skip-verify` logs a warning but connects to self-signed upstreams.
+**Acceptance**: Proxy successfully forwards requests to `https://api.openai.com` with verified TLS. Custom CA file works for internal PKI. `--tls-no-system-ca` with `--ca-file` connects to self-signed upstreams.
 
 > **In plain English:** Encrypts the connection from NanoMask to the upstream API (e.g., OpenAI). Most production APIs require HTTPS anyway, so without this the proxy simply can’t connect to them. The custom CA flag supports government networks that use their own certificate systems.
 

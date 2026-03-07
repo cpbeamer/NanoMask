@@ -49,15 +49,17 @@ zig build test
 
 ### Configure
 
-Edit `src/main.zig` to set your environment:
+All settings are configurable via CLI flags or environment variables (see [Configuration](#configuration) below):
 
-```zig
-const listen_port: u16 = 8081;
-const target_host = "your-llm-api.internal";
-const target_port: u16 = 443;
+```bash
+# Forward to an upstream API over HTTPS with entity masking
+zig build run -- --target-host api.openai.com --target-port 443 --target-tls --entity-file entities.txt
 
-// Entity names to mask (production: load from headers or config)
-const demo_names = [_][]const u8{ "John Doe", "Jane Smith", "Dr. Johnson" };
+# Enable TLS on the listener side
+zig build run -- --tls-cert cert.pem --tls-key key.pem --entity-file entities.txt
+
+# Use environment variables (12-factor friendly)
+NANOMASK_TARGET_HOST=api.internal NANOMASK_TARGET_PORT=443 zig build run
 ```
 
 Or pass entity names per-request via HTTP header:
@@ -270,10 +272,15 @@ NanoMask supports a strict configuration precedence:
 | Entity sync | `--entity-file-sync` | `NANOMASK_ENTITY_FILE_SYNC` | disabled | Write API entity changes back to entity file |
 | TLS certificate | `--tls-cert` | `NANOMASK_TLS_CERT` | none | PEM certificate file for TLS (requires `--tls-key`) |
 | TLS private key | `--tls-key` | `NANOMASK_TLS_KEY` | none | PEM private key file for TLS (requires `--tls-cert`) |
+| Target TLS | `--target-tls` | `NANOMASK_TARGET_TLS` | disabled | Enable HTTPS for upstream connections |
+| CA file | `--ca-file` | `NANOMASK_CA_FILE` | system CAs | Custom CA bundle PEM for upstream TLS verification |
+| Suppress system CAs | `--tls-no-system-ca` | `NANOMASK_TLS_NO_SYSTEM_CA` | disabled | Suppress system CA bundle; use with `--ca-file` for self-signed certs |
 
 *Note: Per-request `X-ZPG-Entities` header overrides the entity names loaded from the file or compiled defaults.*
 
-> **TLS**: When both `--tls-cert` and `--tls-key` are provided, NanoMask performs a full TLS 1.3 handshake on each accepted connection using AES-128-GCM-SHA256 with X25519 key exchange. The encrypted reader/writer wraps the raw socket transparently — the HTTP server and redaction pipeline operate on plaintext. Supports ECDSA P-256 and Ed25519 private keys in PKCS#8 PEM format.
+> **Listener TLS**: When both `--tls-cert` and `--tls-key` are provided, NanoMask performs a full TLS 1.3 handshake on each accepted connection using AES-128-GCM-SHA256 with X25519 key exchange. The encrypted reader/writer wraps the raw socket transparently — the HTTP server and redaction pipeline operate on plaintext. Supports ECDSA P-256 and Ed25519 private keys in PKCS#8 PEM format.
+
+> **Upstream TLS**: When `--target-tls` is enabled, NanoMask connects to the upstream server over HTTPS. By default the system CA bundle is used for certificate verification. Use `--ca-file` to specify a custom CA bundle (e.g., for internal PKI or GovCloud environments). Use `--tls-no-system-ca` to suppress the system CA bundle and rely solely on `--ca-file` for trust anchors (e.g., self-signed certificates).
 
 ## License
 

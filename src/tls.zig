@@ -291,9 +291,6 @@ pub const TlsServerStream = struct {
     plaintext_start: usize,
     plaintext_end: usize,
 
-    // Write buffer for building encrypted records
-    write_record_buf: [tls.record_header_len + tls.max_ciphertext_len]u8,
-
     pub fn reader(self: *TlsServerStream) *Io.Reader {
         return &self.reader_state;
     }
@@ -621,7 +618,7 @@ pub fn accept(
     raw_writer: *Io.Writer,
     io_buf: []u8,
 ) AcceptError!TlsServerStream {
-    if (io_buf.len < 16 * 1024) return error.HandshakeFailed;
+    if (io_buf.len < 32 * 1024) return error.HandshakeFailed;
 
     // ----- Step 1: Read ClientHello -----
     const ch_header = raw_reader.peek(tls.record_header_len) catch return error.ReadFailed;
@@ -992,7 +989,6 @@ pub fn accept(
         .plaintext_buf = undefined,
         .plaintext_start = 0,
         .plaintext_end = 0,
-        .write_record_buf = undefined,
     };
 }
 
