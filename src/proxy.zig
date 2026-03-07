@@ -3,20 +3,17 @@ const http = std.http;
 const redact = @import("redact.zig");
 const entity_mask = @import("entity_mask.zig");
 const fuzzy_match = @import("fuzzy_match.zig");
+const admin = @import("admin.zig");
+const versioned_entity_set = @import("versioned_entity_set.zig");
+const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
+const http_util = @import("http_util.zig");
 
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
 
-/// Find a custom header value by name (case-insensitive) using the HeaderIterator.
-fn findHeader(head_buffer: []const u8, target_name: []const u8) ?[]const u8 {
-    var it = http.HeaderIterator.init(head_buffer);
-    while (it.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, target_name)) {
-            return header.value;
-        }
-    }
-    return null;
-}
+/// Find a custom header value by name (case-insensitive).
+/// Delegates to the shared http_util implementation.
+const findHeader = http_util.findHeader;
 
 /// Parse a comma-separated header value into individual trimmed name slices.
 /// Returns owned slice of slices pointing into `header_value` memory.
@@ -48,9 +45,17 @@ pub fn handleRequest(
     target_port: u16,
     session_entity_map: ?*const entity_mask.EntityMap,
     session_fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+    entity_set: ?*VersionedEntitySet,
+    admin_config: admin.AdminConfig,
 ) !void {
     const method = request.head.method;
     const uri_str = request.head.target;
+
+    // --- Admin API interception (before proxying) ---
+    if (try admin.handleAdminRequest(request, entity_set, admin_config, allocator)) {
+        std.debug.print("[ADM] {s} {s} -> handled\n", .{ @tagName(method), uri_str });
+        return;
+    }
 
     std.debug.print("[PRX] {s} {s}\n", .{ @tagName(method), uri_str });
 

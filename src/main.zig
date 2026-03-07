@@ -9,6 +9,7 @@ const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const EntitySnapshot = versioned_entity_set.EntitySnapshot;
 const file_watcher = @import("file_watcher.zig");
 const FileWatcher = file_watcher.FileWatcher;
+const admin = @import("admin.zig");
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
@@ -23,6 +24,7 @@ const ThreadContext = struct {
     /// Individual Request objects are per-handler (not thread-safe).
     http_client: *std.http.Client,
     active_connections: *std.atomic.Value(u32),
+    admin_config: admin.AdminConfig,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -64,6 +66,8 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
         ctx.target_port,
         em,
         fm,
+        ctx.entity_set,
+        ctx.admin_config,
     ) catch |err| {
         std.debug.print("[ERR] Proxy request failed: {}\n", .{err});
     };
@@ -148,6 +152,23 @@ pub fn main() !void {
             std.debug.print("[WARN] Failed to start file watcher: {} — hot-reload disabled\n", .{err});
             watcher = null;
         };
+    } else if (cfg.admin_api) {
+        // Admin API is enabled but no entity file — create an empty entity set
+        // so the admin API can populate it from scratch via POST/PUT.
+        const empty_names = [_][]const u8{};
+        const initial_snapshot = versioned_entity_set.loadSnapshotFromNames(
+            &empty_names,
+            cfg.fuzzy_threshold,
+            1,
+            allocator,
+        ) catch {
+            std.debug.print("error: failed to create empty entity set for admin API\n", .{});
+            std.process.exit(1);
+        };
+        std.debug.print("Admin API enabled with empty entity set (populate via POST /_admin/entities)\n", .{});
+        const es = try allocator.create(VersionedEntitySet);
+        es.* = VersionedEntitySet.init(initial_snapshot);
+        entity_set = es;
     } else {
         std.debug.print("WARNING: No entity file provided. Running in SSN-only mode unless X-ZPG-Entities header is present on requests.\n", .{});
     }
@@ -160,7 +181,11 @@ pub fn main() !void {
         defer es.release(snap);
         std.debug.print("Entity masking: {} session names loaded (v{})\n", .{ snap.loaded_names.len, snap.version });
         std.debug.print("Fuzzy matching: {} variants at {d:.0}% threshold\n", .{ snap.fuzzy_matcher.variants.len, cfg.fuzzy_threshold * 100.0 });
-        std.debug.print("Hot-reload: enabled (polling every {}ms)\n", .{cfg.watch_interval_ms});
+        if (watcher != null) {
+            std.debug.print("Hot-reload: enabled (polling every {}ms)\n", .{cfg.watch_interval_ms});
+        } else {
+            std.debug.print("Hot-reload: disabled (admin-only, no file watcher)\n", .{});
+        }
     } else {
         std.debug.print("Entity masking: disabled (SSN-only mode)\n", .{});
         std.debug.print("Fuzzy matching: disabled (SSN-only mode)\n", .{});
@@ -169,7 +194,22 @@ pub fn main() !void {
 
     std.debug.print("Connection pool: shared client with keep-alive (up to 32 upstream connections)\n", .{});
     std.debug.print("Bidirectional pipeline: mask request -> unmask response\n", .{});
-    std.debug.print("Multi-threaded: up to {} concurrent connections\n\n", .{cfg.max_connections});
+    std.debug.print("Multi-threaded: up to {} concurrent connections\n", .{cfg.max_connections});
+    if (cfg.admin_api) {
+        std.debug.print("Admin API: enabled at /_admin/entities", .{});
+        if (cfg.admin_token != null) {
+            std.debug.print(" (auth required)", .{});
+        } else {
+            std.debug.print(" (WARNING: no auth token set)", .{});
+        }
+        if (cfg.entity_file_sync) {
+            std.debug.print(" [file-sync on]", .{});
+        }
+        std.debug.print("\n", .{});
+    } else {
+        std.debug.print("Admin API: disabled\n", .{});
+    }
+    std.debug.print("\n", .{});
 
     var net_server = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", cfg.listen_port), .{
         .reuse_address = true,
@@ -188,6 +228,14 @@ pub fn main() !void {
 
     var active_connections = std.atomic.Value(u32).init(0);
 
+    const admin_config = admin.AdminConfig{
+        .enabled = cfg.admin_api,
+        .token = cfg.admin_token,
+        .entity_file_sync = cfg.entity_file_sync,
+        .entity_file = cfg.entity_file,
+        .fuzzy_threshold = cfg.fuzzy_threshold,
+    };
+
     const ctx = ThreadContext{
         .allocator = allocator,
         .target_host = cfg.target_host,
@@ -195,6 +243,7 @@ pub fn main() !void {
         .entity_set = entity_set,
         .http_client = &http_client,
         .active_connections = &active_connections,
+        .admin_config = admin_config,
     };
 
     while (true) {

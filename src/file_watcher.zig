@@ -103,8 +103,9 @@ pub const FileWatcher = struct {
 
     /// Rebuild automaton and swap when entity file changes.
     fn handleFileChange(self: *FileWatcher, new_stat: FileStat) void {
-        const old_version = self.entity_set.version;
-        const new_version = old_version + 1;
+        // Use nextVersion() for atomic, monotonic version generation.
+        const new_version = self.entity_set.nextVersion();
+        const old_version = new_version - 1;
 
         std.debug.print("[WATCH] Entity reload started (v{} → v{})\n", .{ old_version, new_version });
 

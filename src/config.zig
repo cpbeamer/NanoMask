@@ -46,6 +46,12 @@ pub const Config = struct {
     log_level_src: ConfigSource = .default,
     watch_interval_ms: u64 = 1000,
     watch_interval_ms_src: ConfigSource = .default,
+    admin_api: bool = false,
+    admin_api_src: ConfigSource = .default,
+    admin_token: ?[]const u8 = null,
+    admin_token_src: ConfigSource = .default,
+    entity_file_sync: bool = false,
+    entity_file_sync_src: ConfigSource = .default,
 
     allocator: std.mem.Allocator,
 
@@ -58,6 +64,7 @@ pub const Config = struct {
         InvalidMaxConnections,
         InvalidWatchInterval,
         EntityFileNotFound,
+        InvalidAdminFlag,
         UnknownFlag,
         OutOfMemory,
     };
@@ -68,6 +75,9 @@ pub const Config = struct {
         }
         if (self.entity_file != null and self.entity_file_src == .env_var) {
             self.allocator.free(self.entity_file.?);
+        }
+        if (self.admin_token != null and self.admin_token_src == .env_var) {
+            self.allocator.free(self.admin_token.?);
         }
     }
 
@@ -84,6 +94,9 @@ pub const Config = struct {
             \\  --max-connections <u32>    Maximum concurrent connections (default: 128)
             \\  --log-level <level>        Logging level: debug, info, warn, error (default: info)
             \\  --watch-interval <ms>      Entity file poll interval in ms (default: 1000)
+            \\  --admin-api                 Enable /_admin/entities REST endpoints (default: disabled)
+            \\  --admin-token <secret>      Require Bearer token for admin endpoints
+            \\  --entity-file-sync          Write API entity changes back to entity file
             \\  --help                     Print this help message and exit
             \\
         , .{});
@@ -143,6 +156,29 @@ pub const Config = struct {
             };
             if (config.watch_interval_ms == 0) return error.InvalidWatchInterval;
             config.watch_interval_ms_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_API")) {
+            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                config.admin_api = true;
+            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+                config.admin_api = false;
+            } else {
+                std.debug.print("error: NANOMASK_ADMIN_API must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidAdminFlag;
+            }
+            config.admin_api_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_TOKEN")) {
+            config.admin_token = try allocator.dupe(u8, value);
+            config.admin_token_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FILE_SYNC")) {
+            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                config.entity_file_sync = true;
+            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
+                config.entity_file_sync = false;
+            } else {
+                std.debug.print("error: NANOMASK_ENTITY_FILE_SYNC must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidAdminFlag;
+            }
+            config.entity_file_sync_src = .env_var;
         }
     }
 
@@ -162,6 +198,9 @@ pub const Config = struct {
             "NANOMASK_MAX_CONNECTIONS",
             "NANOMASK_LOG_LEVEL",
             "NANOMASK_WATCH_INTERVAL",
+            "NANOMASK_ADMIN_API",
+            "NANOMASK_ADMIN_TOKEN",
+            "NANOMASK_ENTITY_FILE_SYNC",
         };
 
         for (env_keys) |key| {
@@ -290,6 +329,23 @@ pub const Config = struct {
                     return error.InvalidWatchInterval;
                 }
                 config.watch_interval_ms_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-api")) {
+                config.admin_api = true;
+                config.admin_api_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-token")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --admin-token\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.admin_token != null and config.admin_token_src == .env_var) {
+                    allocator.free(config.admin_token.?);
+                }
+                config.admin_token = args[i];
+                config.admin_token_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--entity-file-sync")) {
+                config.entity_file_sync = true;
+                config.entity_file_sync_src = .cli_flag;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -417,4 +473,53 @@ test "Config - invalid watch interval non-numeric" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidWatchInterval, res);
+}
+
+test "Config - admin-api flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--admin-api",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.admin_api);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.admin_api_src);
+}
+
+test "Config - admin-token flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--admin-token", "mysecret",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings("mysecret", cfg.admin_token.?);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.admin_token_src);
+}
+
+test "Config - admin-token missing value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--admin-token",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
+}
+
+test "Config - entity-file-sync flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--entity-file-sync",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.entity_file_sync);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.entity_file_sync_src);
 }

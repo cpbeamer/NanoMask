@@ -55,13 +55,13 @@ pub const EntitySnapshot = struct {
 /// Writers call `swap()` to atomically install a new snapshot.
 pub const VersionedEntitySet = struct {
     current: std.atomic.Value(?*EntitySnapshot),
-    version: u32,
+    version: std.atomic.Value(u32),
     allocator: std.mem.Allocator,
 
     pub fn init(initial_snapshot: *EntitySnapshot) VersionedEntitySet {
         return .{
             .current = std.atomic.Value(?*EntitySnapshot).init(initial_snapshot),
-            .version = initial_snapshot.version,
+            .version = std.atomic.Value(u32).init(initial_snapshot.version),
             .allocator = initial_snapshot.allocator,
         };
     }
@@ -87,12 +87,19 @@ pub const VersionedEntitySet = struct {
     /// If no requests are using the old snapshot, it's freed immediately.
     /// Otherwise it's freed when the last request releases it.
     pub fn swap(self: *VersionedEntitySet, new_snapshot: *EntitySnapshot) void {
-        self.version = new_snapshot.version;
+        self.version.store(new_snapshot.version, .release);
         const old = self.current.swap(new_snapshot, .acq_rel);
         // Release the set's own reference to the old snapshot
         if (old) |old_snap| {
             _ = old_snap.release();
         }
+    }
+
+    /// Atomically increment and return the next version number.
+    /// Used by admin API to safely generate monotonic version IDs
+    /// even under concurrent mutations.
+    pub fn nextVersion(self: *VersionedEntitySet) u32 {
+        return self.version.fetchAdd(1, .acq_rel) + 1;
     }
 
     /// Clean up: release the set's reference to the current snapshot.
@@ -160,6 +167,52 @@ pub fn loadSnapshotFromFile(
         .loaded_names = loaded_names,
         .version = version,
         .ref_count = std.atomic.Value(u32).init(1), // owned by creator
+        .allocator = allocator,
+    };
+
+    return snapshot;
+}
+
+/// Build a snapshot from an in-memory name list (no file I/O).
+/// Used by the admin API to rebuild after add/remove/replace operations.
+/// The returned snapshot has ref_count = 1 (the "owner" reference).
+pub fn loadSnapshotFromNames(
+    names: []const []const u8,
+    fuzzy_threshold: f32,
+    version: u32,
+    allocator: std.mem.Allocator,
+) !*EntitySnapshot {
+    // Dupe all names so the snapshot owns its data
+    const loaded_names = try allocator.alloc([]const u8, names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |j| allocator.free(loaded_names[j]);
+        allocator.free(loaded_names);
+    }
+
+    for (names, 0..) |name, i| {
+        loaded_names[i] = try allocator.dupe(u8, name);
+        initialized = i + 1;
+    }
+
+    var em = try entity_mask.EntityMap.init(allocator, loaded_names);
+    errdefer em.deinit();
+
+    var fm = try fuzzy_match.FuzzyMatcher.init(
+        allocator,
+        em.getRawNames(),
+        em.getAliases(),
+        fuzzy_threshold,
+    );
+    errdefer fm.deinit();
+
+    const snapshot = try allocator.create(EntitySnapshot);
+    snapshot.* = .{
+        .entity_map = em,
+        .fuzzy_matcher = fm,
+        .loaded_names = loaded_names,
+        .version = version,
+        .ref_count = std.atomic.Value(u32).init(1),
         .allocator = allocator,
     };
 
@@ -288,4 +341,32 @@ test "loadSnapshotFromFile - nonexistent file returns error" {
     const allocator = std.testing.allocator;
     const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, 1, allocator);
     try std.testing.expectError(error.FileNotFound, result);
+}
+
+test "loadSnapshotFromNames - builds valid snapshot" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "Alice", "Bob", "Charlie" };
+    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, allocator);
+    defer _ = snapshot.release();
+
+    try std.testing.expectEqual(@as(usize, 3), snapshot.loaded_names.len);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.version);
+
+    const masked = try snapshot.entity_map.mask("Alice met Bob", allocator);
+    defer allocator.free(masked);
+    try std.testing.expectEqualStrings("Entity_A met Entity_B", masked);
+}
+
+test "loadSnapshotFromNames - empty list produces valid snapshot" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{};
+    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, allocator);
+    defer _ = snapshot.release();
+
+    try std.testing.expectEqual(@as(usize, 0), snapshot.loaded_names.len);
+
+    // Masking with no entities should return input unchanged
+    const masked = try snapshot.entity_map.mask("Hello world", allocator);
+    defer allocator.free(masked);
+    try std.testing.expectEqualStrings("Hello world", masked);
 }
