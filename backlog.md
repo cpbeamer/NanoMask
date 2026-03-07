@@ -12,6 +12,8 @@
 
 **Context**: Zig 0.15.2 `std.Io` is the new cross-platform async I/O interface wrapping IOCP (Windows), io_uring (Linux), and kqueue (macOS). This is the idiomatic path forward.
 
+> **In plain English:** Right now NanoMask creates a brand-new OS thread for every user that connects. Threads are expensive — the system chokes after ~128. This epic replaces that with a smarter "event loop" that juggles thousands of connections with just a few threads, the same approach used by high-performance servers like NGINX.
+
 #### 1.1 — Spike: `std.Io` event loop with accept + echo
 
 **Type**: Research / Spike  
@@ -24,6 +26,8 @@
 - Document API surface, gotchas, and buffer ownership semantics
 
 **Acceptance**: A standalone `spike_io.zig` that accepts 1,000+ concurrent connections and echoes data back.
+
+> **In plain English:** A quick experiment to prove the new I/O technology works before investing days rewriting the proxy. Better to spend one day testing than one week building the wrong thing.
 
 ---
 
@@ -38,6 +42,8 @@
 - Pass read/write interfaces instead of raw `std.net.Server.Connection`
 
 **Acceptance**: The existing thread-per-connection model works identically but the handler is decoupled from the threading model.
+
+> **In plain English:** Untangle the connection-handling logic from the threading code so we can swap out the underlying engine without rewriting the business logic. Like separating the engine from the car body — you can swap engines without redesigning the seats.
 
 ---
 
@@ -54,6 +60,8 @@
 
 **Acceptance**: `zig build run` starts the proxy in event-loop mode. Benchmark tool shows 1,000+ concurrent connections handled without thread exhaustion.
 
+> **In plain English:** The main event — replace the old threading model with the event loop. This is the difference between maxing out at ~128 users and handling 10,000+. Also dramatically reduces memory usage since each thread carries ~1 MB of overhead.
+
 ---
 
 #### 1.4 — Graceful shutdown and connection draining
@@ -68,11 +76,15 @@
 
 **Acceptance**: `Ctrl+C` triggers clean shutdown with "draining N connections" log message. No memory leaks.
 
+> **In plain English:** When you stop the proxy, instead of cutting everyone off mid-request, it finishes the in-progress work first. Essential for deploying updates without losing anyone's data.
+
 ---
 
 ### Epic 2: Streaming Chunked Redaction
 
 **Goal**: Process request bodies in fixed-size chunks instead of buffering the entire payload. Critical for multi-MB clinical documents.
+
+> **In plain English:** Instead of waiting for an entire document to arrive before scrubbing it, the proxy processes data in small pieces as it streams through. Without this, a 50 MB clinical document would need 50 MB of RAM per user. With streaming, it's capped at ~64 KB regardless of document size.
 
 **⚠️ Risk**: Streaming complicates cross-chunk pattern matching. SSN patterns (11 chars) and name patterns can span chunk boundaries. The implementation must handle boundary overlaps correctly.
 
@@ -161,6 +173,63 @@
 - Unit tests: file loading, comment skipping, whitespace trimming, missing file error, empty file handling, header override precedence
 
 **Acceptance**: Proxy loads 100+ entities from file and masks them correctly in proxied requests. Per-request `X-ZPG-Entities` header still overrides the file-loaded set. Missing file produces a clear error at startup.
+
+---
+
+#### 3.4 — Hot-reload with atomic automaton swap (RCU)
+
+**Type**: Feature  
+**Estimate**: 1.5 days  
+**Depends on**: 3.3
+
+**Problem**: In production, entity lists change constantly — new patients are admitted, employees join or leave, clients are onboarded. The proxy cannot require a full restart every time an entity is added. At scale (100 K+ entities), rebuilding the Aho-Corasick automaton takes measurable time (hundreds of milliseconds), and requests must not be blocked or dropped during the rebuild.
+
+**Solution — Read-Copy-Update (RCU)**:
+
+The core idea is borrowed from the Linux kernel's RCU pattern: readers (request handlers) are never blocked; writers (entity reloaders) build a new version in the background and swap it in atomically.
+
+- **Versioned automaton**: Wrap the compiled `EntityMap` in a `VersionedEntitySet` struct holding a version counter and an atomic pointer to the active automaton
+- **Background rebuild**: When a reload is triggered, a dedicated thread:
+  1. Reads the updated entity file
+  2. Builds a brand-new Aho-Corasick automaton from the full entity list
+  3. Atomically swaps the pointer from the old automaton to the new one (`@atomicStore`)
+  4. Waits for all in-flight requests referencing the old automaton to complete (epoch-based reclamation or reference counting)
+  5. Frees the old automaton
+- **Reload triggers** (implement at least one, preferably both):
+  - **File watcher**: Use `std.fs.Watch` (or poll-based fallback) to detect changes to the entity file — automatically trigger rebuild
+  - **Signal-based**: `SIGHUP` (Linux/macOS) or a named event (Windows) triggers a reload — standard for daemon-style services
+- **Zero request impact**: In-flight requests continue using the automaton they started with. New requests pick up the latest version. No mutex contention on the hot path.
+- **Logging**: Log `entity reload started (v3 → v4, 47,231 entities)`, `entity reload complete (rebuilt in 340ms)`, `old automaton v3 freed (0 remaining references)`
+- **Error handling**: If the new entity file is malformed or unreadable, log an error and keep the current automaton — never leave the proxy in a broken state
+- Unit tests: atomic swap under concurrent reads, version monotonicity, failed reload preserves old automaton, reference counting correctness
+
+**Acceptance**: Modifying the entity file while the proxy is running triggers an automatic rebuild. Requests in flight during the rebuild complete successfully. The new automaton is active within 1 second of the file change. No requests are dropped or blocked. A corrupted entity file produces a warning but does not crash the proxy or reset the entity list.
+
+---
+
+#### 3.5 — Entity management REST API
+
+**Type**: Feature  
+**Estimate**: 1.5 days  
+**Depends on**: 3.4
+
+**Problem**: File-based entity loading requires filesystem access, which is awkward for programmatic integrations (EHR webhooks, CI/CD pipelines, admin dashboards). Customers need a way to add, remove, and list entities at runtime via HTTP without touching the filesystem or restarting the proxy.
+
+**Solution — Lightweight admin endpoints**:
+
+- Intercept requests to `/_admin/entities` in `src/proxy.zig` (before forwarding to upstream) — admin routes use an `_admin` prefix to avoid collisions with upstream paths
+- **Endpoints**:
+  - `GET /_admin/entities` — Return the current entity list as JSON: `{"version": 4, "count": 231, "entities": ["Jane Smith", "Bob Jones", ...]}`
+  - `POST /_admin/entities` — Add entities (JSON body: `{"add": ["New Patient", "Another Name"]}`). Triggers automaton rebuild via the RCU mechanism from 3.4.
+  - `DELETE /_admin/entities` — Remove entities (JSON body: `{"remove": ["Former Patient"]}`). Triggers rebuild.
+  - `PUT /_admin/entities` — Replace the entire entity set (JSON body: `{"entities": [...]}`). Full rebuild.
+- **Batching**: Consecutive add/remove calls within a configurable debounce window (default 500 ms) are batched into a single automaton rebuild — prevents rebuild storms from rapid-fire API calls
+- **Auth guard**: Admin endpoints are disabled by default. Enable via `--admin-api` flag. Optionally require a bearer token via `--admin-token <secret>` for production use (prevent unauthorized entity manipulation)
+- **Persistence**: When entities are modified via API, optionally write the updated list back to the entity file (`--entity-file-sync` flag) so changes survive restarts. Without this flag, API changes are ephemeral (lost on restart).
+- **Integration pattern**: An EHR system's patient admission webhook calls `POST /_admin/entities` to add the new patient's name. The proxy picks it up within 1 second. No human intervention needed.
+- Unit tests: add/remove/replace round-trip, concurrent API calls during active proxying, debounce batching, auth token validation, persistence write-back, empty body handling, duplicate entity handling
+
+**Acceptance**: `curl -X POST localhost:8081/_admin/entities -d '{"add":["New Patient"]}' -H 'Authorization: Bearer <token>'` adds the entity. Subsequent proxied requests mask "New Patient". `GET /_admin/entities` shows the updated list. Rapid consecutive calls are debounced into a single rebuild. Unauthorized requests return 401.
 
 ---
 
@@ -686,7 +755,7 @@ Phase 3 (Scalability):
 
 Phase 4 (Production Readiness):
   Epic 3 (Config):    3.1 CLI ──► 3.2 Env Vars
-                             └──► 3.3 Entity File
+                             └──► 3.3 Entity File ──► 3.4 Hot-Reload (RCU) ──► 3.5 Admin API
   Epic 4 (TLS):       4.1 Listener TLS ──► 4.2 Upstream TLS
   Epic 5 (Logging):   5.1 Structured Logs ──► 5.2 Audit Events
                        5.3 Health Check (independent)
@@ -706,6 +775,7 @@ Phase 5 (Competitive Moat):
 | Priority | Phase | Tickets | Rationale |
 |---|---|---|---|
 | **P0** | Phase 4 | 3.1 → 3.2 → 3.3 | Can't deploy without external config |
+| **P1** | Phase 4 | 3.4 → 3.5 | Dynamic entity management for production scale |
 | **P0** | Phase 4 | 5.1 → 5.2, 5.3 | Compliance/audit logging is table stakes |
 | **P0** | Phase 4 | 6.1 → 6.2 | Container image unlocks K8s deployment |
 | **P1** | Phase 3 | 1.1 → 1.2 → 1.3 | Concurrency ceiling 128 → 10K+ |
