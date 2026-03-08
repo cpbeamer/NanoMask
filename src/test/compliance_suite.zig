@@ -298,3 +298,137 @@ test "e2e compliance - unsupported response rejected when configured" {
     try std.testing.expectEqual(http.Status.bad_gateway, result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.client_body, "unsupported upstream response body") != null);
 }
+
+// ---------------------------------------------------------------------------
+// NMV2-002 — Request header fidelity (OpenAI, Anthropic, tracing headers)
+// ---------------------------------------------------------------------------
+test "e2e compliance - request header fidelity" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const body = "Hello world";
+
+    const extra_headers = [_]http.Header{
+        .{ .name = "Authorization", .value = "Bearer sk-test-key-12345" },
+        .{ .name = "Accept", .value = "text/event-stream" },
+        .{ .name = "OpenAI-Beta", .value = "assistants=v2" },
+        .{ .name = "anthropic-version", .value = "2023-06-01" },
+        .{ .name = "x-request-id", .value = "trace-abc-123" },
+        .{ .name = "User-Agent", .value = "TestClient/1.0" },
+    };
+
+    var result = try harness.roundTrip(allocator, body, .{
+        .request_extra_headers = &extra_headers,
+    });
+    defer result.deinit();
+
+    // All end-to-end headers should reach the upstream
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "Authorization") != null);
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "Accept") != null);
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "OpenAI-Beta") != null);
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "anthropic-version") != null);
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "x-request-id") != null);
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "User-Agent") != null);
+
+    // Verify header values are preserved exactly
+    const auth_val = http_util.findHeader(result.upstream_head, "Authorization").?;
+    try std.testing.expectEqualStrings("Bearer sk-test-key-12345", auth_val);
+    const openai_val = http_util.findHeader(result.upstream_head, "OpenAI-Beta").?;
+    try std.testing.expectEqualStrings("assistants=v2", openai_val);
+    const anthropic_val = http_util.findHeader(result.upstream_head, "anthropic-version").?;
+    try std.testing.expectEqualStrings("2023-06-01", anthropic_val);
+    const trace_val = http_util.findHeader(result.upstream_head, "x-request-id").?;
+    try std.testing.expectEqualStrings("trace-abc-123", trace_val);
+    const user_agent_val = http_util.findHeader(result.upstream_head, "User-Agent").?;
+    try std.testing.expectEqualStrings("TestClient/1.0", user_agent_val);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_head, "zig/") == null);
+}
+
+// ---------------------------------------------------------------------------
+// NMV2-002 — Azure-style vendor headers
+// ---------------------------------------------------------------------------
+test "e2e compliance - Azure vendor headers" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const body = "{\"prompt\":\"Hello\"}";
+
+    const extra_headers = [_]http.Header{
+        .{ .name = "api-key", .value = "azure-key-abcdef" },
+        .{ .name = "x-ms-client-request-id", .value = "ms-trace-456" },
+    };
+
+    var result = try harness.roundTrip(allocator, body, .{
+        .request_extra_headers = &extra_headers,
+    });
+    defer result.deinit();
+
+    // Azure headers should reach upstream
+    const api_key = http_util.findHeader(result.upstream_head, "api-key") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("azure-key-abcdef", api_key);
+    const ms_trace = http_util.findHeader(result.upstream_head, "x-ms-client-request-id") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("ms-trace-456", ms_trace);
+}
+
+// ---------------------------------------------------------------------------
+// NMV2-002 — Internal headers stripped (X-ZPG-Entities must not leak)
+// ---------------------------------------------------------------------------
+test "e2e compliance - internal headers stripped" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const body = "Patient Jane Smith treated today.";
+    const names = [_][]const u8{"Jane Smith"};
+
+    const extra_headers = [_]http.Header{
+        .{ .name = "Authorization", .value = "Bearer keep-me" },
+        .{ .name = "X-ZPG-Entities", .value = "Jane Smith" },
+    };
+
+    var result = try harness.roundTrip(allocator, body, .{
+        .entity_names = &names,
+        .request_extra_headers = &extra_headers,
+    });
+    defer result.deinit();
+
+    // Authorization should reach upstream
+    const auth_val = http_util.findHeader(result.upstream_head, "Authorization") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("Bearer keep-me", auth_val);
+
+    // X-ZPG-Entities is consumed by the proxy and must NOT reach upstream
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "X-ZPG-Entities") == null);
+
+    // Entity masking should still work (the header was consumed for redaction)
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "Jane Smith") == null);
+}
+
+// ---------------------------------------------------------------------------
+// NMV2-002 — Response header fidelity (Set-Cookie, rate-limit, vendor)
+// ---------------------------------------------------------------------------
+test "e2e compliance - response header fidelity" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const body = "Hello world";
+
+    const upstream_resp_headers = [_]http.Header{
+        .{ .name = "Set-Cookie", .value = "session=abc123; Path=/; HttpOnly" },
+        .{ .name = "x-ratelimit-remaining", .value = "42" },
+        .{ .name = "x-request-id", .value = "resp-trace-789" },
+        .{ .name = "x-custom-vendor", .value = "metadata-value" },
+    };
+
+    var result = try harness.roundTrip(allocator, body, .{
+        .upstream_extra_headers = &upstream_resp_headers,
+    });
+    defer result.deinit();
+
+    // All upstream response headers should survive the proxy and reach the client
+    const set_cookie = http_util.findHeader(result.client_head, "Set-Cookie") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("session=abc123; Path=/; HttpOnly", set_cookie);
+
+    const rate_limit = http_util.findHeader(result.client_head, "x-ratelimit-remaining") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("42", rate_limit);
+
+    const req_id = http_util.findHeader(result.client_head, "x-request-id") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("resp-trace-789", req_id);
+
+    const vendor = http_util.findHeader(result.client_head, "x-custom-vendor") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("metadata-value", vendor);
+}

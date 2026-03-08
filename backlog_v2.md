@@ -37,7 +37,7 @@ NanoMask can operate as a centralized gateway at materially higher concurrency w
 
 ## Phase 1: Fix the Product Truth
 
-### NMV2-001 - Add Payload Policy and Encoding Safety
+### NMV2-001 - Add Payload Policy and Encoding Safety ✅ COMPLETED
 
 **Priority:** P0  
 **Estimate:** 3 days  

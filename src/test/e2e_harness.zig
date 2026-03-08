@@ -19,6 +19,8 @@ pub const RoundTripResult = struct {
     upstream_head: []u8,
     /// Body received by the test client.
     client_body: []u8,
+    /// Raw response head received by the test client.
+    client_head: []u8,
     /// HTTP status returned to the client.
     status: http.Status,
     /// Allocator for freeing results.
@@ -28,6 +30,7 @@ pub const RoundTripResult = struct {
         self.allocator.free(self.upstream_body);
         self.allocator.free(self.upstream_head);
         self.allocator.free(self.client_body);
+        self.allocator.free(self.client_head);
     }
 };
 
@@ -61,6 +64,8 @@ pub const HarnessConfig = struct {
     unsupported_request_body_behavior: body_policy.UnsupportedBodyBehavior = .reject,
     /// Unsupported response body handling.
     unsupported_response_body_behavior: body_policy.UnsupportedBodyBehavior = .bypass,
+    /// Additional request headers to send (NMV2-002 header fidelity testing).
+    request_extra_headers: []const http.Header = &.{},
 };
 
 /// Send a POST request to `uri` with `payload` using content-length encoding
@@ -71,7 +76,7 @@ fn httpPost(
     payload: []const u8,
     content_type: ?[]const u8,
     extra_headers: []const http.Header,
-) !struct { status: http.Status, body: []u8 } {
+) !struct { status: http.Status, body: []u8, head: []u8 } {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
@@ -96,6 +101,8 @@ fn httpPost(
     var redirect_buf: [4096]u8 = undefined;
     var res = try req.receiveHead(&redirect_buf);
     const status = res.head.status;
+    // Capture response head bytes before reader() invalidates them
+    const head_bytes = try allocator.dupe(u8, res.head.bytes);
 
     var transfer_buf: [4096]u8 = undefined;
     const reader = res.reader(&transfer_buf);
@@ -112,6 +119,7 @@ fn httpPost(
     return .{
         .status = status,
         .body = try allocator.dupe(u8, resp_body.items),
+        .head = head_bytes,
     };
 }
 
@@ -216,12 +224,18 @@ pub fn roundTrip(
 
     const proxy_thread = try std.Thread.spawn(.{}, ProxyThread.run, .{ &proxy_server, proxy_ctx });
 
-    // --- 3. Send request through the proxy ---
-    var request_headers_storage: [1]http.Header = undefined;
-    var request_headers_len: usize = 0;
+    // Build merged request headers: user-provided extra headers + Content-Encoding
+    var request_headers = std.ArrayListUnmanaged(http.Header).empty;
+    defer request_headers.deinit(allocator);
+
+    // Copy user-provided extra headers first
+    for (config.request_extra_headers) |h| {
+        try request_headers.append(allocator, h);
+    }
+
+    // Add Content-Encoding if specified
     if (config.request_content_encoding) |content_encoding| {
-        request_headers_storage[request_headers_len] = .{ .name = "Content-Encoding", .value = content_encoding };
-        request_headers_len += 1;
+        try request_headers.append(allocator, .{ .name = "Content-Encoding", .value = content_encoding });
     }
 
     var url_buf: [256]u8 = undefined;
@@ -233,7 +247,7 @@ pub fn roundTrip(
         uri,
         request_body,
         config.request_content_type,
-        request_headers_storage[0..request_headers_len],
+        request_headers.items,
     );
 
     proxy_thread.join();
@@ -253,6 +267,7 @@ pub fn roundTrip(
         .upstream_body = upstream_body,
         .upstream_head = upstream_head,
         .client_body = result.body,
+        .client_head = result.head,
         .status = result.status,
         .allocator = allocator,
     };

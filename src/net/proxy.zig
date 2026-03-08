@@ -192,6 +192,9 @@ pub fn handleRequest(
     ctx: ProxyContext,
 ) !void {
     const allocator = ctx.allocator;
+    var header_arena = std.heap.ArenaAllocator.init(allocator);
+    defer header_arena.deinit();
+    const header_allocator = header_arena.allocator();
     const target_host = ctx.target_host;
     const target_port = ctx.target_port;
     const target_tls = ctx.target_tls;
@@ -251,12 +254,21 @@ pub fn handleRequest(
         return;
     }
 
+    // --- Collect end-to-end request headers for forwarding (NMV2-002) ---
+    const req_e2e_headers = try http_util.collectEndToEndHeaders(
+        header_allocator,
+        request.head_buffer,
+        &.{},
+    );
+
+    var header_names_buf: [512]u8 = undefined;
     log.log(.info, "request_received", session_id, &.{
         .{ .key = "method", .value = .{ .string = @tagName(method) } },
         .{ .key = "path", .value = .{ .string = uri_str } },
         .{ .key = "body_policy", .value = .{ .string = @tagName(request_class.policy) } },
         .{ .key = "content_type", .value = .{ .string = body_policy.contentTypeForLog(request_class.content_type) } },
         .{ .key = "content_encoding", .value = .{ .string = body_policy.contentEncodingForLog(request_class.content_encoding) } },
+        .{ .key = "forwarded_headers", .value = .{ .string = http_util.headerNamesForLog(req_e2e_headers, &header_names_buf) } },
     });
 
     // --- Security: reject absolute-form URIs and non-path targets ---
@@ -320,27 +332,34 @@ pub fn handleRequest(
     else
         .omit;
 
-    var request_headers_storage: [1]http.Header = undefined;
-    var request_headers_len: usize = 0;
+    // Build the forwarded header set: all collected end-to-end headers plus
+    // Content-Encoding if present. User-Agent is carried via extra_headers while
+    // the stdlib default is explicitly disabled below to preserve fidelity.
+    var request_headers = std.ArrayListUnmanaged(http.Header).empty;
+    for (req_e2e_headers) |h| {
+        try request_headers.append(header_allocator, h);
+    }
+
+    // Add Content-Encoding if the inbound request had one
     if (request.head.transfer_compression != .identity) {
-        request_headers_storage[request_headers_len] = .{
+        try request_headers.append(header_allocator, .{
             .name = "Content-Encoding",
             .value = @tagName(request.head.transfer_compression),
-        };
-        request_headers_len += 1;
+        });
     }
 
     var client_req = client.request(method, target_uri, .{
         .headers = .{
             .content_type = content_type_override,
-            .accept_encoding = .{ .override = "identity" },
+            .user_agent = .omit,
         },
-        .extra_headers = request_headers_storage[0..request_headers_len],
+        .extra_headers = request_headers.items,
     }) catch |e| {
         log.log(.error_, "upstream_connect_failed", session_id, &.{});
         return e;
     };
     defer client_req.deinit();
+    // Sets both the accept_encoding bitmask and the header string to identity
     configureIdentityAcceptEncoding(&client_req);
     client_req.transfer_encoding = if (has_body) .chunked else .none;
 
@@ -670,24 +689,37 @@ pub fn handleRequest(
         return;
     }
 
-    var response_headers_storage: [3]http.Header = undefined;
-    var response_headers_len: usize = 0;
+    // --- Collect end-to-end response headers for forwarding (NMV2-002) ---
+    // Duplicate headers before calling downstream_res.reader(), which invalidates
+    // the parsed head string slices in the stdlib response object.
+    const resp_extra_skip = [_][]const u8{"content-disposition"};
+    const resp_e2e_headers = try http_util.collectEndToEndHeaders(
+        header_allocator,
+        downstream_res.head.bytes,
+        &resp_extra_skip,
+    );
+
+    // Merge managed response headers with collected end-to-end headers.
+    // Managed: Content-Type, Content-Disposition, Content-Encoding are set
+    // explicitly because they affect proxy pipeline behavior.
+    var response_headers_list = std.ArrayListUnmanaged(http.Header).empty;
     if (downstream_res.head.content_type) |ct| {
-        response_headers_storage[response_headers_len] = .{ .name = "Content-Type", .value = ct };
-        response_headers_len += 1;
+        try response_headers_list.append(header_allocator, .{ .name = "Content-Type", .value = ct });
     }
     if (downstream_res.head.content_disposition) |cd| {
-        response_headers_storage[response_headers_len] = .{ .name = "Content-Disposition", .value = cd };
-        response_headers_len += 1;
+        try response_headers_list.append(header_allocator, .{ .name = "Content-Disposition", .value = cd });
     }
     if (response_class.policy == .bypass and downstream_res.head.content_encoding != .identity) {
-        response_headers_storage[response_headers_len] = .{
+        try response_headers_list.append(header_allocator, .{
             .name = "Content-Encoding",
             .value = @tagName(downstream_res.head.content_encoding),
-        };
-        response_headers_len += 1;
+        });
     }
-    const response_headers = response_headers_storage[0..response_headers_len];
+    // Append all collected end-to-end response headers
+    for (resp_e2e_headers) |h| {
+        try response_headers_list.append(header_allocator, h);
+    }
+    const response_headers = response_headers_list.items;
 
     if (response_has_body and can_unhash) {
         var transfer_buf: [8192]u8 = undefined;
