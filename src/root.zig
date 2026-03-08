@@ -23,6 +23,11 @@ pub const schema = @import("schema/schema.zig");
 pub const json_redactor = @import("schema/json_redactor.zig");
 pub const hasher = @import("schema/hasher.zig");
 
+// E2E integration testing (Phase 5 / Epic 9) — test-only, not exposed in production builds
+pub const mock_upstream = if (@import("builtin").is_test) @import("test/mock_upstream.zig") else @compileError("test-only");
+pub const e2e_harness = if (@import("builtin").is_test) @import("test/e2e_harness.zig") else @compileError("test-only");
+pub const compliance_suite = if (@import("builtin").is_test) @import("test/compliance_suite.zig") else @compileError("test-only");
+
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
     _ = redact;
@@ -46,4 +51,8 @@ test {
     _ = schema;
     _ = json_redactor;
     _ = hasher;
+    // E2E integration tests
+    _ = mock_upstream;
+    _ = e2e_harness;
+    _ = compliance_suite;
 }
