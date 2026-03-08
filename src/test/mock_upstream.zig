@@ -144,8 +144,8 @@ test "MockUpstream - echo round-trip" {
     defer mock.deinit();
     try mock.start();
 
-    // Give the accept thread a moment to start listening
-    std.time.sleep(10 * std.time.ns_per_ms);
+    // Give the accept thread a moment to start listening (10ms)
+    std.Thread.sleep(10_000_000);
 
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{mock.port});
