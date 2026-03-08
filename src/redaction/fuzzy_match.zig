@@ -1154,7 +1154,7 @@ test "bench - FuzzyMatcher throughput" {
     const allocator = std.testing.allocator;
 
     const names = [_][]const u8{
-        "John Doe",      "Jane Smith",    "Dr. Johnson",
+        "John Doe",      "Jane Smith",   "Dr. Johnson",
         "Mary Williams", "Robert Brown",
     };
     const aliases = [_][]const u8{

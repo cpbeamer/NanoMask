@@ -43,7 +43,7 @@ zig build run -- --entity-file entities.txt
 # Run benchmarks (ReleaseFast, clean output on Windows)
 zig build bench-all 2>$null
 
-# Run all tests (49 tests)
+# Run all tests (250+ tests)
 zig build test
 ```
 
@@ -79,6 +79,28 @@ The proxy transforms the outbound request to:
 
 And transparently restores `Entity_A` → `John Doe` in the upstream response.
 
+### Payload Policy
+
+NanoMask only performs inline privacy transforms on identity-encoded JSON and text payloads.
+
+Supported inline redaction types:
+- `application/json`
+- `application/*+json`
+- `application/x-ndjson`
+- `text/plain`
+- `text/*`
+
+Bypass-by-default types:
+- `multipart/form-data`
+- `application/octet-stream`
+- `application/pdf`
+- `image/*`
+- `audio/*`
+- `video/*`
+
+Everything else is treated as unsupported. By default, unsupported request bodies are rejected with `415 Unsupported Media Type`, while unsupported upstream responses are bypassed unless a response transform is required. You can override those defaults with `--unsupported-request-body-behavior` / `NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR` and `--unsupported-response-body-behavior` / `NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR`.
+
+NanoMask sends `Accept-Encoding: identity` upstream. If a compressed upstream response still arrives and NanoMask would need to unmask or unhash it, the proxy rejects that response instead of attempting to transform compressed bytes.
 ## Algorithms
 
 NanoMask runs a **3-stage privacy pipeline** on every request body. Each stage is optimized for a specific class of PII pattern, and they execute in sequence so that later stages only process text not already redacted by earlier ones.
@@ -220,27 +242,48 @@ See [`architecture.md`](architecture.md) for the full technical design and [`bac
 
 ```
 src/
-├── main.zig                  # Entry point, server setup, thread management
-├── proxy.zig                 # HTTP proxy handler, pipeline orchestration
-├── redact.zig                # Stage 1: SIMD SSN redaction
-├── entity_mask.zig           # Stage 2: Aho-Corasick entity masking/unmasking
-├── fuzzy_match.zig           # Stage 3: Fuzzy name matching (Myers' + trigram filter)
-├── config.zig                # CLI + env var configuration with precedence chain
-├── versioned_entity_set.zig  # RCU-managed entity set for hot-reload
-├── file_watcher.zig          # Poll-based entity file watcher for hot-reload
-├── admin.zig                 # REST API for entity management (/_admin/entities)
-├── tls.zig                   # TLS 1.3 server handshake, record layer, encrypted I/O
-├── logger.zig                # Thread-safe structured JSON logger (NDJSON output)
-├── http_util.zig             # HTTP response helpers
-├── bench.zig                 # Standalone benchmark runner
-├── root.zig                  # Module root for test discovery
-└── test_reader.zig           # Test utilities
+├── main.zig                          # Entry point, server setup, thread management
+├── root.zig                          # Module root for test discovery
+├── bench.zig                         # Standalone benchmark runner
+├── net/
+│   ├── proxy.zig                     # HTTP proxy handler, pipeline orchestration
+│   ├── body_policy.zig               # Content-type classification and body handling policy
+│   └── http_util.zig                 # HTTP response helpers
+├── redaction/
+│   ├── redact.zig                    # Stage 1: SIMD SSN redaction
+│   ├── entity_mask.zig               # Stage 2: Aho-Corasick entity masking/unmasking
+│   └── fuzzy_match.zig               # Stage 3: Fuzzy name matching (Myers' + trigram filter)
+├── patterns/
+│   ├── scanner.zig                   # Unified single-pass pattern scanner
+│   ├── email.zig                     # Email address redaction
+│   ├── phone.zig                     # US phone number redaction
+│   ├── credit_card.zig               # Credit card redaction (Luhn validation)
+│   ├── ip_address.zig                # IPv4/IPv6 address redaction
+│   └── healthcare.zig                # Healthcare ID redaction (MRN, ICD-10, Insurance)
+├── schema/
+│   ├── schema.zig                    # JSON schema parser for field-level redaction
+│   ├── json_redactor.zig             # Schema-aware JSON body redactor
+│   └── hasher.zig                    # HMAC-based deterministic pseudonymisation
+├── entity/
+│   ├── versioned_entity_set.zig      # RCU-managed entity set for hot-reload
+│   └── file_watcher.zig              # Poll-based entity file watcher for hot-reload
+├── infra/
+│   ├── config.zig                    # CLI + env var configuration with precedence chain
+│   └── logger.zig                    # Thread-safe structured JSON logger (NDJSON output)
+├── admin/
+│   └── admin.zig                     # REST API for entity management (/_admin/entities)
+├── crypto/
+│   └── tls.zig                       # TLS 1.3 server handshake, record layer, encrypted I/O
+└── test/
+    ├── compliance_suite.zig          # E2E compliance tests (SSN, entity, pattern, schema)
+    ├── e2e_harness.zig               # E2E test harness (proxy round-trip helper)
+    └── mock_upstream.zig             # Mock HTTP upstream for E2E testing
 ```
 
 ## Testing
 
 ```bash
-# Run all 60+ tests
+# Run all 250+ tests
 zig build test
 
 # Run benchmarks (ReleaseFast, clean output on Windows)
@@ -274,6 +317,8 @@ NanoMask supports a strict configuration precedence:
 | TLS certificate | `--tls-cert` | `NANOMASK_TLS_CERT` | none | PEM certificate file for TLS (requires `--tls-key`) |
 | TLS private key | `--tls-key` | `NANOMASK_TLS_KEY` | none | PEM private key file for TLS (requires `--tls-cert`) |
 | Target TLS | `--target-tls` | `NANOMASK_TARGET_TLS` | disabled | Enable HTTPS for upstream connections |
+| Unsupported request bodies | `--unsupported-request-body-behavior` | `NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR` | `reject` | Behavior for unsupported or non-identity request bodies: `bypass` or `reject` |
+| Unsupported response bodies | `--unsupported-response-body-behavior` | `NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR` | `bypass` | Behavior for unsupported or non-identity response bodies when NanoMask would need to transform them |
 | CA file | `--ca-file` | `NANOMASK_CA_FILE` | system CAs | Custom CA bundle PEM for upstream TLS verification |
 | Suppress system CAs | `--tls-no-system-ca` | `NANOMASK_TLS_NO_SYSTEM_CA` | disabled | Suppress system CA bundle; use with `--ca-file` for self-signed certs |
 | Log file | `--log-file` | `NANOMASK_LOG_FILE` | stderr | Write structured JSON logs to file (append mode) |
@@ -287,7 +332,7 @@ NanoMask supports a strict configuration precedence:
 
 ### Structured Logging
 
-NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include: `request_received`, `upstream_forwarded`, `response_sent`. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
+NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
 
 ### Health Check
 

@@ -1,4 +1,6 @@
 const std = @import("std");
+const body_policy = @import("../net/body_policy.zig");
+const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
 
 pub const LogLevel = enum {
     debug,
@@ -70,6 +72,10 @@ pub const Config = struct {
     log_file_src: ConfigSource = .default,
     audit_log: bool = false,
     audit_log_src: ConfigSource = .default,
+    unsupported_request_body_behavior: UnsupportedBodyBehavior = .reject,
+    unsupported_request_body_behavior_src: ConfigSource = .default,
+    unsupported_response_body_behavior: UnsupportedBodyBehavior = .bypass,
+    unsupported_response_body_behavior_src: ConfigSource = .default,
     // --- Pattern library flags (Phase 5 / Epic 7) ---
     enable_email: bool = false,
     enable_email_src: ConfigSource = .default,
@@ -117,6 +123,7 @@ pub const Config = struct {
         InvalidMaxBodySize,
         MissingAdminToken,
         InvalidAuditLogFlag,
+        InvalidUnsupportedBodyBehavior,
         InvalidPatternFlag,
         InvalidSchemaDefault,
         SchemaFileNotFound,
@@ -184,6 +191,8 @@ pub const Config = struct {
             \\  --ca-file <path>            Custom CA bundle PEM for upstream TLS verification
             \\  --tls-no-system-ca          Suppress system CA bundle loading (use with --ca-file for self-signed certs)
             \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
+            \\  --unsupported-request-body-behavior <mode>  Unsupported request body handling: bypass or reject (default: reject)
+            \\  --unsupported-response-body-behavior <mode> Unsupported response body handling: bypass or reject (default: bypass)
             \\  --log-file <path>            Write structured JSON logs to file (default: stderr)
             \\  --audit-log                  Enable per-redaction audit events in log output
             \\  --enable-email               Redact email addresses (default: disabled)
@@ -316,6 +325,12 @@ pub const Config = struct {
             };
             if (config.max_body_size == 0) return error.InvalidMaxBodySize;
             config.max_body_size_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR")) {
+            config.unsupported_request_body_behavior = try parseUnsupportedBodyBehaviorValue(value, "NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR");
+            config.unsupported_request_body_behavior_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR")) {
+            config.unsupported_response_body_behavior = try parseUnsupportedBodyBehaviorValue(value, "NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR");
+            config.unsupported_response_body_behavior_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_LOG_FILE")) {
             config.log_file = try allocator.dupe(u8, value);
             config.log_file_src = .env_var;
@@ -393,6 +408,16 @@ pub const Config = struct {
         return null;
     }
 
+    fn parseUnsupportedBodyBehaviorValue(
+        value: []const u8,
+        label: []const u8,
+    ) ParseError!UnsupportedBodyBehavior {
+        return UnsupportedBodyBehavior.parse(value) catch {
+            std.debug.print("error: {s} must be 'bypass' or 'reject', got '{s}'\n", .{ label, value });
+            return error.InvalidUnsupportedBodyBehavior;
+        };
+    }
+
     /// Parses configuration from a slice of argument strings. Errors out via writer if not headless.
     pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Config {
         var config = Config{ .allocator = allocator };
@@ -418,6 +443,8 @@ pub const Config = struct {
             "NANOMASK_CA_FILE",
             "NANOMASK_TLS_NO_SYSTEM_CA",
             "NANOMASK_MAX_BODY_SIZE",
+            "NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR",
+            "NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR",
             "NANOMASK_LOG_FILE",
             "NANOMASK_AUDIT_LOG",
             "NANOMASK_ENABLE_EMAIL",
@@ -646,6 +673,22 @@ pub const Config = struct {
                     return error.InvalidMaxBodySize;
                 }
                 config.max_body_size_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--unsupported-request-body-behavior")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --unsupported-request-body-behavior\n", .{});
+                    return error.MissingValue;
+                }
+                config.unsupported_request_body_behavior = try parseUnsupportedBodyBehaviorValue(args[i], "--unsupported-request-body-behavior");
+                config.unsupported_request_body_behavior_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--unsupported-response-body-behavior")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --unsupported-response-body-behavior\n", .{});
+                    return error.MissingValue;
+                }
+                config.unsupported_response_body_behavior = try parseUnsupportedBodyBehaviorValue(args[i], "--unsupported-response-body-behavior");
+                config.unsupported_response_body_behavior_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--log-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -799,12 +842,18 @@ const testing = std.testing;
 test "Config - parse valid arguments" {
     const args = [_][]const u8{
         "nanomask",
-        "--listen-port", "9090",
-        "--target-host", "api.example.com",
-        "--target-port", "443",
-        "--fuzzy-threshold", "0.9",
-        "--max-connections", "1000",
-        "--log-level", "debug",
+        "--listen-port",
+        "9090",
+        "--target-host",
+        "api.example.com",
+        "--target-port",
+        "443",
+        "--fuzzy-threshold",
+        "0.9",
+        "--max-connections",
+        "1000",
+        "--log-level",
+        "debug",
     };
 
     var config = try Config.parse(std.testing.allocator, &args);
@@ -832,7 +881,8 @@ test "Config - missing value" {
 test "Config - invalid port" {
     const args = [_][]const u8{
         "nanomask",
-        "--listen-port", "99999",
+        "--listen-port",
+        "99999",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -842,7 +892,8 @@ test "Config - invalid port" {
 test "Config - out of range fuzzy threshold" {
     const args = [_][]const u8{
         "nanomask",
-        "--fuzzy-threshold", "1.5",
+        "--fuzzy-threshold",
+        "1.5",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -872,7 +923,8 @@ test "Config - help flag" {
 test "Config - invalid max connections zero" {
     const args = [_][]const u8{
         "nanomask",
-        "--max-connections", "0",
+        "--max-connections",
+        "0",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -882,7 +934,8 @@ test "Config - invalid max connections zero" {
 test "Config - valid watch interval" {
     const args = [_][]const u8{
         "nanomask",
-        "--watch-interval", "5000",
+        "--watch-interval",
+        "5000",
     };
 
     var config = try Config.parse(std.testing.allocator, &args);
@@ -895,7 +948,8 @@ test "Config - valid watch interval" {
 test "Config - invalid watch interval zero" {
     const args = [_][]const u8{
         "nanomask",
-        "--watch-interval", "0",
+        "--watch-interval",
+        "0",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -905,7 +959,8 @@ test "Config - invalid watch interval zero" {
 test "Config - invalid watch interval non-numeric" {
     const args = [_][]const u8{
         "nanomask",
-        "--watch-interval", "abc",
+        "--watch-interval",
+        "abc",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -916,7 +971,8 @@ test "Config - admin-api flag" {
     const args = [_][]const u8{
         "nanomask",
         "--admin-api",
-        "--admin-token", "test-secret",
+        "--admin-token",
+        "test-secret",
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -939,7 +995,8 @@ test "Config - admin-api without token fails" {
 test "Config - admin-token flag" {
     const args = [_][]const u8{
         "nanomask",
-        "--admin-token", "mysecret",
+        "--admin-token",
+        "mysecret",
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -984,7 +1041,8 @@ test "Config - tls-cert without tls-key" {
 
     const args = [_][]const u8{
         "nanomask",
-        "--tls-cert", tmp_cert,
+        "--tls-cert",
+        tmp_cert,
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1002,7 +1060,8 @@ test "Config - tls-key without tls-cert" {
 
     const args = [_][]const u8{
         "nanomask",
-        "--tls-key", tmp_key,
+        "--tls-key",
+        tmp_key,
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1027,8 +1086,10 @@ test "Config - tls-cert and tls-key valid pair" {
 
     const args = [_][]const u8{
         "nanomask",
-        "--tls-cert", tmp_cert,
-        "--tls-key", tmp_key,
+        "--tls-cert",
+        tmp_cert,
+        "--tls-key",
+        tmp_key,
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -1043,8 +1104,10 @@ test "Config - tls-cert and tls-key valid pair" {
 test "Config - tls-cert file not found" {
     const args = [_][]const u8{
         "nanomask",
-        "--tls-cert", "nonexistent_tls_cert_12345.pem",
-        "--tls-key", "nonexistent_tls_key_12345.pem",
+        "--tls-cert",
+        "nonexistent_tls_cert_12345.pem",
+        "--tls-key",
+        "nonexistent_tls_key_12345.pem",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1062,8 +1125,10 @@ test "Config - tls-key file not found" {
 
     const args = [_][]const u8{
         "nanomask",
-        "--tls-cert", tmp_cert,
-        "--tls-key", "nonexistent_tls_key_12345.pem",
+        "--tls-cert",
+        tmp_cert,
+        "--tls-key",
+        "nonexistent_tls_key_12345.pem",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1107,7 +1172,8 @@ test "Config - ca-file with valid file" {
 
     const args = [_][]const u8{
         "nanomask",
-        "--ca-file", tmp_ca,
+        "--ca-file",
+        tmp_ca,
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -1120,7 +1186,8 @@ test "Config - ca-file with valid file" {
 test "Config - ca-file not found" {
     const args = [_][]const u8{
         "nanomask",
-        "--ca-file", "nonexistent_ca_12345.pem",
+        "--ca-file",
+        "nonexistent_ca_12345.pem",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1156,7 +1223,8 @@ test "Config - tls-no-system-ca + ca-file is valid (complementary)" {
         "nanomask",
         "--target-tls",
         "--tls-no-system-ca",
-        "--ca-file", tmp_ca,
+        "--ca-file",
+        tmp_ca,
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -1183,7 +1251,8 @@ test "Config - healthcheck flag" {
 test "Config - schema-default flag valid values" {
     const args = [_][]const u8{
         "nanomask",
-        "--schema-default", "REDACT",
+        "--schema-default",
+        "REDACT",
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -1196,7 +1265,8 @@ test "Config - schema-default flag valid values" {
 test "Config - schema-default invalid value" {
     const args = [_][]const u8{
         "nanomask",
-        "--schema-default", "DELETE",
+        "--schema-default",
+        "DELETE",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1217,7 +1287,8 @@ test "Config - hash-key valid 64 hex chars" {
     const valid_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const args = [_][]const u8{
         "nanomask",
-        "--hash-key", valid_key,
+        "--hash-key",
+        valid_key,
     };
 
     var cfg = try Config.parse(std.testing.allocator, &args);
@@ -1230,7 +1301,8 @@ test "Config - hash-key valid 64 hex chars" {
 test "Config - hash-key invalid length" {
     const args = [_][]const u8{
         "nanomask",
-        "--hash-key", "tooshort",
+        "--hash-key",
+        "tooshort",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1241,7 +1313,8 @@ test "Config - hash-key invalid hex chars" {
     // 64 chars but contains 'g' which is not valid hex
     const args = [_][]const u8{
         "nanomask",
-        "--hash-key", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+        "--hash-key",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1261,7 +1334,8 @@ test "Config - hash-key missing value" {
 test "Config - hash-key-file not found" {
     const args = [_][]const u8{
         "nanomask",
-        "--hash-key-file", "nonexistent_hash_key_12345.txt",
+        "--hash-key-file",
+        "nonexistent_hash_key_12345.txt",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
@@ -1271,9 +1345,49 @@ test "Config - hash-key-file not found" {
 test "Config - schema-file not found" {
     const args = [_][]const u8{
         "nanomask",
-        "--schema-file", "nonexistent_schema_12345.txt",
+        "--schema-file",
+        "nonexistent_schema_12345.txt",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.SchemaFileNotFound, res);
+}
+
+test "Config - unsupported body behavior defaults" {
+    const args = [_][]const u8{"nanomask"};
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(UnsupportedBodyBehavior.reject, cfg.unsupported_request_body_behavior);
+    try testing.expectEqual(UnsupportedBodyBehavior.bypass, cfg.unsupported_response_body_behavior);
+}
+
+test "Config - unsupported body behavior flags" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--unsupported-request-body-behavior",
+        "bypass",
+        "--unsupported-response-body-behavior",
+        "reject",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(UnsupportedBodyBehavior.bypass, cfg.unsupported_request_body_behavior);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.unsupported_request_body_behavior_src);
+    try testing.expectEqual(UnsupportedBodyBehavior.reject, cfg.unsupported_response_body_behavior);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.unsupported_response_body_behavior_src);
+}
+
+test "Config - unsupported body behavior invalid value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--unsupported-request-body-behavior",
+        "drop",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidUnsupportedBodyBehavior, res);
 }

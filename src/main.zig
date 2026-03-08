@@ -15,6 +15,7 @@ const logger_mod = @import("infra/logger.zig");
 const Logger = logger_mod.Logger;
 const schema_mod = @import("schema/schema.zig");
 const hasher_mod = @import("schema/hasher.zig");
+const body_policy = @import("net/body_policy.zig");
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
@@ -43,6 +44,8 @@ const ThreadContext = struct {
     connections_total: *std.atomic.Value(u64),
     /// Server start timestamp (epoch seconds) for uptime calculation.
     start_time: i64,
+    unsupported_request_body_behavior: body_policy.UnsupportedBodyBehavior,
+    unsupported_response_body_behavior: body_policy.UnsupportedBodyBehavior,
     // Pattern library enable flags (Phase 5 / Epic 7)
     enable_email: bool,
     enable_phone: bool,
@@ -125,6 +128,8 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
             .active_connections = ctx.active_connections,
             .connections_total = ctx.connections_total,
             .start_time = ctx.start_time,
+            .unsupported_request_body_behavior = ctx.unsupported_request_body_behavior,
+            .unsupported_response_body_behavior = ctx.unsupported_response_body_behavior,
             .enable_email = ctx.enable_email,
             .enable_phone = ctx.enable_phone,
             .enable_credit_card = ctx.enable_credit_card,
@@ -199,6 +204,8 @@ pub fn main() !void {
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
         .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
+        .{ .key = "unsupported_request_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_request_body_behavior) } },
+        .{ .key = "unsupported_response_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_response_body_behavior) } },
     });
 
     // --- Entity Masking Setup (RCU) ---
@@ -432,6 +439,8 @@ pub fn main() !void {
         .logger = &log,
         .connections_total = &connections_total,
         .start_time = start_time,
+        .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
+        .unsupported_response_body_behavior = cfg.unsupported_response_body_behavior,
         .enable_email = cfg.enable_email,
         .enable_phone = cfg.enable_phone,
         .enable_credit_card = cfg.enable_credit_card,

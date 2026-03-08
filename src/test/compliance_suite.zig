@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const http = std.http;
 const harness = @import("e2e_harness.zig");
+const body_policy = @import("../net/body_policy.zig");
+const http_util = @import("../net/http_util.zig");
 const schema_mod = @import("../schema/schema.zig");
 const hasher_mod = @import("../schema/hasher.zig");
 
@@ -247,4 +250,51 @@ test "e2e compliance - schema HASH round-trip" {
 
     // Response-path unhashing: the client should see the original value restored
     try std.testing.expect(std.mem.indexOf(u8, result.client_body, "PT-99001") != null);
+}
+
+test "e2e compliance - PDF request bypass" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const payload = [_]u8{ 0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a, 0x00, 0xff };
+
+    var result = try harness.roundTrip(allocator, payload[0..], .{
+        .request_content_type = "application/pdf",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualSlices(u8, payload[0..], result.upstream_body);
+    const accept_encoding = http_util.findHeader(result.upstream_head, "Accept-Encoding") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("identity", accept_encoding);
+}
+
+test "e2e compliance - unsupported request rejected" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var result = try harness.roundTrip(allocator, "<patient>Jane Smith</patient>", .{
+        .request_content_type = "application/xml",
+        .unsupported_request_body_behavior = .reject,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(http.Status.unsupported_media_type, result.status);
+    try std.testing.expectEqual(@as(usize, 0), result.upstream_body.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "Unsupported request body") != null);
+}
+
+test "e2e compliance - unsupported response rejected when configured" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{"Jane Smith"};
+
+    var result = try harness.roundTrip(allocator, "{\"patient\":\"Jane Smith\"}", .{
+        .entity_names = &names,
+        .upstream_response = "<patient>Entity_A</patient>",
+        .upstream_content_type = "application/xml",
+        .unsupported_response_body_behavior = body_policy.UnsupportedBodyBehavior.reject,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(http.Status.bad_gateway, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "unsupported upstream response body") != null);
 }

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const http = std.http;
 const MockUpstream = @import("mock_upstream.zig").MockUpstream;
 const proxy = @import("../net/proxy.zig");
+const body_policy = @import("../net/body_policy.zig");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
 const admin = @import("../admin/admin.zig");
@@ -12,9 +13,11 @@ const hasher_mod = @import("../schema/hasher.zig");
 
 /// Result of an E2E round-trip through the proxy.
 pub const RoundTripResult = struct {
-    /// Body received by the mock upstream (post-redaction).
+    /// Body received by the mock upstream (post-redaction or bypass).
     upstream_body: []u8,
-    /// Body received by the test client (post-unmasking).
+    /// Raw request head received by the mock upstream.
+    upstream_head: []u8,
+    /// Body received by the test client.
     client_body: []u8,
     /// HTTP status returned to the client.
     status: http.Status,
@@ -23,6 +26,7 @@ pub const RoundTripResult = struct {
 
     pub fn deinit(self: *RoundTripResult) void {
         self.allocator.free(self.upstream_body);
+        self.allocator.free(self.upstream_head);
         self.allocator.free(self.client_body);
     }
 };
@@ -31,12 +35,18 @@ pub const RoundTripResult = struct {
 pub const HarnessConfig = struct {
     /// Entity names for Aho-Corasick masking. Empty = SSN-only mode.
     entity_names: []const []const u8 = &.{},
-    /// Fuzzy matching threshold (0.0–1.0). 0 = disabled.
+    /// Fuzzy matching threshold (0.0-1.0). 0 = disabled.
     fuzzy_threshold: f32 = 0.0,
+    /// Content-Type to send to NanoMask. Null omits the header entirely.
+    request_content_type: ?[]const u8 = "application/json",
+    /// Optional Content-Encoding to send to NanoMask.
+    request_content_encoding: ?[]const u8 = null,
     /// Response body the mock upstream should return.
     upstream_response: []const u8 = "OK",
     /// Content-Type for the upstream response.
     upstream_content_type: []const u8 = "text/plain",
+    /// Additional upstream response headers.
+    upstream_extra_headers: []const http.Header = &.{},
     /// Pattern library flags.
     enable_email: bool = false,
     enable_phone: bool = false,
@@ -47,6 +57,10 @@ pub const HarnessConfig = struct {
     schema: ?*const schema_mod.Schema = null,
     /// Hasher for HASH-mode pseudonymisation (null = disabled).
     hasher: ?*hasher_mod.Hasher = null,
+    /// Unsupported request body handling.
+    unsupported_request_body_behavior: body_policy.UnsupportedBodyBehavior = .reject,
+    /// Unsupported response body handling.
+    unsupported_response_body_behavior: body_policy.UnsupportedBodyBehavior = .bypass,
 };
 
 /// Send a POST request to `uri` with `payload` using content-length encoding
@@ -55,16 +69,23 @@ fn httpPost(
     allocator: std.mem.Allocator,
     uri: std.Uri,
     payload: []const u8,
+    content_type: ?[]const u8,
+    extra_headers: []const http.Header,
 ) !struct { status: http.Status, body: []u8 } {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
+    const content_type_header: http.Client.Request.Headers.Value = if (content_type) |ct|
+        .{ .override = ct }
+    else
+        .omit;
+
     var req = try client.request(.POST, uri, .{
-        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .headers = .{ .content_type = content_type_header },
+        .extra_headers = extra_headers,
     });
     defer req.deinit();
 
-    // Use content-length (not chunked) — matches fetch() implementation pattern
     req.transfer_encoding = .{ .content_length = payload.len };
     var body_buf: [1]u8 = undefined;
     var body_writer = try req.sendBodyUnflushed(&body_buf);
@@ -72,12 +93,10 @@ fn httpPost(
     try body_writer.end();
     try req.connection.?.flush();
 
-    // Read response
     var redirect_buf: [4096]u8 = undefined;
     var res = try req.receiveHead(&redirect_buf);
     const status = res.head.status;
 
-    // Read response body
     var transfer_buf: [4096]u8 = undefined;
     const reader = res.reader(&transfer_buf);
     var resp_body = std.ArrayListUnmanaged(u8).empty;
@@ -96,7 +115,7 @@ fn httpPost(
     };
 }
 
-/// Perform a full E2E round-trip: client → NanoMask proxy → mock upstream → proxy → client.
+/// Perform a full E2E round-trip: client -> NanoMask proxy -> mock upstream -> proxy -> client.
 pub fn roundTrip(
     allocator: std.mem.Allocator,
     request_body: []const u8,
@@ -107,6 +126,7 @@ pub fn roundTrip(
         allocator,
         config.upstream_response,
         config.upstream_content_type,
+        config.upstream_extra_headers,
     );
     defer mock.deinit();
     try mock.start();
@@ -119,7 +139,6 @@ pub fn roundTrip(
     defer proxy_server.deinit();
     const proxy_port = proxy_server.listen_address.getPort();
 
-    // Build entity map if names provided
     var entity_map: ?entity_mask.EntityMap = null;
     defer if (entity_map) |*em| em.deinit();
 
@@ -127,7 +146,6 @@ pub fn roundTrip(
         entity_map = try entity_mask.EntityMap.init(allocator, config.entity_names);
     }
 
-    // Build fuzzy matcher if threshold > 0
     var fuzzy_matcher: ?fuzzy_match.FuzzyMatcher = null;
     defer if (fuzzy_matcher) |*fm| fm.deinit();
 
@@ -135,20 +153,16 @@ pub fn roundTrip(
         fuzzy_matcher = try fuzzy_match.FuzzyMatcher.init(allocator, config.entity_names, &.{}, config.fuzzy_threshold);
     }
 
-    // Create a logger that discards output (tests should not pollute stderr)
     var log = try logger_mod.Logger.init(.error_, false, null);
     defer log.deinit();
 
-    // Shared HTTP client for the proxy's upstream connection
     var upstream_client = std.http.Client{ .allocator = allocator };
     defer upstream_client.deinit();
 
-    // Atomic counters (required by ProxyContext, not used for assertions)
     var active_connections = std.atomic.Value(u32).init(1);
     var connections_total = std.atomic.Value(u64).init(0);
     const start_time = std.time.timestamp();
 
-    // Thread context for the proxy handler
     const proxy_ctx = proxy.ProxyContext{
         .allocator = allocator,
         .client = &upstream_client,
@@ -165,6 +179,8 @@ pub fn roundTrip(
         .active_connections = &active_connections,
         .connections_total = &connections_total,
         .start_time = start_time,
+        .unsupported_request_body_behavior = config.unsupported_request_body_behavior,
+        .unsupported_response_body_behavior = config.unsupported_response_body_behavior,
         .enable_email = config.enable_email,
         .enable_phone = config.enable_phone,
         .enable_credit_card = config.enable_credit_card,
@@ -174,7 +190,6 @@ pub fn roundTrip(
         .hasher = config.hasher,
     };
 
-    // Spawn a thread that accepts one connection and runs the proxy pipeline
     const ProxyThread = struct {
         fn run(server: *std.net.Server, ctx: proxy.ProxyContext) void {
             const connection = server.accept() catch return;
@@ -185,7 +200,7 @@ pub fn roundTrip(
 
             var stream_reader = connection.stream.reader(&read_buf);
             var stream_writer = connection.stream.writer(&write_buf);
-            // Mutation happens through the interface pointers, not the binding.
+            // keep alive: prevent compiler from eliding stack-locals before .interface() borrows them
             _ = &stream_reader;
             _ = &stream_writer;
 
@@ -202,27 +217,41 @@ pub fn roundTrip(
     const proxy_thread = try std.Thread.spawn(.{}, ProxyThread.run, .{ &proxy_server, proxy_ctx });
 
     // --- 3. Send request through the proxy ---
+    var request_headers_storage: [1]http.Header = undefined;
+    var request_headers_len: usize = 0;
+    if (config.request_content_encoding) |content_encoding| {
+        request_headers_storage[request_headers_len] = .{ .name = "Content-Encoding", .value = content_encoding };
+        request_headers_len += 1;
+    }
+
     var url_buf: [256]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/data", .{proxy_port});
     const uri = try std.Uri.parse(url);
 
-    const result = try httpPost(allocator, uri, request_body);
+    const result = try httpPost(
+        allocator,
+        uri,
+        request_body,
+        config.request_content_type,
+        request_headers_storage[0..request_headers_len],
+    );
 
-    // Join proxy thread
     proxy_thread.join();
 
-    // Wait for mock to finish recording
+    mock.stop();
     if (mock.thread) |t| {
         t.join();
         mock.thread = null;
     }
 
-    // --- 4. Collect results ---
-    const recorded = mock.getRecordedBody() orelse "";
-    const upstream_body = try allocator.dupe(u8, recorded);
+    const recorded_body = mock.getRecordedBody() orelse "";
+    const recorded_head = mock.getRecordedHead() orelse "";
+    const upstream_body = try allocator.dupe(u8, recorded_body);
+    const upstream_head = try allocator.dupe(u8, recorded_head);
 
     return .{
         .upstream_body = upstream_body,
+        .upstream_head = upstream_head,
         .client_body = result.body,
         .status = result.status,
         .allocator = allocator,
@@ -230,11 +259,10 @@ pub fn roundTrip(
 }
 
 // ===========================================================================
-// Smoke Test — verify the harness itself works
+// Smoke Test - verify the harness itself works
 // ===========================================================================
 
 test "harness - passthrough round-trip" {
-    // Zig 0.15 std.net has known issues with concurrent socket I/O on Windows
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -245,7 +273,6 @@ test "harness - passthrough round-trip" {
     });
     defer result.deinit();
 
-    // No PII → body should pass through unchanged
     try std.testing.expectEqualStrings(body, result.upstream_body);
     try std.testing.expectEqualStrings("upstream says hi", result.client_body);
     try std.testing.expectEqual(http.Status.ok, result.status);

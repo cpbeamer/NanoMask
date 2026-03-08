@@ -3,31 +3,24 @@ const builtin = @import("builtin");
 const http = std.http;
 
 /// A minimal HTTP server for E2E testing that records the received request
-/// body and returns a configurable response. Runs in a background thread
-/// so the test can act as both the client and the assertion driver.
+/// head/body and returns a configurable response.
 pub const MockUpstream = struct {
-    /// Allocator used for dynamic buffers.
     allocator: std.mem.Allocator,
-    /// The underlying TCP listener.
     net_server: std.net.Server,
-    /// Port the server is listening on (OS-assigned via port 0).
     port: u16,
-    /// Body to return in responses.
     response_body: []const u8,
-    /// Content-Type header for the response.
     response_content_type: []const u8,
-    /// Recorded request body from the most recent request (heap-allocated).
+    response_extra_headers: []const http.Header,
     recorded_body: ?[]u8,
-    /// Background accept-loop thread handle.
+    recorded_head: ?[]u8,
     thread: ?std.Thread,
-    /// Signal to stop the accept loop.
     should_stop: std.atomic.Value(bool),
 
-    /// Initialise and bind to a random available port on localhost.
     pub fn init(
         allocator: std.mem.Allocator,
         response_body: []const u8,
         response_content_type: []const u8,
+        response_extra_headers: []const http.Header,
     ) !MockUpstream {
         var server = try std.net.Address.listen(
             try std.net.Address.parseIp("127.0.0.1", 0),
@@ -40,15 +33,23 @@ pub const MockUpstream = struct {
             .port = port,
             .response_body = response_body,
             .response_content_type = response_content_type,
+            .response_extra_headers = response_extra_headers,
             .recorded_body = null,
+            .recorded_head = null,
             .thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
         };
     }
 
-    /// Start the accept loop in a background thread.
     pub fn start(self: *MockUpstream) !void {
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+    }
+
+    pub fn stop(self: *MockUpstream) void {
+        self.should_stop.store(true, .release);
+        if (std.net.tcpConnectToAddress(self.net_server.listen_address)) |conn| {
+            conn.close();
+        } else |_| {}
     }
 
     fn acceptLoop(self: *MockUpstream) void {
@@ -58,7 +59,6 @@ pub const MockUpstream = struct {
                 continue;
             };
             self.handleOne(connection) catch {};
-            // Only handle a single request per E2E test.
             return;
         }
     }
@@ -71,7 +71,7 @@ pub const MockUpstream = struct {
 
         var stream_reader = connection.stream.reader(&read_buf);
         var stream_writer = connection.stream.writer(&write_buf);
-        // Mutation happens through the interface pointers, not the binding.
+        // keep alive: prevent compiler from eliding stack-locals before .interface() borrows them
         _ = &stream_reader;
         _ = &stream_writer;
 
@@ -81,68 +81,70 @@ pub const MockUpstream = struct {
         var server = http.Server.init(&reader_iface, &writer_iface);
         var request = try server.receiveHead();
 
-        const method = request.head.method;
-        // Record request body
-        if (method.requestHasBody()) {
-            // Clear expect header — we handle the body directly
+        if (self.recorded_head) |old_head| self.allocator.free(old_head);
+        self.recorded_head = try self.allocator.dupe(u8, request.head_buffer);
+
+        if (request.head.method.requestHasBody()) {
             request.head.expect = null;
             var body_read_buf: [8192]u8 = undefined;
             const body_reader = request.readerExpectNone(&body_read_buf);
             var body = std.ArrayListUnmanaged(u8).empty;
+            defer body.deinit(self.allocator);
+
             var chunk_buf: [8192]u8 = undefined;
             while (true) {
                 const n = body_reader.readSliceShort(&chunk_buf) catch break;
                 if (n == 0) break;
                 try body.appendSlice(self.allocator, chunk_buf[0..n]);
+                if (n < chunk_buf.len) break;
             }
-            // Free any previously recorded body
-            if (self.recorded_body) |old| self.allocator.free(old);
+
+            if (self.recorded_body) |old_body| self.allocator.free(old_body);
             self.recorded_body = try body.toOwnedSlice(self.allocator);
         }
 
-        // Send response using simple respond() API
+        var headers = std.ArrayListUnmanaged(http.Header).empty;
+        defer headers.deinit(self.allocator);
+        try headers.append(self.allocator, .{ .name = "Content-Type", .value = self.response_content_type });
+        try headers.appendSlice(self.allocator, self.response_extra_headers);
+
         try request.respond(self.response_body, .{
             .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = self.response_content_type },
-            },
+            .extra_headers = headers.items,
         });
     }
 
-    /// Return the body that the mock upstream received.
     pub fn getRecordedBody(self: *const MockUpstream) ?[]const u8 {
         return self.recorded_body;
     }
 
-    /// Stop the server and clean up.
+    pub fn getRecordedHead(self: *const MockUpstream) ?[]const u8 {
+        return self.recorded_head;
+    }
+
     pub fn deinit(self: *MockUpstream) void {
-        self.should_stop.store(true, .release);
-        // Unblock the accept() call by connecting and immediately closing.
-        if (std.net.tcpConnectToAddress(self.net_server.listen_address)) |conn| {
-            conn.close();
-        } else |_| {}
+        self.stop();
         if (self.thread) |t| t.join();
         self.net_server.deinit();
         if (self.recorded_body) |b| self.allocator.free(b);
+        if (self.recorded_head) |h| self.allocator.free(h);
     }
 };
 
 // ===========================================================================
-// Unit Tests — verify mock server records bodies and returns responses
+// Unit Tests - verify mock server records bodies and returns responses
 // ===========================================================================
 
 test "MockUpstream - echo round-trip" {
-    // Zig 0.15 std.net has known issues with concurrent socket I/O on Windows
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
 
     const response_text = "Hello from upstream";
-    var mock = try MockUpstream.init(allocator, response_text, "text/plain");
+    var mock = try MockUpstream.init(allocator, response_text, "text/plain", &.{});
     defer mock.deinit();
     try mock.start();
 
-    // Build URL for the mock
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{mock.port});
     const uri = try std.Uri.parse(url);
@@ -150,7 +152,6 @@ test "MockUpstream - echo round-trip" {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // Send a POST with a body using content-length encoding
     const send_body = "test request body";
     var req = try client.request(.POST, uri, .{});
     defer req.deinit();
@@ -162,7 +163,6 @@ test "MockUpstream - echo round-trip" {
     try body_writer.end();
     try req.connection.?.flush();
 
-    // Read the response
     var redirect_buf: [4096]u8 = undefined;
     var res = try req.receiveHead(&redirect_buf);
     try std.testing.expectEqual(std.http.Status.ok, res.head.status);
@@ -181,13 +181,13 @@ test "MockUpstream - echo round-trip" {
 
     try std.testing.expectEqualStrings(response_text, resp_body.items);
 
-    // Wait for mock thread to finish processing
+    mock.stop();
     if (mock.thread) |t| {
         t.join();
         mock.thread = null;
     }
 
-    // Verify the mock recorded the request body
     const recorded = mock.getRecordedBody() orelse return error.NoBodyRecorded;
     try std.testing.expectEqualStrings(send_body, recorded);
+    try std.testing.expect(mock.getRecordedHead() != null);
 }

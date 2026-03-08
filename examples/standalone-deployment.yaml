@@ -7,6 +7,9 @@
 # Usage:
 #   kubectl apply -f examples/standalone-deployment.yaml
 #
+# NanoMask performs inline redaction for JSON and text payloads.
+# Common binary formats such as PDF, image/*, audio/*, video/*, and octet-stream bodies are bypassed unchanged.
+#
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -35,6 +38,7 @@ spec:
       containers:
         - name: nanomask
           image: nanomask:0.1.0
+          # Default payload policy: reject unsupported request bodies, bypass unsupported upstream responses.
           env:
             - name: NANOMASK_LISTEN_PORT
               value: "8081"
@@ -44,6 +48,10 @@ spec:
               value: "443"
             - name: NANOMASK_TARGET_TLS
               value: "true"
+            - name: NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR
+              value: "reject"
+            - name: NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR
+              value: "bypass"
             - name: NANOMASK_LOG_LEVEL
               value: info
           ports:
