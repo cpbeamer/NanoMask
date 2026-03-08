@@ -305,8 +305,7 @@ test "e2e compliance - audit log emits schema events without leaking values" {
     var hasher_instance = try hasher_mod.Hasher.init(key_hex, allocator);
     defer hasher_instance.deinit();
 
-    var result = try harness.roundTrip(
-        allocator,
+    var result = try harness.roundTrip(allocator,
         \\{"patient_name":"John Doe","internal_id":"PT-99001","notes":"SSN 123-45-6789 appears here"}
     , .{
         .schema = &schema_instance,
@@ -585,4 +584,41 @@ test "e2e compliance - NDJSON response streams incrementally" {
     try std.testing.expectEqualStrings("application/x-ndjson", content_type);
     const transfer_encoding = http_util.findHeader(result.client_head, "Transfer-Encoding") orelse return error.MissingHeader;
     try std.testing.expectEqualStrings("chunked", transfer_encoding);
+}
+
+test "e2e compliance - readiness endpoint is separate from health" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var result = try harness.roundTrip(allocator, "", .{
+        .request_method = .GET,
+        .request_target = "/readyz",
+        .request_content_type = null,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(http.Status.ok, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "\"status\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "\"entity_reload\":\"ok\"") != null);
+}
+
+test "e2e compliance - metrics endpoint exposes Prometheus format" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var result = try harness.roundTrip(allocator, "", .{
+        .request_method = .GET,
+        .request_target = "/metrics",
+        .request_content_type = null,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(http.Status.ok, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "# HELP nanomask_http_requests_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "nanomask_http_request_duration_seconds_bucket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "nanomask_upstream_request_duration_seconds_bucket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "nanomask_ready") != null);
+
+    const content_type = http_util.findHeader(result.client_head, "Content-Type") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("text/plain; version=0.0.4; charset=utf-8", content_type);
 }

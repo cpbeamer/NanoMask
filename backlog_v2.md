@@ -240,7 +240,7 @@ Make the audit log feature real, not just configurable.
 
 Auditors and security teams do not buy "trust us." They buy evidence. This ticket turns logging into evidence.
 
-### NMV2-007 - Add Prometheus Metrics and Separate Liveness from Readiness
+### NMV2-007 - Add Prometheus Metrics and Separate Liveness from Readiness ✅ COMPLETED
 
 **Priority:** P1  
 **Estimate:** 4 days  

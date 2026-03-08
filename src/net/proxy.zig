@@ -11,6 +11,9 @@ const config_mod = @import("../infra/config.zig");
 const Config = config_mod.Config;
 const logger_mod = @import("../infra/logger.zig");
 const Logger = logger_mod.Logger;
+const observability_mod = @import("../infra/observability.zig");
+const Observability = observability_mod.Observability;
+const Route = observability_mod.Route;
 const redaction_audit = @import("../infra/redaction_audit.zig");
 const body_policy = @import("body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
@@ -29,10 +32,6 @@ const max_url_len = 2048;
 /// Maximum number of entities accepted via the X-ZPG-Entities header.
 /// Prevents Aho-Corasick construction DoS from oversized entity lists.
 const max_header_entities: usize = 100;
-
-/// Maximum bytes accumulated for audit on chunked (streamed) requests.
-/// Prevents unbounded memory growth when audit logging is enabled.
-const max_audit_body_size: usize = 1024 * 1024; // 1 MB
 
 /// Find a custom header value by name (case-insensitive).
 /// Delegates to the shared http_util implementation.
@@ -64,13 +63,14 @@ fn sendTextResponse(
     request: *http.Server.Request,
     status: http.Status,
     body: []const u8,
-) !void {
+) !usize {
     try request.respond(body, .{
         .status = status,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
         },
     });
+    return body.len;
 }
 
 fn sendBodyPolicyResponse(
@@ -78,7 +78,7 @@ fn sendBodyPolicyResponse(
     status: http.Status,
     prefix: []const u8,
     classification: body_policy.Classification,
-) !void {
+) !usize {
     var buf: [512]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buf,
@@ -89,7 +89,7 @@ fn sendBodyPolicyResponse(
             body_policy.contentEncodingForLog(classification.content_encoding),
         },
     ) catch prefix;
-    try sendTextResponse(request, status, message);
+    return sendTextResponse(request, status, message);
 }
 
 fn identityOnlyAcceptEncoding() @TypeOf(http.Client.Request.default_accept_encoding) {
@@ -109,7 +109,7 @@ fn forwardBodyBypass(
     max_body_size: usize,
     log: *Logger,
     session_id: []const u8,
-) !void {
+) !usize {
     var req_body_transfer_buf: [8192]u8 = undefined;
     var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
 
@@ -142,6 +142,7 @@ fn forwardBodyBypass(
     if (client_req.connection) |conn| {
         try conn.flush();
     }
+    return bytes_forwarded;
 }
 
 fn responseHasBody(method: http.Method, status: http.Status) bool {
@@ -227,6 +228,7 @@ pub const ProxyContext = struct {
     admin_config: admin.AdminConfig,
     max_body_size: usize,
     log: *Logger,
+    observability: *Observability,
     session_id: []const u8,
     active_connections: *std.atomic.Value(u32),
     connections_total: *std.atomic.Value(u64),
@@ -274,6 +276,29 @@ pub fn handleRequest(
     const entity_set = ctx.entity_set;
     const admin_config = ctx.admin_config;
     const request_start = std.time.nanoTimestamp();
+    var route: Route = .proxy;
+    var response_status: http.Status = .internal_server_error;
+    var request_body_bytes: u64 = 0;
+    var response_body_bytes: u64 = 0;
+    var upstream_latency_us: u64 = 0;
+    var upstream_latency_recorded = false;
+    defer {
+        const raw_total_latency = std.time.nanoTimestamp() - request_start;
+        const total_latency_us: u64 = if (raw_total_latency < 0)
+            0
+        else
+            @intCast(@divTrunc(raw_total_latency, 1000));
+        ctx.observability.recordRequest(
+            route,
+            @intFromEnum(response_status),
+            total_latency_us,
+            request_body_bytes,
+            response_body_bytes,
+        );
+        if (upstream_latency_recorded) {
+            ctx.observability.recordUpstreamLatency(upstream_latency_us);
+        }
+    }
     const method = request.head.method;
     const uri_str = request.head.target;
     const has_body = method.requestHasBody();
@@ -286,6 +311,7 @@ pub fn handleRequest(
 
     // --- Health check endpoint (before admin and proxying) ---
     if (method == .GET and std.mem.eql(u8, uri_str, "/healthz")) {
+        route = .healthz;
         log.debug("healthz", session_id);
         // Clamp to zero if system clock jumped backward (NTP correction)
         // to avoid @intCast panic on negative delta.
@@ -298,6 +324,8 @@ pub fn handleRequest(
         const body = std.fmt.bufPrint(&json_buf,
             \\{{"status":"ok","uptime_s":{d},"connections_active":{d},"connections_total":{d},"version":"{s}"}}
         , .{ uptime_s, active, total, Config.version }) catch unreachable;
+        response_status = .ok;
+        response_body_bytes = body.len;
 
         var resp_buf: [2048]u8 = undefined;
         var response_writer = try request.respondStreaming(&resp_buf, .{
@@ -313,8 +341,67 @@ pub fn handleRequest(
         return;
     }
 
+    if (method == .GET and std.mem.eql(u8, uri_str, "/readyz")) {
+        route = .readyz;
+        const readiness = ctx.observability.readinessSnapshot();
+        const ready = readiness.isReady();
+
+        var json_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &json_buf,
+            \\{{"status":"{s}","startup":"{s}","entity_reload":"{s}","entity_reload_success_total":{d},"entity_reload_failure_total":{d},"version":"{s}"}}
+        ,
+            .{
+                if (ready) "ready" else "not_ready",
+                if (readiness.startup_ready) "ok" else "failed",
+                if (readiness.entity_reload_ready) "ok" else "failed",
+                readiness.entity_reload_success_total,
+                readiness.entity_reload_failure_total,
+                Config.version,
+            },
+        ) catch unreachable;
+        response_status = if (ready) .ok else .service_unavailable;
+        response_body_bytes = body.len;
+
+        var resp_buf: [2048]u8 = undefined;
+        var response_writer = try request.respondStreaming(&resp_buf, .{
+            .respond_options = .{
+                .status = response_status,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                },
+            },
+        });
+        try response_writer.writer.writeAll(body);
+        try response_writer.end();
+        return;
+    }
+
+    if (method == .GET and std.mem.eql(u8, uri_str, "/metrics")) {
+        route = .metrics;
+        const body = try ctx.observability.renderMetrics(allocator);
+        defer allocator.free(body);
+        response_status = .ok;
+        response_body_bytes = body.len;
+
+        var resp_buf: [2048]u8 = undefined;
+        var response_writer = try request.respondStreaming(&resp_buf, .{
+            .respond_options = .{
+                .status = .ok,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain; version=0.0.4; charset=utf-8" },
+                },
+            },
+        });
+        try response_writer.writer.writeAll(body);
+        try response_writer.end();
+        return;
+    }
+
     // --- Admin API interception (before proxying) ---
-    if (try admin.handleAdminRequest(request, entity_set, admin_config, allocator)) {
+    if (try admin.handleAdminRequest(request, entity_set, admin_config, allocator)) |admin_status| {
+        route = .admin;
+        response_status = admin_status;
         log.log(.info, "admin_request", session_id, &.{
             .{ .key = "method", .value = .{ .string = @tagName(method) } },
             .{ .key = "path", .value = .{ .string = uri_str } },
@@ -341,7 +428,8 @@ pub fn handleRequest(
 
     // --- Security: reject absolute-form URIs and non-path targets ---
     if (uri_str.len == 0 or uri_str[0] != '/') {
-        try sendTextResponse(request, .bad_request, "Bad Request: invalid URI\n");
+        response_status = .bad_request;
+        response_body_bytes = try sendTextResponse(request, .bad_request, "Bad Request: invalid URI\n");
         return;
     }
 
@@ -351,7 +439,8 @@ pub fn handleRequest(
             .{ .key = "content_type", .value = .{ .string = body_policy.contentTypeForLog(request_class.content_type) } },
             .{ .key = "content_encoding", .value = .{ .string = body_policy.contentEncodingForLog(request_class.content_encoding) } },
         });
-        try sendBodyPolicyResponse(request, .unsupported_media_type, "Unsupported request body", request_class);
+        response_status = .unsupported_media_type;
+        response_body_bytes = try sendBodyPolicyResponse(request, .unsupported_media_type, "Unsupported request body", request_class);
         return;
     }
     // --- Determine entity map: per-request header overrides session default ---
@@ -434,7 +523,7 @@ pub fn handleRequest(
     // --- Request path: apply privacy pipeline to outbound body ---
     if (has_body) {
         if (request_class.policy == .bypass) {
-            try forwardBodyBypass(request, &client_req, max_body_size, log, session_id);
+            request_body_bytes = try forwardBodyBypass(request, &client_req, max_body_size, log, session_id);
         } else {
             const active_schema_for_request = if (ctx.schema != null and request_class.kind.supportsSchemaJson())
                 ctx.schema
@@ -467,6 +556,7 @@ pub fn handleRequest(
 
                         if (bytes_read < chunk_buf.len) break;
                     }
+                    request_body_bytes = full_body.items.len;
 
                     // Stage 0: Entity masking on the full body (same as chunked path).
                     // Runs Aho-Corasick replacement so named entities are masked before
@@ -495,22 +585,17 @@ pub fn handleRequest(
 
                     // --- Inline audit: emit events during the primary redaction pass
                     //     instead of re-running the pipeline afterwards (see observation #1).
-                    var emitter: ?redaction_audit.AuditEmitter = if (log.audit_enabled)
-                        redaction_audit.AuditEmitter.init(log, session_id)
-                    else
-                        null;
-                    defer if (emitter) |*e| e.finish();
+                    var emitter = redaction_audit.AuditEmitter.init(log, session_id, ctx.observability);
+                    defer emitter.finish();
 
                     // Emit entity-mask audit events before schema processing
-                    if (emitter != null) {
-                        if (active_entity_map) |em| {
-                            try redaction_audit.emitEntityMaskAuditEvents(
-                                em,
-                                full_body.items,
-                                &emitter.?,
-                                allocator,
-                            );
-                        }
+                    if (active_entity_map) |em| {
+                        try redaction_audit.emitEntityMaskAuditEvents(
+                            em,
+                            full_body.items,
+                            &emitter,
+                            allocator,
+                        );
                     }
 
                     // Build ScanContext to run SCAN-action values through the
@@ -520,73 +605,47 @@ pub fn handleRequest(
                         const Self = @This();
 
                         proxy_ctx: *const ProxyContext,
-                        emitter: ?*redaction_audit.AuditEmitter,
+                        emitter: *redaction_audit.AuditEmitter,
 
                         fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
                             const self: *Self = @ptrCast(@alignCast(ctx_ptr));
 
-                            if (self.emitter) |audit_emitter| {
-                                // Audit-aware path: emit text-stage audit events per-field
-                                return redaction_audit.runTextStages(
-                                    input_val,
-                                    field_path,
-                                    .{
-                                        .ssn = true,
-                                        .patterns = true,
-                                        .fuzzy = true,
-                                    },
-                                    self.proxy_ctx.session_entity_map,
-                                    self.proxy_ctx.session_fuzzy_matcher,
-                                    self.proxy_ctx.patternFlags(),
-                                    audit_emitter,
-                                    alloc,
-                                );
-                            } else {
-                                // Non-audit fast path: direct redaction
-                                var current = try alloc.dupe(u8, input_val);
-
-                                redact.redactSsn(current);
-
-                                const pflags = self.proxy_ctx.patternFlags();
-                                if (pflags.anyEnabled()) {
-                                    const scanned = try scanner.redact(current, pflags, alloc);
-                                    alloc.free(current);
-                                    current = scanned;
-                                }
-
-                                if (self.proxy_ctx.session_fuzzy_matcher) |fm| {
-                                    const em_aliases = if (self.proxy_ctx.session_entity_map) |em| em.getAliases() else &.{};
-                                    const fuzzed = try fm.fuzzyRedact(current, em_aliases, &.{}, alloc);
-                                    alloc.free(current);
-                                    current = fuzzed;
-                                }
-
-                                return current;
-                            }
+                            return redaction_audit.runTextStages(
+                                input_val,
+                                field_path,
+                                .{
+                                    .ssn = true,
+                                    .patterns = true,
+                                    .fuzzy = true,
+                                },
+                                self.proxy_ctx.session_entity_map,
+                                self.proxy_ctx.session_fuzzy_matcher,
+                                self.proxy_ctx.patternFlags(),
+                                self.emitter,
+                                alloc,
+                            );
                         }
 
                         fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
                             const self: *Self = @ptrCast(@alignCast(ctx_ptr));
-                            if (self.emitter) |audit_emitter| {
-                                audit_emitter.emit(.{
-                                    .stage = "schema",
-                                    .match_type = switch (event.action) {
-                                        .redact => "schema_redact",
-                                        .hash => "schema_hash",
-                                        .scan => "schema_scan",
-                                        .keep => "schema_keep",
-                                    },
-                                    .field_path = event.field_path,
-                                    .original_length = event.original_length,
-                                    .replacement_type = event.replacement_type,
-                                });
-                            }
+                            self.emitter.emit(.{
+                                .stage = "schema",
+                                .match_type = switch (event.action) {
+                                    .redact => "schema_redact",
+                                    .hash => "schema_hash",
+                                    .scan => "schema_scan",
+                                    .keep => "schema_keep",
+                                },
+                                .field_path = event.field_path,
+                                .original_length = event.original_length,
+                                .replacement_type = event.replacement_type,
+                            });
                         }
                     };
 
                     var scan_audit_state = ScanAuditState{
                         .proxy_ctx = &ctx,
-                        .emitter = if (emitter != null) &emitter.? else null,
+                        .emitter = &emitter,
                     };
 
                     const scan_ctx_iface: ?json_redactor.ScanContext = .{
@@ -594,10 +653,10 @@ pub fn handleRequest(
                         .ctx_ptr = @ptrCast(&scan_audit_state),
                     };
 
-                    const audit_ctx: ?json_redactor.AuditContext = if (emitter != null) .{
+                    const audit_ctx: ?json_redactor.AuditContext = .{
                         .audit_fn = &ScanAuditState.onSchemaAction,
                         .ctx_ptr = @ptrCast(&scan_audit_state),
-                    } else null;
+                    };
 
                     const redacted = try json_redactor.redactJsonWithAudit(
                         masked_body,
@@ -637,8 +696,8 @@ pub fn handleRequest(
 
                 var body_read_buf: [8192]u8 = undefined;
                 var bytes_forwarded: usize = 0;
-                var audit_body: ?std.ArrayListUnmanaged(u8) = if (log.audit_enabled) .empty else null;
-                defer if (audit_body) |*buf| buf.deinit(allocator);
+                var audit_body: std.ArrayListUnmanaged(u8) = .empty;
+                defer audit_body.deinit(allocator);
                 if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
                     var raw_chunk_buf: [8192]u8 = undefined;
                     while (true) {
@@ -654,12 +713,7 @@ pub fn handleRequest(
                         }
 
                         const raw_chunk = raw_chunk_buf[0..bytes_read];
-                        if (audit_body) |*buf| {
-                            // Cap audit accumulation to avoid unbounded memory growth
-                            if (buf.items.len + raw_chunk.len <= max_audit_body_size) {
-                                try buf.appendSlice(allocator, raw_chunk);
-                            }
-                        }
+                        try audit_body.appendSlice(allocator, raw_chunk);
 
                         var masked_chunk: []u8 = undefined;
                         var masked_allocated = false;
@@ -718,6 +772,7 @@ pub fn handleRequest(
                         // Breaking here prevents another read call that panics if the stream is already .ready
                         if (bytes_read < raw_chunk_buf.len) break;
                     }
+                    request_body_bytes = bytes_forwarded;
 
                     // Flushes
                     var ac_flushed: ?[]u8 = null;
@@ -778,19 +833,18 @@ pub fn handleRequest(
                     });
                 }
 
-                if (audit_body) |buf| {
-                    try redaction_audit.emitRequestAuditEvents(
-                        allocator,
-                        log,
-                        session_id,
-                        buf.items,
-                        active_entity_map,
-                        session_fuzzy_matcher,
-                        ctx.patternFlags(),
-                        null,
-                        null,
-                    );
-                }
+                try redaction_audit.emitRequestAuditEvents(
+                    allocator,
+                    log,
+                    session_id,
+                    audit_body.items,
+                    active_entity_map,
+                    session_fuzzy_matcher,
+                    ctx.patternFlags(),
+                    null,
+                    null,
+                    ctx.observability,
+                );
 
                 try req_body.end();
                 if (client_req.connection) |conn| {
@@ -807,15 +861,28 @@ pub fn handleRequest(
     // --- Read upstream response ---
     var redirect_buffer: [4096]u8 = undefined;
     var downstream_res = client_req.receiveHead(&redirect_buffer) catch |err| {
+        const raw_upstream_latency = std.time.nanoTimestamp() - request_start;
+        upstream_latency_us = if (raw_upstream_latency < 0)
+            0
+        else
+            @intCast(@divTrunc(raw_upstream_latency, 1000));
+        upstream_latency_recorded = true;
         log.log(.warn, "upstream_response_head_failed", session_id, &.{
             .{ .key = "error", .value = .{ .string = @errorName(err) } },
             .{ .key = "target_host", .value = .{ .string = target_host } },
         });
-        try sendTextResponse(request, .bad_gateway, "Bad Gateway: upstream response headers or encodings are unsupported\n");
+        response_status = .bad_gateway;
+        response_body_bytes = try sendTextResponse(request, .bad_gateway, "Bad Gateway: upstream response headers or encodings are unsupported\n");
         return;
     };
 
-    const upstream_latency_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - request_start, 1000));
+    const raw_upstream_latency = std.time.nanoTimestamp() - request_start;
+    upstream_latency_us = if (raw_upstream_latency < 0)
+        0
+    else
+        @intCast(@divTrunc(raw_upstream_latency, 1000));
+    upstream_latency_recorded = true;
+    response_status = downstream_res.head.status;
     const response_has_body = responseHasBody(method, downstream_res.head.status);
     const response_kind = body_policy.classifyContentType(downstream_res.head.content_type);
     const can_unmask = active_entity_map != null and response_kind.supportsInlineTransform();
@@ -863,7 +930,8 @@ pub fn handleRequest(
             .{ .key = "content_type", .value = .{ .string = body_policy.contentTypeForLog(response_class.content_type) } },
             .{ .key = "content_encoding", .value = .{ .string = body_policy.contentEncodingForLog(response_class.content_encoding) } },
         });
-        try sendBodyPolicyResponse(request, .bad_gateway, "Bad Gateway: unsupported upstream response body", response_class);
+        response_status = .bad_gateway;
+        response_body_bytes = try sendBodyPolicyResponse(request, .bad_gateway, "Bad Gateway: unsupported upstream response body", response_class);
         return;
     }
 
@@ -920,7 +988,8 @@ pub fn handleRequest(
                 log.log(.warn, "response_body_too_large", session_id, &.{
                     .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
                 });
-                try sendTextResponse(request, .bad_gateway, "Bad Gateway: upstream response body too large\n");
+                response_status = .bad_gateway;
+                response_body_bytes = try sendTextResponse(request, .bad_gateway, "Bad Gateway: upstream response body too large\n");
                 return;
             }
 
@@ -945,7 +1014,8 @@ pub fn handleRequest(
             log.log(.warn, "response_unhash_failed", session_id, &.{
                 .{ .key = "error", .value = .{ .string = @errorName(err) } },
             });
-            try sendTextResponse(request, .bad_gateway, "Bad Gateway: upstream JSON response could not be restored\n");
+            response_status = .bad_gateway;
+            response_body_bytes = try sendTextResponse(request, .bad_gateway, "Bad Gateway: upstream JSON response could not be restored\n");
             return;
         };
         defer allocator.free(unhashed);
@@ -960,6 +1030,7 @@ pub fn handleRequest(
         });
         if (unhashed.len > 0) try response_writer.writer.writeAll(unhashed);
         try response_writer.end();
+        response_body_bytes = unhashed.len;
     } else {
         const response_content_length: ?u64 = switch (response_mode) {
             .stream_passthrough => downstream_res.head.content_length,
@@ -985,6 +1056,7 @@ pub fn handleRequest(
                     const bytes_read = try readAvailable(downstream_reader, &resp_buf);
                     if (bytes_read == 0) break;
                     try response_writer.writer.writeAll(resp_buf[0..bytes_read]);
+                    response_body_bytes += bytes_read;
                     if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                 }
             } else {
@@ -1000,6 +1072,7 @@ pub fn handleRequest(
                     defer allocator.free(unmasked);
                     if (unmasked.len > 0) {
                         try response_writer.writer.writeAll(unmasked);
+                        response_body_bytes += unmasked.len;
                         if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                     }
                 }
@@ -1008,6 +1081,7 @@ pub fn handleRequest(
                 defer allocator.free(flushed);
                 if (flushed.len > 0) {
                     try response_writer.writer.writeAll(flushed);
+                    response_body_bytes += flushed.len;
                     if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                 }
             }
@@ -1016,7 +1090,11 @@ pub fn handleRequest(
         try response_writer.end();
     }
 
-    const total_latency_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - request_start, 1000));
+    const raw_total_latency = std.time.nanoTimestamp() - request_start;
+    const total_latency_us: u64 = if (raw_total_latency < 0)
+        0
+    else
+        @intCast(@divTrunc(raw_total_latency, 1000));
     log.log(.info, "response_sent", session_id, &.{
         .{ .key = "total_latency_us", .value = .{ .uint = total_latency_us } },
     });

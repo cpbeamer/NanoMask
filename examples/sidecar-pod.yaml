@@ -76,7 +76,7 @@ spec:
         failureThreshold: 3
       readinessProbe:
         httpGet:
-          path: /healthz
+          path: /readyz
           port: 8081
         initialDelaySeconds: 2
         periodSeconds: 5

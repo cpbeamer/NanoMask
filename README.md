@@ -368,15 +368,47 @@ Example audit event:
 
 To keep noisy payloads from overwhelming operators, NanoMask caps audit emission at 256 events per request and logs `audit_event_cap_reached` if additional events were dropped.
 
-### Health Check
+### Health and Metrics
 
-`GET /healthz` returns HTTP 200 with a JSON body:
+`GET /healthz` is the liveness endpoint. It returns HTTP 200 with a JSON body:
 
 ```json
 {"status":"ok","uptime_s":3600,"connections_active":5,"connections_total":1200,"version":"0.1.0"}
 ```
 
-Usable as a K8s liveness/readiness probe. Health checks are logged at `DEBUG` level only to avoid log noise.
+`GET /readyz` is the readiness endpoint. It returns HTTP 200 while NanoMask is ready to serve traffic and HTTP 503 when startup state or entity hot-reload health is broken.
+
+```json
+{"status":"ready","startup":"ok","entity_reload":"ok","entity_reload_success_total":3,"entity_reload_failure_total":0,"version":"0.1.0"}
+```
+
+`GET /metrics` exposes Prometheus text format on the same listener. The built-in series include:
+
+- request totals
+- end-to-end request latency histogram
+- upstream latency histogram
+- downstream response status counts
+- request and response bytes processed
+- redaction matches by stage
+- active connections
+- entity reload success and failure totals
+- dropped structured log lines
+
+Recommended probe split:
+
+- Liveness: `/healthz`
+- Readiness: `/readyz`
+- Prometheus scrape: `/metrics`
+
+Helm can add scrape annotations for the shared Service:
+
+```yaml
+metrics:
+  enabled: true
+  path: /metrics
+```
+
+Health endpoints are logged at `DEBUG` level only to avoid log noise.
 
 ## License
 

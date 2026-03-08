@@ -9,6 +9,8 @@ pub const file_watcher = @import("entity/file_watcher.zig");
 pub const admin = @import("admin/admin.zig");
 pub const tls_server = @import("crypto/tls.zig");
 pub const logger = @import("infra/logger.zig");
+pub const observability = @import("infra/observability.zig");
+pub const redaction_audit = @import("infra/redaction_audit.zig");
 pub const body_policy = @import("net/body_policy.zig");
 
 // Pattern library (Phase 5 / Epic 7)
@@ -41,7 +43,9 @@ test {
     _ = admin;
     _ = tls_server;
     _ = logger;
+    _ = observability;
     _ = body_policy;
+    _ = redaction_audit;
     _ = @import("net/http_util.zig");
     // Pattern library
     _ = email;

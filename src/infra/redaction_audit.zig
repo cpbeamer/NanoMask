@@ -1,6 +1,8 @@
 const std = @import("std");
 const logger_mod = @import("logger.zig");
 const Logger = logger_mod.Logger;
+const observability_mod = @import("observability.zig");
+const Observability = observability_mod.Observability;
 const redact = @import("../redaction/redact.zig");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
@@ -21,18 +23,24 @@ pub const TextStageConfig = struct {
 pub const AuditEmitter = struct {
     log: *Logger,
     session_id: []const u8,
+    observability: ?*Observability = null,
     emitted: usize = 0,
     dropped: usize = 0,
     limit: usize = max_events_per_request,
 
-    pub fn init(log: *Logger, session_id: []const u8) AuditEmitter {
+    pub fn init(log: *Logger, session_id: []const u8, observability: ?*Observability) AuditEmitter {
         return .{
             .log = log,
             .session_id = session_id,
+            .observability = observability,
         };
     }
 
     pub fn emit(self: *AuditEmitter, event: Logger.AuditEvent) void {
+        if (self.observability) |obs| {
+            obs.recordAuditEvent(event);
+        }
+
         if (!self.log.audit_enabled) return;
 
         if (self.emitted >= self.limit) {
@@ -45,6 +53,7 @@ pub const AuditEmitter = struct {
     }
 
     pub fn finish(self: *AuditEmitter) void {
+        if (!self.log.audit_enabled) return;
         if (self.dropped == 0) return;
 
         self.log.log(.warn, "audit_event_cap_reached", self.session_id, &.{
@@ -65,10 +74,12 @@ pub fn emitRequestAuditEvents(
     pattern_flags: scanner.PatternFlags,
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
+    observability: ?*Observability,
 ) !void {
-    if (!log.audit_enabled or body.len == 0) return;
+    if (body.len == 0) return;
+    if (!log.audit_enabled and observability == null) return;
 
-    var emitter = AuditEmitter.init(log, session_id);
+    var emitter = AuditEmitter.init(log, session_id, observability);
     defer emitter.finish();
 
     if (schema) |active_schema| {
@@ -397,7 +408,7 @@ test "AuditEmitter - cap enforcement at 256 events" {
         .owns_file = false,
     };
 
-    var emitter = AuditEmitter.init(&logger, "cap_test");
+    var emitter = AuditEmitter.init(&logger, "cap_test", null);
 
     // Emit exactly max_events_per_request + 10 events
     const total = max_events_per_request + 10;
@@ -430,7 +441,7 @@ test "AuditEmitter - finish logs dropped count" {
         .owns_file = false,
     };
 
-    var emitter = AuditEmitter.init(&logger, "finish_test");
+    var emitter = AuditEmitter.init(&logger, "finish_test", null);
     emitter.limit = 2; // small limit to make test fast
 
     for (0..5) |_| {
@@ -465,7 +476,7 @@ test "AuditEmitter - no output when audit disabled" {
         .owns_file = false,
     };
 
-    var emitter = AuditEmitter.init(&logger, "disabled_test");
+    var emitter = AuditEmitter.init(&logger, "disabled_test", null);
 
     emitter.emit(.{
         .stage = "ssn",

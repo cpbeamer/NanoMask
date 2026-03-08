@@ -101,6 +101,18 @@ service:
   # -- Service port (maps to proxy.listenPort).
   port: 8081
 
+# -- Metrics exposure on the main listener.
+metrics:
+  # -- Enable Prometheus scrape annotations on the NanoMask Service.
+  enabled: false
+  # -- Prometheus path served by NanoMask.
+  path: /metrics
+  service:
+    # -- Extra Service annotations for Prometheus Operator or custom scrapers.
+    annotations: {}
+    # -- Extra Service labels for ServiceMonitor selectors or inventory.
+    labels: {}
+
 # ── Network policy ───────────────────────────────────────────────────
 networkPolicy:
   # -- Create a NetworkPolicy restricting egress to the upstream and DNS.

@@ -13,6 +13,8 @@ const admin = @import("admin/admin.zig");
 const tls_mod = @import("crypto/tls.zig");
 const logger_mod = @import("infra/logger.zig");
 const Logger = logger_mod.Logger;
+const observability_mod = @import("infra/observability.zig");
+const Observability = observability_mod.Observability;
 const schema_mod = @import("schema/schema.zig");
 const hasher_mod = @import("schema/hasher.zig");
 const body_policy = @import("net/body_policy.zig");
@@ -40,6 +42,7 @@ const ThreadContext = struct {
     max_body_size: usize,
     /// Structured JSON logger — thread-safe, shared across all handlers.
     logger: *Logger,
+    observability: *Observability,
     /// Lifetime connection counter for /healthz endpoint.
     connections_total: *std.atomic.Value(u64),
     /// Server start timestamp (epoch seconds) for uptime calculation.
@@ -125,6 +128,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
             .admin_config = ctx.admin_config,
             .max_body_size = ctx.max_body_size,
             .log = ctx.logger,
+            .observability = ctx.observability,
             .session_id = session_id,
             .active_connections = ctx.active_connections,
             .connections_total = ctx.connections_total,
@@ -199,6 +203,11 @@ pub fn main() !void {
     };
     defer log.deinit();
 
+    var active_connections = std.atomic.Value(u32).init(0);
+    var connections_total = std.atomic.Value(u64).init(0);
+    const start_time = std.time.timestamp();
+    var observability = Observability.init(&log, &active_connections);
+
     var listen_address_buf: [128]u8 = undefined;
     const listen_address = cfg.formatListenAddress(&listen_address_buf) catch {
         std.debug.print("error: failed to format listen address\n", .{});
@@ -257,9 +266,11 @@ pub fn main() !void {
             es,
             cfg.fuzzy_threshold,
             allocator,
+            &observability,
         );
         watcher.?.start() catch {
             log.warn("file_watcher_start_failed", null);
+            observability.markEntityReloadFailure();
             watcher = null;
         };
     } else if (cfg.admin_api) {
@@ -434,10 +445,6 @@ pub fn main() !void {
     // Long-running upstream calls will block the handler thread until completion.
     // This is a known limitation to address when the stdlib exposes timeout options.
 
-    var active_connections = std.atomic.Value(u32).init(0);
-    var connections_total = std.atomic.Value(u64).init(0);
-    const start_time = std.time.timestamp();
-
     const admin_config = admin.AdminConfig{
         .enabled = cfg.admin_api,
         .token = cfg.admin_token,
@@ -458,6 +465,7 @@ pub fn main() !void {
         .target_tls = cfg.target_tls,
         .max_body_size = cfg.max_body_size,
         .logger = &log,
+        .observability = &observability,
         .connections_total = &connections_total,
         .start_time = start_time,
         .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
@@ -470,6 +478,8 @@ pub fn main() !void {
         .schema = if (schema_instance) |*s| s else null,
         .hasher = if (hasher_instance) |*h| h else null,
     };
+
+    observability.markStartupReady();
 
     while (true) {
         const connection = net_server.accept() catch {

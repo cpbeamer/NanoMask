@@ -8,6 +8,7 @@ const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
 const admin = @import("../admin/admin.zig");
 const logger_mod = @import("../infra/logger.zig");
+const observability_mod = @import("../infra/observability.zig");
 const schema_mod = @import("../schema/schema.zig");
 const hasher_mod = @import("../schema/hasher.zig");
 
@@ -262,6 +263,8 @@ pub fn roundTrip(
     var active_connections = std.atomic.Value(u32).init(1);
     var connections_total = std.atomic.Value(u64).init(0);
     const start_time = std.time.timestamp();
+    var observability = observability_mod.Observability.init(&log, &active_connections);
+    observability.markStartupReady();
 
     const proxy_ctx = proxy.ProxyContext{
         .allocator = allocator,
@@ -275,6 +278,7 @@ pub fn roundTrip(
         .admin_config = .{ .enabled = false, .token = null, .entity_file_sync = false, .entity_file = null, .fuzzy_threshold = 0.0 },
         .max_body_size = 1024 * 1024,
         .log = &log,
+        .observability = &observability,
         .session_id = "e2e-test",
         .active_connections = &active_connections,
         .connections_total = &connections_total,

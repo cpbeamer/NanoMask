@@ -1,6 +1,8 @@
 const std = @import("std");
 const versioned_entity_set = @import("versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
+const observability_mod = @import("../infra/observability.zig");
+const Observability = observability_mod.Observability;
 
 // ---------------------------------------------------------------------------
 // File Watcher — poll-based entity file reload trigger
@@ -20,6 +22,7 @@ pub const FileWatcher = struct {
     entity_set: *VersionedEntitySet,
     fuzzy_threshold: f32,
     allocator: std.mem.Allocator,
+    observability: ?*Observability,
     running: std.atomic.Value(bool),
     thread: ?std.Thread = null,
 
@@ -29,6 +32,7 @@ pub const FileWatcher = struct {
         entity_set: *VersionedEntitySet,
         fuzzy_threshold: f32,
         allocator: std.mem.Allocator,
+        observability: ?*Observability,
     ) FileWatcher {
         // Get initial file stat for baseline comparison
         const stat = getFileStat(path);
@@ -41,6 +45,7 @@ pub const FileWatcher = struct {
             .entity_set = entity_set,
             .fuzzy_threshold = fuzzy_threshold,
             .allocator = allocator,
+            .observability = observability,
             .running = std.atomic.Value(bool).init(true),
         };
     }
@@ -121,6 +126,9 @@ pub const FileWatcher = struct {
             self.allocator,
         ) catch |err| {
             std.debug.print("[WATCH] WARNING: Entity reload failed: {s} — keeping current automaton (v{})\n", .{ @errorName(err), old_version });
+            if (self.observability) |obs| {
+                obs.markEntityReloadFailure();
+            }
             // Update stat anyway to avoid retrying every poll cycle on a
             // persistently broken file. Next real change will trigger retry.
             self.last_mtime = new_stat.mtime;
@@ -138,6 +146,9 @@ pub const FileWatcher = struct {
             new_snapshot.loaded_names.len,
             elapsed_ms,
         });
+        if (self.observability) |obs| {
+            obs.markEntityReloadSuccess();
+        }
 
         self.last_mtime = new_stat.mtime;
         self.last_size = new_stat.size;
@@ -168,7 +179,7 @@ test "FileWatcher - start and join lifecycle" {
     defer set.deinit();
 
     // Use a very short poll interval — the test only needs one cycle
-    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, allocator);
+    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, allocator, null);
     try watcher.start();
 
     // Let it run briefly, then join — verifies clean thread cleanup

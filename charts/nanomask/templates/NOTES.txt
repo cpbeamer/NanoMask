@@ -15,10 +15,25 @@ Get the proxy URL:
 Verify the proxy is healthy:
 {{- if eq .Values.service.type "ClusterIP" }}
   curl http://localhost:{{ .Values.service.port }}/healthz
+  curl http://localhost:{{ .Values.service.port }}/readyz
 {{- else if eq .Values.service.type "NodePort" }}
   curl http://$NODE_IP:$NODE_PORT/healthz
+  curl http://$NODE_IP:$NODE_PORT/readyz
 {{- else if eq .Values.service.type "LoadBalancer" }}
   curl http://$SERVICE_IP:{{ .Values.service.port }}/healthz
+  curl http://$SERVICE_IP:{{ .Values.service.port }}/readyz
+{{- end }}
+
+{{- if .Values.metrics.enabled }}
+
+Prometheus metrics:
+{{- if eq .Values.service.type "ClusterIP" }}
+  curl http://localhost:{{ .Values.service.port }}{{ .Values.metrics.path }}
+{{- else if eq .Values.service.type "NodePort" }}
+  curl http://$NODE_IP:$NODE_PORT{{ .Values.metrics.path }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+  curl http://$SERVICE_IP:{{ .Values.service.port }}{{ .Values.metrics.path }}
+{{- end }}
 {{- end }}
 
 Listener bind address: {{ .Values.proxy.listenHost }}:{{ .Values.proxy.listenPort }}

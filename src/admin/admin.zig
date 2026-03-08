@@ -38,29 +38,30 @@ pub fn handleAdminRequest(
     entity_set: ?*VersionedEntitySet,
     admin_config: AdminConfig,
     allocator: std.mem.Allocator,
-) !bool {
-    if (!admin_config.enabled) return false;
-    if (!isAdminRoute(request.head.target)) return false;
+) !?http.Status {
+    if (!admin_config.enabled) return null;
+    if (!isAdminRoute(request.head.target)) return null;
 
     // Auth check: if token is configured, require Bearer token
     if (admin_config.token) |expected_token| {
         const auth_header = http_util.findHeader(request.head_buffer, "Authorization");
         if (auth_header == null or !validateBearerToken(auth_header.?, expected_token)) {
             try sendJsonResponse(request, .unauthorized, "{\"error\":\"unauthorized\"}");
-            return true;
+            return .unauthorized;
         }
     }
 
     const method = request.head.method;
-    switch (method) {
+    return switch (method) {
         .GET => try handleGet(request, entity_set),
         .POST => try handlePost(request, entity_set, admin_config, allocator),
         .DELETE => try handleDelete(request, entity_set, admin_config, allocator),
         .PUT => try handlePut(request, entity_set, admin_config, allocator),
-        else => try sendJsonResponse(request, .method_not_allowed, "{\"error\":\"method not allowed\"}"),
-    }
-
-    return true;
+        else => blk: {
+            try sendJsonResponse(request, .method_not_allowed, "{\"error\":\"method not allowed\"}");
+            break :blk .method_not_allowed;
+        },
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +122,10 @@ fn sendJsonResponse(
 fn handleGet(
     request: *http.Server.Request,
     entity_set: ?*VersionedEntitySet,
-) !void {
+) !http.Status {
     if (entity_set == null) {
         try sendJsonResponse(request, .ok, "{\"version\":0,\"count\":0,\"entities\":[]}");
-        return;
+        return .ok;
     }
     const es = entity_set.?;
     const snapshot = es.acquire();
@@ -174,6 +175,7 @@ fn handleGet(
     try json_buf.appendSlice(snapshot.allocator, "]}");
 
     try sendJsonResponse(request, .ok, json_buf.items);
+    return .ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,13 +187,13 @@ fn handlePost(
     entity_set: ?*VersionedEntitySet,
     admin_config: AdminConfig,
     allocator: std.mem.Allocator,
-) !void {
+) !http.Status {
     const body = try readRequestBody(request, allocator);
     defer allocator.free(body);
 
     const new_names = parseJsonStringArray(body, "add", allocator) catch {
         try sendJsonResponse(request, .bad_request, "{\"error\":\"invalid JSON, expected {\\\"add\\\":[...]}\"}");
-        return;
+        return .bad_request;
     };
     defer {
         for (new_names) |n| allocator.free(n);
@@ -200,13 +202,13 @@ fn handlePost(
 
     if (new_names.len == 0) {
         try sendJsonResponse(request, .bad_request, "{\"error\":\"empty add list\"}");
-        return;
+        return .bad_request;
     }
 
     // Merge with existing names (deduplicate via HashMap for O(1) lookups)
     const es = entity_set orelse {
         try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
-        return;
+        return .internal_server_error;
     };
 
     const current_snap = es.acquire();
@@ -242,6 +244,7 @@ fn handlePost(
 
     try rebuildAndSwap(es, merged.items, admin_config, allocator);
     try sendJsonResponse(request, .ok, "{\"status\":\"ok\"}");
+    return .ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,13 +256,13 @@ fn handleDelete(
     entity_set: ?*VersionedEntitySet,
     admin_config: AdminConfig,
     allocator: std.mem.Allocator,
-) !void {
+) !http.Status {
     const body = try readRequestBody(request, allocator);
     defer allocator.free(body);
 
     const remove_names = parseJsonStringArray(body, "remove", allocator) catch {
         try sendJsonResponse(request, .bad_request, "{\"error\":\"invalid JSON, expected {\\\"remove\\\":[...]}\"}");
-        return;
+        return .bad_request;
     };
     defer {
         for (remove_names) |n| allocator.free(n);
@@ -268,12 +271,12 @@ fn handleDelete(
 
     if (remove_names.len == 0) {
         try sendJsonResponse(request, .bad_request, "{\"error\":\"empty remove list\"}");
-        return;
+        return .bad_request;
     }
 
     const es = entity_set orelse {
         try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
-        return;
+        return .internal_server_error;
     };
 
     const current_snap = es.acquire();
@@ -304,6 +307,7 @@ fn handleDelete(
 
     try rebuildAndSwap(es, kept.items, admin_config, allocator);
     try sendJsonResponse(request, .ok, "{\"status\":\"ok\"}");
+    return .ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,13 +319,13 @@ fn handlePut(
     entity_set: ?*VersionedEntitySet,
     admin_config: AdminConfig,
     allocator: std.mem.Allocator,
-) !void {
+) !http.Status {
     const body = try readRequestBody(request, allocator);
     defer allocator.free(body);
 
     const new_names = parseJsonStringArray(body, "entities", allocator) catch {
         try sendJsonResponse(request, .bad_request, "{\"error\":\"invalid JSON, expected {\\\"entities\\\":[...]}\"}");
-        return;
+        return .bad_request;
     };
     defer {
         for (new_names) |n| allocator.free(n);
@@ -330,11 +334,12 @@ fn handlePut(
 
     const es = entity_set orelse {
         try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
-        return;
+        return .internal_server_error;
     };
 
     try rebuildAndSwap(es, new_names, admin_config, allocator);
     try sendJsonResponse(request, .ok, "{\"status\":\"ok\"}");
+    return .ok;
 }
 
 // ---------------------------------------------------------------------------
