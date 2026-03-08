@@ -79,8 +79,8 @@ pub const Config = struct {
     enable_credit_card_src: ConfigSource = .default,
     enable_ip: bool = false,
     enable_ip_src: ConfigSource = .default,
-    healthcare: bool = false,
-    healthcare_src: ConfigSource = .default,
+    enable_healthcare: bool = false,
+    enable_healthcare_src: ConfigSource = .default,
 
     /// When true, perform a health check probe against localhost and exit.
     /// Used by Docker HEALTHCHECK in scratch containers with no curl/wget.
@@ -164,7 +164,7 @@ pub const Config = struct {
             \\  --enable-phone               Redact US phone numbers (default: disabled)
             \\  --enable-credit-card          Redact credit card numbers with Luhn validation (default: disabled)
             \\  --enable-ip                  Redact IPv4/IPv6 addresses (default: disabled)
-            \\  --healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
+            \\  --enable-healthcare           Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
             \\  --healthcheck                Probe /healthz on localhost and exit (for Docker HEALTHCHECK)
             \\  --help                     Print this help message and exit
             \\
@@ -327,9 +327,9 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_IP")) {
             config.enable_ip = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_ip_src = .env_var;
-        } else if (std.mem.eql(u8, name, "NANOMASK_HEALTHCARE")) {
-            config.healthcare = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
-            config.healthcare_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_HEALTHCARE")) {
+            config.enable_healthcare = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_healthcare_src = .env_var;
         }
     }
 
@@ -370,7 +370,7 @@ pub const Config = struct {
             "NANOMASK_ENABLE_PHONE",
             "NANOMASK_ENABLE_CREDIT_CARD",
             "NANOMASK_ENABLE_IP",
-            "NANOMASK_HEALTHCARE",
+            "NANOMASK_ENABLE_HEALTHCARE",
         };
 
         for (env_keys) |key| {
@@ -614,9 +614,9 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-ip")) {
                 config.enable_ip = true;
                 config.enable_ip_src = .cli_flag;
-            } else if (std.mem.eql(u8, arg, "--healthcare")) {
-                config.healthcare = true;
-                config.healthcare_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-healthcare")) {
+                config.enable_healthcare = true;
+                config.enable_healthcare_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
             } else {

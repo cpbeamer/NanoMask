@@ -46,7 +46,7 @@ const ThreadContext = struct {
     enable_phone: bool,
     enable_credit_card: bool,
     enable_ip: bool,
-    healthcare: bool,
+    enable_healthcare: bool,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -124,7 +124,7 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
             .enable_phone = ctx.enable_phone,
             .enable_credit_card = ctx.enable_credit_card,
             .enable_ip = ctx.enable_ip,
-            .healthcare = ctx.healthcare,
+            .enable_healthcare = ctx.enable_healthcare,
         },
     ) catch |err| {
         ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{
@@ -382,7 +382,7 @@ pub fn main() !void {
         .enable_phone = cfg.enable_phone,
         .enable_credit_card = cfg.enable_credit_card,
         .enable_ip = cfg.enable_ip,
-        .healthcare = cfg.healthcare,
+        .enable_healthcare = cfg.enable_healthcare,
     };
 
     while (true) {

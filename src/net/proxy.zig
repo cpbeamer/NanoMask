@@ -75,7 +75,7 @@ pub const ProxyContext = struct {
     enable_phone: bool,
     enable_credit_card: bool,
     enable_ip: bool,
-    healthcare: bool,
+    enable_healthcare: bool,
 };
 /// Chain all enabled pattern redactors on a buffer slice.
 /// Returns a newly allocated buffer with all patterns applied.
@@ -104,7 +104,7 @@ fn applyPatterns(input: []const u8, ctx: ProxyContext, allocator: std.mem.Alloca
         allocator.free(current);
         current = next;
     }
-    if (ctx.healthcare) {
+    if (ctx.enable_healthcare) {
         const next = try healthcare_pattern.redactHealthcare(current, allocator);
         allocator.free(current);
         current = next;
@@ -307,7 +307,7 @@ pub fn handleRequest(
                 defer if (pf_alloc) |a| allocator.free(a);
                 defer if (pe_alloc) |a| allocator.free(a);
 
-                if (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.healthcare) {
+                if (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.enable_healthcare) {
                     if (pattern_finalized.len > 0) {
                         const buf = try applyPatterns(pattern_finalized, ctx, allocator);
                         pf_alloc = buf;
@@ -368,7 +368,7 @@ pub fn handleRequest(
             if (session_fuzzy_matcher) |fm| {
                 const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
 
-                const pattern_result = if (ssn_final_emissions.items.len > 0 and (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.healthcare))
+                const pattern_result = if (ssn_final_emissions.items.len > 0 and (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.enable_healthcare))
                     try applyPatterns(ssn_final_emissions.items, ctx, allocator)
                 else
                     null;
@@ -384,7 +384,7 @@ pub fn handleRequest(
                 defer allocator.free(fuzzy_flushed);
                 if (fuzzy_flushed.len > 0) try req_body.writer.writeAll(fuzzy_flushed);
             } else {
-                const pattern_result = if (ssn_final_emissions.items.len > 0 and (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.healthcare))
+                const pattern_result = if (ssn_final_emissions.items.len > 0 and (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.enable_healthcare))
                     try applyPatterns(ssn_final_emissions.items, ctx, allocator)
                 else
                     null;

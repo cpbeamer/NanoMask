@@ -7,7 +7,7 @@ const std = @import("std");
 // redacted when preceded by a recognizable label keyword. Without context,
 // digit sequences and alphanumeric codes are too ambiguous to redact safely.
 //
-// This module is gated behind the `--healthcare` CLI flag to avoid false
+// This module is gated behind the `--enable-healthcare` CLI flag to avoid false
 // positives in non-healthcare contexts.
 // ---------------------------------------------------------------------------
 
