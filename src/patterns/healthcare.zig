@@ -144,48 +144,46 @@ fn matchInsurance(buf: []const u8, cursor: usize) ?struct { value_start: usize, 
     return null;
 }
 
-/// Redact healthcare identifiers in the input.
-/// Returns an owned slice (caller must free).
-pub fn redactHealthcare(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (input.len < 4) {
-        return try allocator.dupe(u8, input);
+/// Single-position match for the unified scanner.
+/// Tries MRN labels, insurance labels, then ICD-10 codes.
+/// For label-based matches, `redact_start` points past the label so the label
+/// text is preserved in the output.
+pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+    if (pos >= buf.len) return null;
+
+    // Fast pre-check: bail immediately if the current byte cannot start any
+    // healthcare pattern. Labels start with M/m, P/p, I/i, G/g; ICD-10
+    // starts with uppercase A-Z. This avoids calling matchMrn/matchInsurance
+    // on ~95% of bytes.
+    const c = buf[pos];
+    const lower = std.ascii.toLower(c);
+    const can_start_label = (lower == 'm' or lower == 'p' or lower == 'i' or lower == 'g');
+    const can_start_icd10 = std.ascii.isUpper(c);
+
+    if (!can_start_label and !can_start_icd10) return null;
+
+    // MRN detection (labels start with M/P)
+    if (lower == 'm' or lower == 'p') {
+        if (matchMrn(buf, pos)) |m| {
+            return .{ .start = pos, .end = m.end, .redact_start = m.value_start, .replacement = mrn_replacement };
+        }
     }
 
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var cursor: usize = 0;
-
-    while (cursor < input.len) {
-        // --- MRN detection ---
-        if (matchMrn(input, cursor)) |match| {
-            // Emit everything from cursor to value start (including the label)
-            try result.appendSlice(allocator, input[cursor..match.value_start]);
-            try result.appendSlice(allocator, mrn_replacement);
-            cursor = match.end;
-            continue;
+    // Insurance ID detection (labels start with I/M/P/G)
+    if (can_start_label) {
+        if (matchInsurance(buf, pos)) |m| {
+            return .{ .start = pos, .end = m.end, .redact_start = m.value_start, .replacement = insurance_replacement };
         }
-
-        // --- Insurance ID detection ---
-        if (matchInsurance(input, cursor)) |match| {
-            try result.appendSlice(allocator, input[cursor..match.value_start]);
-            try result.appendSlice(allocator, insurance_replacement);
-            cursor = match.end;
-            continue;
-        }
-
-        // --- ICD-10 detection ---
-        if (matchIcd10(input, cursor)) |end| {
-            try result.appendSlice(allocator, icd10_replacement);
-            cursor = end;
-            continue;
-        }
-
-        try result.append(allocator, input[cursor]);
-        cursor += 1;
     }
 
-    return try result.toOwnedSlice(allocator);
+    // ICD-10 detection (starts with uppercase letter)
+    if (can_start_icd10) {
+        if (matchIcd10(buf, pos)) |end| {
+            return .{ .start = pos, .end = end, .redact_start = pos, .replacement = icd10_replacement };
+        }
+    }
+
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,102 +191,87 @@ pub fn redactHealthcare(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
 // ---------------------------------------------------------------------------
 
 test "healthcare - MRN with label" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("MRN: 1234567 is the record", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("MRN: [MRN_REDACTED] is the record", result);
+    const input = "MRN: 1234567 is the record";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("MRN: 1234567", input[m.start..m.end]);
+    // Label is preserved: redact_start points past "MRN: "
+    try std.testing.expectEqualStrings("1234567", input[m.redact_start..m.end]);
+    try std.testing.expectEqualStrings(mrn_replacement, m.replacement);
 }
 
 test "healthcare - MR# format" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("MR#12345678 found", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("MR#[MRN_REDACTED] found", result);
+    const input = "MR#12345678 found";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("MR#12345678", input[m.start..m.end]);
+    try std.testing.expectEqualStrings("12345678", input[m.redact_start..m.end]);
 }
 
 test "healthcare - Medical Record label" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Medical Record: 12345678 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Medical Record: [MRN_REDACTED] here", result);
+    const input = "Medical Record: 12345678 here";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("12345678", input[m.redact_start..m.end]);
+    try std.testing.expectEqualStrings(mrn_replacement, m.replacement);
 }
 
 test "healthcare - Patient ID label" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Patient ID: 123456 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Patient ID: [MRN_REDACTED] end", result);
+    const input = "Patient ID: 123456 end";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("123456", input[m.redact_start..m.end]);
+    try std.testing.expectEqualStrings(mrn_replacement, m.replacement);
 }
 
 test "healthcare - ICD-10 with extension" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Diagnosis E11.65 noted", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Diagnosis [ICD10_REDACTED] noted", result);
+    const input = "Diagnosis E11.65 noted";
+    const start = std.mem.indexOf(u8, input, "E11").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("E11.65", input[m.start..m.end]);
+    try std.testing.expectEqualStrings(icd10_replacement, m.replacement);
 }
 
 test "healthcare - ICD-10 multi-char extension" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Code Z87.891 recorded", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Code [ICD10_REDACTED] recorded", result);
+    const input = "Code Z87.891 recorded";
+    const start = std.mem.indexOf(u8, input, "Z87").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("Z87.891", input[m.start..m.end]);
 }
 
 test "healthcare - ICD-10 short form rejected without extension" {
-    const allocator = std.testing.allocator;
+    const input = "Item A12 in list";
+    const start = std.mem.indexOf(u8, input, "A12").?;
     // "A12" alone is too ambiguous without a dot extension
-    const result = try redactHealthcare("Item A12 in list", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Item A12 in list", result);
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "healthcare - Insurance ID with label" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Insurance ID: ABC12345678 ok", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Insurance ID: [INSURANCE_REDACTED] ok", result);
+    const input = "Insurance ID: ABC12345678 ok";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("ABC12345678", input[m.redact_start..m.end]);
+    try std.testing.expectEqualStrings(insurance_replacement, m.replacement);
 }
 
 test "healthcare - Member ID with label" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Member ID: XYZ98765432 ok", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Member ID: [INSURANCE_REDACTED] ok", result);
+    const input = "Member ID: XYZ98765432 ok";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("XYZ98765432", input[m.redact_start..m.end]);
+    try std.testing.expectEqualStrings(insurance_replacement, m.replacement);
 }
 
 test "healthcare - Policy # with label" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("Policy # 12345678AB here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Policy # [INSURANCE_REDACTED] here", result);
-}
-
-test "healthcare - no healthcare ids unchanged" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("This text has no healthcare identifiers.", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("This text has no healthcare identifiers.", result);
-}
-
-test "healthcare - empty input" {
-    const allocator = std.testing.allocator;
-    const result = try redactHealthcare("", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
+    const input = "Policy # 12345678AB here";
+    const m = tryMatchAt(input, 0).?;
+    try std.testing.expectEqualStrings("12345678AB", input[m.redact_start..m.end]);
 }
 
 test "healthcare - false positive rejection of standalone digits" {
-    const allocator = std.testing.allocator;
-    // "1234567" without a label should not be redacted
-    const result = try redactHealthcare("Order 1234567 placed", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Order 1234567 placed", result);
+    const input = "Order 1234567 placed";
+    // '1' is a digit, not a label starter — tryMatchAt bails on pre-check
+    const start = std.mem.indexOf(u8, input, "1234").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "healthcare - ICD-10 embedded in word rejected" {
-    const allocator = std.testing.allocator;
-    // "XA12.5" preceded by letter should not match
-    const result = try redactHealthcare("CodeXA12.5 test", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("CodeXA12.5 test", result);
+    const input = "CodeXA12.5 test";
+    // 'X' at position 4 is preceded by 'e' (alphanumeric), so ICD-10 rejects
+    const start = std.mem.indexOf(u8, input, "XA12").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }

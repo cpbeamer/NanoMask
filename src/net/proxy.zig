@@ -12,12 +12,8 @@ const Config = config_mod.Config;
 const logger_mod = @import("../infra/logger.zig");
 const Logger = logger_mod.Logger;
 
-// Pattern library (Phase 5 / Epic 7)
-const email_pattern = @import("../patterns/email.zig");
-const phone_pattern = @import("../patterns/phone.zig");
-const credit_card_pattern = @import("../patterns/credit_card.zig");
-const ip_address_pattern = @import("../patterns/ip_address.zig");
-const healthcare_pattern = @import("../patterns/healthcare.zig");
+// Unified single-pass pattern scanner (Phase 5 / Epic 7)
+const scanner = @import("../patterns/scanner.zig");
 
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
@@ -76,42 +72,18 @@ pub const ProxyContext = struct {
     enable_credit_card: bool,
     enable_ip: bool,
     enable_healthcare: bool,
+
+    /// Build scanner flags from the proxy context's enable fields.
+    pub fn patternFlags(self: ProxyContext) scanner.PatternFlags {
+        return .{
+            .email = self.enable_email,
+            .phone = self.enable_phone,
+            .credit_card = self.enable_credit_card,
+            .ip = self.enable_ip,
+            .healthcare = self.enable_healthcare,
+        };
+    }
 };
-/// Chain all enabled pattern redactors on a buffer slice.
-/// Returns a newly allocated buffer with all patterns applied.
-/// Caller owns the returned slice and must free it.
-fn applyPatterns(input: []const u8, ctx: ProxyContext, allocator: std.mem.Allocator) ![]u8 {
-    var current = try allocator.dupe(u8, input);
-    errdefer allocator.free(current);
-
-    if (ctx.enable_email) {
-        const next = try email_pattern.redactEmails(current, allocator);
-        allocator.free(current);
-        current = next;
-    }
-    if (ctx.enable_phone) {
-        const next = try phone_pattern.redactPhones(current, allocator);
-        allocator.free(current);
-        current = next;
-    }
-    if (ctx.enable_credit_card) {
-        const next = try credit_card_pattern.redactCreditCards(current, allocator);
-        allocator.free(current);
-        current = next;
-    }
-    if (ctx.enable_ip) {
-        const next = try ip_address_pattern.redactIpAddresses(current, allocator);
-        allocator.free(current);
-        current = next;
-    }
-    if (ctx.enable_healthcare) {
-        const next = try healthcare_pattern.redactHealthcare(current, allocator);
-        allocator.free(current);
-        current = next;
-    }
-
-    return current;
-}
 
 pub fn handleRequest(
     request: *http.Server.Request,
@@ -295,26 +267,24 @@ pub fn handleRequest(
 
                 const ssn_res = redact.redactSsnChunked(masked_chunk, &ssn_state);
 
-                // --- Pattern library stages (after SSN, before fuzzy) ---
-                // Each pattern allocates a new result; we chain them, freeing
-                // intermediates. The final buffer feeds into fuzzy or output.
+                // --- Pattern library: single-pass scan (after SSN, before fuzzy) ---
+                const scanner_flags = ctx.patternFlags();
                 var pattern_finalized = ssn_res.finalized;
                 var pattern_emitted = ssn_res.emitted;
 
-                // Track allocations for cleanup
                 var pf_alloc: ?[]u8 = null;
                 var pe_alloc: ?[]u8 = null;
                 defer if (pf_alloc) |a| allocator.free(a);
                 defer if (pe_alloc) |a| allocator.free(a);
 
-                if (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.enable_healthcare) {
+                if (scanner_flags.anyEnabled()) {
                     if (pattern_finalized.len > 0) {
-                        const buf = try applyPatterns(pattern_finalized, ctx, allocator);
+                        const buf = try scanner.redact(pattern_finalized, scanner_flags, allocator);
                         pf_alloc = buf;
                         pattern_finalized = buf;
                     }
                     if (pattern_emitted.len > 0) {
-                        const buf = try applyPatterns(pattern_emitted, ctx, allocator);
+                        const buf = try scanner.redact(pattern_emitted, scanner_flags, allocator);
                         pe_alloc = buf;
                         pattern_emitted = buf;
                     }
@@ -368,8 +338,8 @@ pub fn handleRequest(
             if (session_fuzzy_matcher) |fm| {
                 const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
 
-                const pattern_result = if (ssn_final_emissions.items.len > 0 and (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.enable_healthcare))
-                    try applyPatterns(ssn_final_emissions.items, ctx, allocator)
+                const pattern_result = if (ssn_final_emissions.items.len > 0 and ctx.patternFlags().anyEnabled())
+                    try scanner.redact(ssn_final_emissions.items, ctx.patternFlags(), allocator)
                 else
                     null;
                 defer if (pattern_result) |pr| allocator.free(pr);
@@ -384,8 +354,8 @@ pub fn handleRequest(
                 defer allocator.free(fuzzy_flushed);
                 if (fuzzy_flushed.len > 0) try req_body.writer.writeAll(fuzzy_flushed);
             } else {
-                const pattern_result = if (ssn_final_emissions.items.len > 0 and (ctx.enable_email or ctx.enable_phone or ctx.enable_credit_card or ctx.enable_ip or ctx.enable_healthcare))
-                    try applyPatterns(ssn_final_emissions.items, ctx, allocator)
+                const pattern_result = if (ssn_final_emissions.items.len > 0 and ctx.patternFlags().anyEnabled())
+                    try scanner.redact(ssn_final_emissions.items, ctx.patternFlags(), allocator)
                 else
                     null;
                 defer if (pattern_result) |pr| allocator.free(pr);

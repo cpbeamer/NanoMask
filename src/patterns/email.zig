@@ -77,162 +77,98 @@ fn findEmailBounds(buf: []const u8, at_pos: usize) ?struct { start: usize, end: 
     return .{ .start = local_start, .end = domain_end };
 }
 
-/// Redact all email addresses in the buffer, replacing each with `[EMAIL_REDACTED]`.
-/// Returns an owned slice with redacted content (caller must free).
-pub fn redactEmails(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (input.len < 5) {
-        return try allocator.dupe(u8, input);
-    }
-
-    // First pass: find all email spans so we can emit in one go without
-    // complex rewinding logic.
-    var spans = std.ArrayListUnmanaged(struct { start: usize, end: usize }).empty;
-    defer spans.deinit(allocator);
-
-    var scan: usize = 0;
-    while (scan < input.len) {
-        if (input[scan] == '@') {
-            if (findEmailBounds(input, scan)) |bounds| {
-                try spans.append(allocator, .{ .start = bounds.start, .end = bounds.end });
-                scan = bounds.end;
-                continue;
-            }
-        }
-        scan += 1;
-    }
-
-    // No emails found — return a copy
-    if (spans.items.len == 0) {
-        return try allocator.dupe(u8, input);
-    }
-
-    // Second pass: build result with replacements
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var cursor: usize = 0;
-    for (spans.items) |span| {
-        // Emit text before this email
-        if (span.start > cursor) {
-            try result.appendSlice(allocator, input[cursor..span.start]);
-        }
-        // Emit replacement
-        try result.appendSlice(allocator, replacement);
-        cursor = span.end;
-    }
-    // Emit remaining text
-    if (cursor < input.len) {
-        try result.appendSlice(allocator, input[cursor..]);
-    }
-
-    return try result.toOwnedSlice(allocator);
+/// Single-position match for the unified scanner.
+/// Triggers only when `buf[pos] == '@'`. Returns match bounds including
+/// the local part (which starts before `pos`).
+pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+    if (pos >= buf.len or buf[pos] != '@') return null;
+    const bounds = findEmailBounds(buf, pos) orelse return null;
+    return .{ .start = bounds.start, .end = bounds.end, .redact_start = bounds.start, .replacement = replacement };
 }
 
 // ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
 
-test "email - standard email redaction" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Contact john.doe@hospital.org for details", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Contact [EMAIL_REDACTED] for details", result);
+test "email - standard email" {
+    const input = "Contact john.doe@hospital.org for details";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqualStrings("john.doe@hospital.org", input[m.start..m.end]);
+    try std.testing.expectEqualStrings(replacement, m.replacement);
 }
 
 test "email - plus alias" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Send to user+tag@gmail.com please", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Send to [EMAIL_REDACTED] please", result);
+    const input = "Send to user+tag@gmail.com please";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqualStrings("user+tag@gmail.com", input[m.start..m.end]);
 }
 
 test "email - subdomain" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Email a@b.c.d.com works", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Email [EMAIL_REDACTED] works", result);
+    const input = "Email a@b.c.d.com works";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqualStrings("a@b.c.d.com", input[m.start..m.end]);
 }
 
 test "email - long TLD (.museum)" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Visit admin@gallery.museum now", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Visit [EMAIL_REDACTED] now", result);
+    const input = "Visit admin@gallery.museum now";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqualStrings("admin@gallery.museum", input[m.start..m.end]);
 }
 
 test "email - rejects @mention (no local part)" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Hey @username check this", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Hey @username check this", result);
+    const input = "Hey @username check this";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    try std.testing.expect(tryMatchAt(input, at_pos) == null);
 }
 
 test "email - rejects @@decorator" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Use @@login decorator here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Use @@login decorator here", result);
+    const input = "Use @@login decorator here";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    try std.testing.expect(tryMatchAt(input, at_pos) == null);
 }
 
 test "email - no TLD rejected" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Invalid user@localhost here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Invalid user@localhost here", result);
+    const input = "Invalid user@localhost here";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    try std.testing.expect(tryMatchAt(input, at_pos) == null);
 }
 
 test "email - consecutive dots rejected" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Bad user@bad..domain.com ok", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Bad user@bad..domain.com ok", result);
-}
-
-test "email - multiple emails" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("From alice@example.com to bob@test.org done", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("From [EMAIL_REDACTED] to [EMAIL_REDACTED] done", result);
-}
-
-test "email - no emails unchanged" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("This text has no sensitive data at all.", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("This text has no sensitive data at all.", result);
-}
-
-test "email - empty input" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
+    const input = "Bad user@bad..domain.com ok";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    try std.testing.expect(tryMatchAt(input, at_pos) == null);
 }
 
 test "email - adjacent to punctuation" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("(user@domain.com)", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("([EMAIL_REDACTED])", result);
+    const input = "(user@domain.com)";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqualStrings("user@domain.com", input[m.start..m.end]);
 }
 
 test "email - email at start" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("user@domain.com is here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[EMAIL_REDACTED] is here", result);
+    const input = "user@domain.com is here";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqual(@as(usize, 0), m.start);
+    try std.testing.expectEqualStrings("user@domain.com", input[m.start..m.end]);
 }
 
 test "email - email at end" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Contact user@domain.com", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Contact [EMAIL_REDACTED]", result);
+    const input = "Contact user@domain.com";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqual(input.len, m.end);
+    try std.testing.expectEqualStrings("user@domain.com", input[m.start..m.end]);
 }
 
 test "email - underscore in local part" {
-    const allocator = std.testing.allocator;
-    const result = try redactEmails("Send to first_last@work.co ok", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Send to [EMAIL_REDACTED] ok", result);
+    const input = "Send to first_last@work.co ok";
+    const at_pos = std.mem.indexOfScalar(u8, input, '@').?;
+    const m = tryMatchAt(input, at_pos).?;
+    try std.testing.expectEqualStrings("first_last@work.co", input[m.start..m.end]);
 }

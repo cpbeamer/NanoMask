@@ -124,89 +124,48 @@ fn matchIpv6(buf: []const u8, start: usize) ?usize {
     return pos;
 }
 
-/// Redact all IP addresses in the input, replacing with type-specific tokens.
-/// Returns an owned slice (caller must free).
-pub fn redactIpAddresses(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (input.len < 3) {
-        return try allocator.dupe(u8, input);
+/// Single-position match for the unified scanner.
+/// Tries IPv4 first (digit trigger), then IPv6 (hex digit or `::` trigger).
+/// CIDR suffixes are excluded from the match so they pass through in the output.
+pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+    if (pos >= buf.len) return null;
+    const c = buf[pos];
+
+    // --- IPv4 ---
+    if (std.ascii.isDigit(c)) {
+        const preceded_by_version = pos > 0 and (buf[pos - 1] == 'v' or buf[pos - 1] == 'V');
+        const preceded_by_digit = pos > 0 and std.ascii.isDigit(buf[pos - 1]);
+        const preceded_by_dot = pos > 0 and buf[pos - 1] == '.';
+
+        if (!preceded_by_version and !preceded_by_digit and !preceded_by_dot) {
+            if (matchIpv4(buf, pos)) |end| {
+                const followed_by_alnum = end < buf.len and (std.ascii.isDigit(buf[end]) or buf[end] == '.');
+                if (!followed_by_alnum) {
+                    return .{ .start = pos, .end = end, .redact_start = pos, .replacement = ipv4_replacement };
+                }
+            }
+        }
     }
 
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(allocator);
+    // --- IPv6 ---
+    if (isHexDigit(c) or c == ':') {
+        const is_start_of_ipv6 = (c == ':' and pos + 1 < buf.len and buf[pos + 1] == ':') or
+            (isHexDigit(c) and !std.ascii.isAlphabetic(c));
+        const preceded_by_alnum = pos > 0 and (std.ascii.isAlphanumeric(buf[pos - 1]) or buf[pos - 1] == ':');
 
-    var cursor: usize = 0;
-
-    while (cursor < input.len) {
-        const c = input[cursor];
-
-        // --- IPv4 detection ---
-        if (std.ascii.isDigit(c)) {
-            // Skip if preceded by a version indicator 'v' or 'V'
-            const preceded_by_version = cursor > 0 and (input[cursor - 1] == 'v' or input[cursor - 1] == 'V');
-            // Skip if preceded by another digit (part of a larger number)
-            const preceded_by_digit = cursor > 0 and std.ascii.isDigit(input[cursor - 1]);
-            // Skip if preceded by '.' (we're in the middle of something)
-            const preceded_by_dot = cursor > 0 and input[cursor - 1] == '.';
-
-            if (!preceded_by_version and !preceded_by_digit and !preceded_by_dot) {
-                if (matchIpv4(input, cursor)) |end| {
-                    // Make sure it's not followed by more digits or dots
-                    const followed_by_alnum = end < input.len and (std.ascii.isDigit(input[end]) or input[end] == '.');
-
-                    if (!followed_by_alnum) {
-                        // Handle optional CIDR notation
-                        if (end < input.len and input[end] == '/') {
-                            var cidr_end = end + 1;
-                            while (cidr_end < input.len and std.ascii.isDigit(input[cidr_end])) {
-                                cidr_end += 1;
-                            }
-                            if (cidr_end > end + 1) {
-                                try result.appendSlice(allocator, ipv4_replacement);
-                                // Preserve the CIDR suffix
-                                try result.appendSlice(allocator, input[end..cidr_end]);
-                                cursor = cidr_end;
-                                continue;
-                            }
-                        }
-
-                        try result.appendSlice(allocator, ipv4_replacement);
-                        cursor = end;
-                        continue;
+        if (is_start_of_ipv6 and !preceded_by_alnum) {
+            if (matchIpv6(buf, pos)) |end| {
+                if (end - pos >= 3) {
+                    const followed_by_hex = end < buf.len and (isHexDigit(buf[end]) or buf[end] == ':');
+                    if (!followed_by_hex) {
+                        return .{ .start = pos, .end = end, .redact_start = pos, .replacement = ipv6_replacement };
                     }
                 }
             }
         }
-
-        // --- IPv6 detection ---
-        if (isHexDigit(c) or c == ':') {
-            // Only attempt IPv6 if it looks plausible: hex digit or starts with ::
-            const is_start_of_ipv6 = (c == ':' and cursor + 1 < input.len and input[cursor + 1] == ':') or
-                (isHexDigit(c) and !std.ascii.isAlphabetic(c));
-
-            // Don't try if preceded by alphanumeric (part of a word)
-            const preceded_by_alnum = cursor > 0 and (std.ascii.isAlphanumeric(input[cursor - 1]) or input[cursor - 1] == ':');
-
-            if (is_start_of_ipv6 and !preceded_by_alnum) {
-                if (matchIpv6(input, cursor)) |end| {
-                    // Ensure we found a long enough match (at least "::1" style)
-                    if (end - cursor >= 3) {
-                        // Not followed by hex or colon
-                        const followed_by_hex = end < input.len and (isHexDigit(input[end]) or input[end] == ':');
-                        if (!followed_by_hex) {
-                            try result.appendSlice(allocator, ipv6_replacement);
-                            cursor = end;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        try result.append(allocator, input[cursor]);
-        cursor += 1;
     }
 
-    return try result.toOwnedSlice(allocator);
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,92 +173,73 @@ pub fn redactIpAddresses(input: []const u8, allocator: std.mem.Allocator) ![]u8 
 // ---------------------------------------------------------------------------
 
 test "ipv4 - standard address" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Server at 192.168.1.1 is up", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Server at [IPV4_REDACTED] is up", result);
+    const input = "Server at 192.168.1.1 is up";
+    const start = std.mem.indexOf(u8, input, "192").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("192.168.1.1", input[m.start..m.end]);
+    try std.testing.expectEqualStrings(ipv4_replacement, m.replacement);
 }
 
 test "ipv4 - loopback" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Connect to 127.0.0.1 now", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Connect to [IPV4_REDACTED] now", result);
+    const input = "Connect to 127.0.0.1 now";
+    const start = std.mem.indexOf(u8, input, "127").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("127.0.0.1", input[m.start..m.end]);
 }
 
 test "ipv4 - max values" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("IP 255.255.255.255 broadcast", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("IP [IPV4_REDACTED] broadcast", result);
+    const input = "IP 255.255.255.255 broadcast";
+    const start = std.mem.indexOf(u8, input, "255").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("255.255.255.255", input[m.start..m.end]);
 }
 
 test "ipv4 - rejects version number v1.2.3.4" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Running v1.2.3.4 release", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Running v1.2.3.4 release", result);
+    const input = "Running v1.2.3.4 release";
+    // 'v' precedes the digit, so tryMatchAt at the digit position should reject
+    const start = std.mem.indexOf(u8, input, "1.2.3.4").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "ipv4 - rejects V2.1.0.3 uppercase" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Version V2.1.0.3 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Version V2.1.0.3 here", result);
+    const input = "Version V2.1.0.3 here";
+    const start = std.mem.indexOf(u8, input, "2.1.0.3").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "ipv4 - rejects octet > 255" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Bad 999.999.999.999 data", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Bad 999.999.999.999 data", result);
+    const input = "Bad 999.999.999.999 data";
+    const start = std.mem.indexOf(u8, input, "999").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
-test "ipv4 - CIDR notation preserved" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Subnet 192.168.1.0/24 ok", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Subnet [IPV4_REDACTED]/24 ok", result);
-}
-
-test "ipv4 - multiple addresses" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("From 10.0.0.1 to 10.0.0.2 done", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("From [IPV4_REDACTED] to [IPV4_REDACTED] done", result);
+test "ipv4 - CIDR suffix excluded from match" {
+    const input = "Subnet 192.168.1.0/24 ok";
+    const start = std.mem.indexOf(u8, input, "192").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("192.168.1.0", input[m.start..m.end]);
+    // Verify CIDR suffix is NOT consumed by the match
+    try std.testing.expect(input[m.end] == '/');
 }
 
 test "ipv6 - full address" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Addr [IPV6_REDACTED] here", result);
+    const input = "Addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 here";
+    const start = std.mem.indexOf(u8, input, "2001").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("2001:0db8:85a3:0000:0000:8a2e:0370:7334", input[m.start..m.end]);
+    try std.testing.expectEqualStrings(ipv6_replacement, m.replacement);
 }
 
 test "ipv6 - compressed loopback" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Loopback ::1 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Loopback [IPV6_REDACTED] here", result);
-}
-
-test "ip - no IPs unchanged" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("This text has no IP addresses.", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("This text has no IP addresses.", result);
-}
-
-test "ip - empty input" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
+    const input = "Loopback ::1 here";
+    const start = std.mem.indexOfScalar(u8, input, ':').?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("::1", input[m.start..m.end]);
+    try std.testing.expectEqualStrings(ipv6_replacement, m.replacement);
 }
 
 test "ipv4 - rejects leading zeros" {
-    const allocator = std.testing.allocator;
-    const result = try redactIpAddresses("Bad 192.168.01.1 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Bad 192.168.01.1 here", result);
+    const input = "Bad 192.168.01.1 here";
+    const start = std.mem.indexOf(u8, input, "192").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }

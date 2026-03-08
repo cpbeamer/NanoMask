@@ -102,62 +102,15 @@ fn extractCcCandidate(
     };
 }
 
-/// Redact all credit card numbers in the input, replacing each with `[CC_REDACTED]`.
-/// Returns an owned slice (caller must free).
-pub fn redactCreditCards(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (input.len < 13) {
-        return try allocator.dupe(u8, input);
-    }
-
-    // First pass: find all credit card spans
-    var spans = std.ArrayListUnmanaged(struct { start: usize, end: usize }).empty;
-    defer spans.deinit(allocator);
-
-    var scan: usize = 0;
-    while (scan < input.len) {
-        if (std.ascii.isDigit(input[scan])) {
-            const preceded_by_digit = scan > 0 and std.ascii.isDigit(input[scan - 1]);
-
-            if (!preceded_by_digit) {
-                if (extractCcCandidate(input, scan)) |candidate| {
-                    const digits = candidate.digits[0..candidate.digit_count];
-
-                    // Verify it's not followed by more digits
-                    const followed_by_digit = candidate.end < input.len and std.ascii.isDigit(input[candidate.end]);
-
-                    if (!followed_by_digit and hasKnownPrefix(digits) and luhnValid(digits)) {
-                        try spans.append(allocator, .{ .start = scan, .end = candidate.end });
-                        scan = candidate.end;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        scan += 1;
-    }
-
-    if (spans.items.len == 0) {
-        return try allocator.dupe(u8, input);
-    }
-
-    // Second pass: build result
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var cursor: usize = 0;
-    for (spans.items) |span| {
-        if (span.start > cursor) {
-            try result.appendSlice(allocator, input[cursor..span.start]);
-        }
-        try result.appendSlice(allocator, replacement);
-        cursor = span.end;
-    }
-    if (cursor < input.len) {
-        try result.appendSlice(allocator, input[cursor..]);
-    }
-
-    return try result.toOwnedSlice(allocator);
+/// Single-position match for the unified scanner.
+pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+    if (pos >= buf.len or !std.ascii.isDigit(buf[pos])) return null;
+    if (pos > 0 and std.ascii.isDigit(buf[pos - 1])) return null;
+    const candidate = extractCcCandidate(buf, pos) orelse return null;
+    const digits = candidate.digits[0..candidate.digit_count];
+    if (candidate.end < buf.len and std.ascii.isDigit(buf[candidate.end])) return null;
+    if (!hasKnownPrefix(digits) or !luhnValid(digits)) return null;
+    return .{ .start = pos, .end = candidate.end, .redact_start = pos, .replacement = replacement };
 }
 
 // ---------------------------------------------------------------------------
@@ -165,88 +118,64 @@ pub fn redactCreditCards(input: []const u8, allocator: std.mem.Allocator) ![]u8 
 // ---------------------------------------------------------------------------
 
 test "cc - Visa standard" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 4111111111111111 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 4111111111111111 end";
+    const start = std.mem.indexOf(u8, input, "411").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("4111111111111111", input[m.start..m.end]);
 }
 
 test "cc - Visa dashed" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 4111-1111-1111-1111 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 4111-1111-1111-1111 end";
+    const start = std.mem.indexOf(u8, input, "4111-").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("4111-1111-1111-1111", input[m.start..m.end]);
 }
 
 test "cc - Visa spaced" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 4111 1111 1111 1111 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 4111 1111 1111 1111 end";
+    const start = std.mem.indexOf(u8, input, "4111 ").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("4111 1111 1111 1111", input[m.start..m.end]);
 }
 
 test "cc - Mastercard" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 5500000000000004 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 5500000000000004 end";
+    const start = std.mem.indexOf(u8, input, "550").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("5500000000000004", input[m.start..m.end]);
 }
 
 test "cc - Amex 34" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 340000000000009 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 340000000000009 end";
+    const start = std.mem.indexOf(u8, input, "340").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("340000000000009", input[m.start..m.end]);
 }
 
 test "cc - Amex 37" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 370000000000002 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 370000000000002 end";
+    const start = std.mem.indexOf(u8, input, "370").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("370000000000002", input[m.start..m.end]);
 }
 
 test "cc - Discover" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Card: 6011000000000004 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: [CC_REDACTED] end", result);
+    const input = "Card: 6011000000000004 end";
+    const start = std.mem.indexOf(u8, input, "601").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("6011000000000004", input[m.start..m.end]);
 }
 
 test "cc - fails Luhn (bad checksum)" {
-    const allocator = std.testing.allocator;
-    // 4111111111111112 does NOT pass Luhn
-    const result = try redactCreditCards("Card: 4111111111111112 end", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Card: 4111111111111112 end", result);
+    const input = "Card: 4111111111111112 end";
+    const start = std.mem.indexOf(u8, input, "411").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "cc - too short (12 digits)" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Number 411111111111 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Number 411111111111 here", result);
-}
-
-test "cc - no credit cards unchanged" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("No cards in this text.", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("No cards in this text.", result);
-}
-
-test "cc - empty input" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
-}
-
-test "cc - multiple cards" {
-    const allocator = std.testing.allocator;
-    const result = try redactCreditCards("Visa: 4111111111111111 MC: 5500000000000004", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Visa: [CC_REDACTED] MC: [CC_REDACTED]", result);
+    const input = "Number 411111111111 here";
+    const start = std.mem.indexOf(u8, input, "411").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "cc - Luhn validation correctness" {

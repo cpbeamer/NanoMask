@@ -107,65 +107,18 @@ fn isValidUsPhone(digits: []const u8, count: u8) bool {
     return true;
 }
 
-/// Redact all US phone numbers in the input, replacing each with `[PHONE_REDACTED]`.
-/// Returns an owned slice (caller must free).
-pub fn redactPhones(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (input.len < 10) {
-        return try allocator.dupe(u8, input);
-    }
-
-    // First pass: find all phone spans
-    var spans = std.ArrayListUnmanaged(struct { start: usize, end: usize }).empty;
-    defer spans.deinit(allocator);
-
-    var scan: usize = 0;
-    while (scan < input.len) {
-        const c = input[scan];
-
-        // Potential phone start: digit, '(', or '+'
-        if (std.ascii.isDigit(c) or c == '(' or c == '+') {
-            // Skip if preceded by a digit (part of a longer number)
-            const preceded_by_digit = scan > 0 and std.ascii.isDigit(input[scan - 1]);
-
-            if (!preceded_by_digit) {
-                if (extractPhoneCandidate(input, scan)) |candidate| {
-                    if (isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) {
-                        // Check it's not followed by more digits
-                        const followed_by_digit = candidate.end < input.len and std.ascii.isDigit(input[candidate.end]);
-                        if (!followed_by_digit) {
-                            try spans.append(allocator, .{ .start = candidate.actual_start, .end = candidate.end });
-                            scan = candidate.end;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        scan += 1;
-    }
-
-    if (spans.items.len == 0) {
-        return try allocator.dupe(u8, input);
-    }
-
-    // Second pass: build result with replacements
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var cursor: usize = 0;
-    for (spans.items) |span| {
-        if (span.start > cursor) {
-            try result.appendSlice(allocator, input[cursor..span.start]);
-        }
-        try result.appendSlice(allocator, replacement);
-        cursor = span.end;
-    }
-    if (cursor < input.len) {
-        try result.appendSlice(allocator, input[cursor..]);
-    }
-
-    return try result.toOwnedSlice(allocator);
+/// Single-position match for the unified scanner.
+pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+    if (pos >= buf.len) return null;
+    const c = buf[pos];
+    if (!std.ascii.isDigit(c) and c != '(' and c != '+') return null;
+    // Skip if preceded by a digit (part of a longer number)
+    if (pos > 0 and std.ascii.isDigit(buf[pos - 1])) return null;
+    const candidate = extractPhoneCandidate(buf, pos) orelse return null;
+    if (!isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;
+    // Not followed by more digits
+    if (candidate.end < buf.len and std.ascii.isDigit(buf[candidate.end])) return null;
+    return .{ .start = candidate.actual_start, .end = candidate.end, .redact_start = candidate.actual_start, .replacement = replacement };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,93 +126,69 @@ pub fn redactPhones(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
 // ---------------------------------------------------------------------------
 
 test "phone - parenthesized format" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Call (555) 234-5678 now", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Call [PHONE_REDACTED] now", result);
+    const input = "Call (555) 234-5678 now";
+    const start = std.mem.indexOf(u8, input, "(555)").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("(555) 234-5678", input[m.start..m.end]);
 }
 
 test "phone - dashed format" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Call 555-234-5678 now", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Call [PHONE_REDACTED] now", result);
+    const input = "Call 555-234-5678 now";
+    const start = std.mem.indexOf(u8, input, "555-").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("555-234-5678", input[m.start..m.end]);
 }
 
 test "phone - dotted format" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Call 555.234.5678 now", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Call [PHONE_REDACTED] now", result);
+    const input = "Call 555.234.5678 now";
+    const start = std.mem.indexOf(u8, input, "555.").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("555.234.5678", input[m.start..m.end]);
 }
 
 test "phone - 10 contiguous digits" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Call 5552345678 now", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Call [PHONE_REDACTED] now", result);
+    const input = "Call 5552345678 now";
+    const start = std.mem.indexOf(u8, input, "555").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("5552345678", input[m.start..m.end]);
 }
 
 test "phone - international prefix +1" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Call +1-555-234-5678 today", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Call [PHONE_REDACTED] today", result);
+    const input = "Call +1-555-234-5678 today";
+    const start = std.mem.indexOfScalar(u8, input, '+').?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("+1-555-234-5678", input[m.start..m.end]);
 }
 
 test "phone - domestic prefix 1" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Call 1-555-234-5678 today", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Call [PHONE_REDACTED] today", result);
+    const input = "Call 1-555-234-5678 today";
+    const start = std.mem.indexOf(u8, input, "1-555").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings("1-555-234-5678", input[m.start..m.end]);
 }
 
 test "phone - rejects area code starting with 0" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Number 055-234-5678 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Number 055-234-5678 here", result);
+    const input = "Number 055-234-5678 here";
+    const start = std.mem.indexOf(u8, input, "055").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "phone - rejects area code starting with 1" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Number 155-234-5678 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Number 155-234-5678 here", result);
+    const input = "Number 155-234-5678 here";
+    const start = std.mem.indexOf(u8, input, "155").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "phone - rejects all-same digits" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Number 2222222222 here", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Number 2222222222 here", result);
-}
-
-test "phone - no phones unchanged" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("This text has no phone numbers.", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("This text has no phone numbers.", result);
-}
-
-test "phone - empty input" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("", result);
-}
-
-test "phone - multiple phones" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Home: 555-234-5678, Work: 555-876-5432", allocator);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Home: [PHONE_REDACTED], Work: [PHONE_REDACTED]", result);
+    const input = "Number 2222222222 here";
+    const start = std.mem.indexOf(u8, input, "222").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }
 
 test "phone - embedded in longer digit sequence rejected" {
-    const allocator = std.testing.allocator;
-    const result = try redactPhones("Order 99555234567800 ID", allocator);
-    defer allocator.free(result);
-    // Should not redact — digits are part of a longer number
-    try std.testing.expectEqualStrings("Order 99555234567800 ID", result);
+    const input = "Order 99555234567800 ID";
+    // First digit '9' at position 6 is not preceded by digit, but the full
+    // sequence has 14 digits which fails US phone validation.
+    const start = std.mem.indexOf(u8, input, "99").?;
+    try std.testing.expect(tryMatchAt(input, start) == null);
 }

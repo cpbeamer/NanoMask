@@ -16,6 +16,7 @@ pub const phone = @import("patterns/phone.zig");
 pub const credit_card = @import("patterns/credit_card.zig");
 pub const ip_address = @import("patterns/ip_address.zig");
 pub const healthcare = @import("patterns/healthcare.zig");
+pub const pattern_scanner = @import("patterns/scanner.zig");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -35,4 +36,5 @@ test {
     _ = credit_card;
     _ = ip_address;
     _ = healthcare;
+    _ = pattern_scanner;
 }
