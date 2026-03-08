@@ -167,16 +167,15 @@ pub fn main() !void {
     defer cfg.deinit();
 
     // --- Healthcheck probe mode ---
-    // When --healthcheck is set, act as a client: probe /healthz on localhost
-    // and exit 0 (healthy) or 1 (unhealthy). Used by Docker HEALTHCHECK in
-    // scratch containers that have no curl or wget.
+    // When --healthcheck is set, act as a client: probe /healthz on the
+    // configured listener and exit 0 (healthy) or 1 (unhealthy). Wildcard
+    // listeners map to loopback so container probes still work.
     if (cfg.healthcheck) {
         var client = std.http.Client{ .allocator = allocator };
         defer client.deinit();
 
-        // Build the health check URL targeting the configured listen port.
-        var url_buf: [64]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/healthz", .{cfg.listen_port}) catch {
+        var url_buf: [160]u8 = undefined;
+        const url = cfg.formatHealthcheckUrl(&url_buf) catch {
             std.process.exit(1);
         };
 
@@ -199,8 +198,16 @@ pub fn main() !void {
     };
     defer log.deinit();
 
+    var listen_address_buf: [128]u8 = undefined;
+    const listen_address = cfg.formatListenAddress(&listen_address_buf) catch {
+        std.debug.print("error: failed to format listen address\n", .{});
+        std.process.exit(1);
+    };
+
     log.log(.info, "config_resolved", null, &.{
+        .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
         .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
+        .{ .key = "listen_address", .value = .{ .string = listen_address } },
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
         .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
@@ -341,7 +348,9 @@ pub fn main() !void {
     const upstream_protocol = if (cfg.target_tls) "https" else "http";
     log.log(.info, "server_starting", null, &.{
         .{ .key = "protocol", .value = .{ .string = protocol } },
+        .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
         .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
+        .{ .key = "listen_address", .value = .{ .string = listen_address } },
         .{ .key = "upstream_protocol", .value = .{ .string = upstream_protocol } },
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
@@ -365,10 +374,21 @@ pub fn main() !void {
         }
     }
 
-    var net_server = try std.net.Address.listen(try std.net.Address.parseIp("127.0.0.1", cfg.listen_port), .{
+    const bind_address = std.net.Address.parseIp(cfg.listen_host, cfg.listen_port) catch {
+        std.debug.print("error: invalid listen address '{s}'\n", .{cfg.listen_host});
+        std.process.exit(1);
+    };
+
+    var net_server = try std.net.Address.listen(bind_address, .{
         .reuse_address = true,
     });
     defer net_server.deinit();
+
+    log.log(.info, "server_listening", null, &.{
+        .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
+        .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
+        .{ .key = "listen_address", .value = .{ .string = listen_address } },
+    });
 
     // Shared HTTP client: the stdlib ConnectionPool is thread-safe (uses Mutex).
     // All handler threads share this client, enabling TCP connection reuse with

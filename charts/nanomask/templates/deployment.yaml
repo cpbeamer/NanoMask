@@ -34,6 +34,8 @@ spec:
               containerPort: {{ .Values.proxy.listenPort }}
               protocol: TCP
           env:
+            - name: NANOMASK_LISTEN_HOST
+              value: {{ .Values.proxy.listenHost | quote }}
             - name: NANOMASK_LISTEN_PORT
               value: {{ .Values.proxy.listenPort | quote }}
             - name: NANOMASK_TARGET_HOST

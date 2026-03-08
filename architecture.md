@@ -8,7 +8,7 @@ The Zig Privacy Guard (ZPG) is a high-throughput, low-latency de-identification 
 Rather than relying on third-party frameworks like `zap`, the proxy is built entirely upon the Zig Standard Library's `std.http` module to ensure a zero-dependency footprint and native cross-platform compilation (specifically to support Windows development seamlessly).
 
 ### Core Components
-*   **Listener (`std.net.Server`)**: Binds to `127.0.0.1:8081` with `reuse_address` enabled to handle incoming TCP connections.
+*   **Listener (`std.net.Server`)**: Binds to a configurable listener address with `reuse_address` enabled to handle incoming TCP connections. The default is `127.0.0.1:8081` for sidecar-safe localhost binding, while gateway deployments can use `0.0.0.0:8081`.
 *   **Ingress Server (`std.http.Server`)**: Wraps the incoming connection stream. Utilizes specific `reader.interface()` and `&writer.interface` generic IO wrappers to coerce buffered connection streams into HTTP Server objects.
 *   **Egress Client (`std.http.Client`)**: Manages the outbound connection to the downstream API. Supports both bodiless (`sendBodilessUnflushed`) and body-forwarding (`sendBodyComplete`) modes depending on the request method.
 *   **Thread-Per-Connection Model**: Each accepted connection is dispatched to a dedicated, short-lived thread via `std.Thread.spawn` (not a fixed-size pool). An atomic counter enforces a configurable connection cap. Per-thread HTTP clients are created to avoid shared mutable state; the session-level entity map is passed as read-only context.

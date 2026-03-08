@@ -19,6 +19,10 @@ fullnameOverride: ""
 
 # ── Proxy configuration ──────────────────────────────────────────────
 proxy:
+  # -- Host/IP NanoMask binds to inside the container.
+  # Use 127.0.0.1 for sidecar-only pod traffic, 0.0.0.0 for Service-backed gateway mode,
+  # or :: for dual-stack IPv6 gateway mode.
+  listenHost: 0.0.0.0
   # -- Port NanoMask listens on inside the container.
   listenPort: 8081
   # -- Upstream target hostname.

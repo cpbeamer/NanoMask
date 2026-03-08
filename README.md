@@ -52,6 +52,12 @@ zig build test
 All settings are configurable via CLI flags or environment variables (see [Configuration](#configuration) below):
 
 ```bash
+# Keep the proxy loopback-only for sidecar deployments
+zig build run -- --listen-host 127.0.0.1 --target-host api.openai.com --target-port 443 --target-tls
+
+# Bind on all pod/container interfaces for gateway mode
+zig build run -- --listen-host 0.0.0.0 --target-host api.openai.com --target-port 443 --target-tls
+
 # Forward to an upstream API over HTTPS with entity masking
 zig build run -- --target-host api.openai.com --target-port 443 --target-tls --entity-file entities.txt
 
@@ -101,6 +107,18 @@ Bypass-by-default types:
 Everything else is treated as unsupported. By default, unsupported request bodies are rejected with `415 Unsupported Media Type`, while unsupported upstream responses are bypassed unless a response transform is required. You can override those defaults with `--unsupported-request-body-behavior` / `NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR` and `--unsupported-response-body-behavior` / `NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR`.
 
 NanoMask sends `Accept-Encoding: identity` upstream. If a compressed upstream response still arrives and NanoMask would need to unmask or unhash it, the proxy rejects that response instead of attempting to transform compressed bytes.
+
+### Response Streaming
+
+NanoMask now preserves end-to-end response headers by default and only strips hop-by-hop headers such as `Connection`, `Keep-Alive`, `Transfer-Encoding`, `TE`, `Trailer`, and `Upgrade`.
+
+- `Set-Cookie`, `Cache-Control`, request IDs, rate-limit headers, and vendor metadata are forwarded downstream.
+- `text/event-stream`, `application/x-ndjson`, and chunked upstream responses stay streamed to the client. NanoMask flushes each forwarded chunk so SSE and line-delimited output are not held until the upstream completes.
+- Fixed-length responses that do not require a response transform keep a downstream `Content-Length`.
+- Response unmasking for alias restoration stays incremental when the payload is inline-transformable and identity-encoded.
+- HASH restore (`unhashJson`) still requires full JSON buffering. When that happens the proxy logs `response_mode="buffered"` with `buffer_reason="json_unhash"` so operators can see why streaming was disabled for that response.
+
+The local mock-upstream compliance suite includes streamed SSE and NDJSON flows with inter-chunk delays and asserts that the first downstream chunk arrives before the full upstream response completes. That gives NanoMask a regression check for first-token latency on loopback without relying on an external vendor.
 ## Algorithms
 
 NanoMask runs a **3-stage privacy pipeline** on every request body. Each stage is optimized for a specific class of PII pattern, and they execute in sequence so that later stages only process text not already redacted by earlier ones.
@@ -303,6 +321,7 @@ NanoMask supports a strict configuration precedence:
 
 | Setting | CLI Flag | Environment Variable | Default | Description |
 |---|---|---|---|---|
+| Listen host | `--listen-host` | `NANOMASK_LISTEN_HOST` | `127.0.0.1` | Bind address for the proxy listener; use `0.0.0.0` for gateway mode or `::` for dual-stack IPv6 |
 | Listen port | `--listen-port` | `NANOMASK_LISTEN_PORT` | `8081` | Port the proxy listens on |
 | Target host | `--target-host` | `NANOMASK_TARGET_HOST` | `httpbin.org` | Upstream server hostname |
 | Target port | `--target-port` | `NANOMASK_TARGET_PORT` | `80` | Upstream server port |
@@ -332,7 +351,7 @@ NanoMask supports a strict configuration precedence:
 
 ### Structured Logging
 
-NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
+NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. Response forwarding logs now include `response_mode`, `buffer_reason`, and `flush_per_chunk` so operators can distinguish streamed pass-through traffic from intentionally buffered restore flows. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
 
 ### Health Check
 

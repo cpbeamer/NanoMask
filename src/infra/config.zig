@@ -34,6 +34,8 @@ pub const ConfigSource = enum {
 pub const Config = struct {
     /// Centralised version string — referenced by /healthz and future endpoints.
     pub const version = "0.1.0";
+    listen_host: []const u8 = "127.0.0.1",
+    listen_host_src: ConfigSource = .default,
     listen_port: u16 = 8081,
     listen_port_src: ConfigSource = .default,
     target_host: []const u8 = "httpbin.org",
@@ -98,8 +100,8 @@ pub const Config = struct {
     hash_key_file: ?[]const u8 = null,
     hash_key_file_src: ConfigSource = .default,
 
-    /// When true, perform a health check probe against localhost and exit.
-    /// Used by Docker HEALTHCHECK in scratch containers with no curl/wget.
+    /// When true, perform a health check probe against the listener and exit.
+    /// Wildcard binds probe loopback so container HEALTHCHECK still works.
     healthcheck: bool = false,
 
     allocator: std.mem.Allocator,
@@ -107,6 +109,7 @@ pub const Config = struct {
     pub const ParseError = error{
         HelpRequested,
         MissingValue,
+        InvalidListenHost,
         InvalidPort,
         InvalidThreshold,
         InvalidLogLevel,
@@ -134,6 +137,9 @@ pub const Config = struct {
     };
 
     pub fn deinit(self: *Config) void {
+        if (self.listen_host_src == .env_var) {
+            self.allocator.free(self.listen_host);
+        }
         if (self.target_host_src == .env_var) {
             self.allocator.free(self.target_host);
         }
@@ -169,11 +175,12 @@ pub const Config = struct {
         }
     }
 
-    pub fn printHelp(writer: anytype) !void {
-        try writer.print(
+    pub fn printHelp() void {
+        std.debug.print(
             \\Usage: nanomask [options]
             \\
             \\Options:
+            \\  --listen-host <ip>         Host/IP to bind on (default: 127.0.0.1)
             \\  --listen-port <u16>        Port to listen on (default: 8081)
             \\  --target-host <string>     Upstream target host (default: httpbin.org)
             \\  --target-port <u16>        Upstream target port (default: 80)
@@ -204,14 +211,51 @@ pub const Config = struct {
             \\  --schema-default <action>     Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
             \\  --hash-key <hex>              64-char hex HMAC key for HASH-mode pseudonymization
             \\  --hash-key-file <path>        File containing 64-char hex HMAC key
-            \\  --healthcheck                Probe /healthz on localhost and exit (for Docker HEALTHCHECK)
+            \\  --healthcheck                Probe /healthz on the local listener and exit
             \\  --help                     Print this help message and exit
             \\
         , .{});
     }
 
+    fn needsBracketedHost(host: []const u8) bool {
+        return std.mem.indexOfScalar(u8, host, ':') != null and
+            !(host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']');
+    }
+
+    fn validateListenHostValue(value: []const u8, label: []const u8) ParseError!void {
+        _ = std.net.Address.parseIp(value, 0) catch {
+            std.debug.print("error: {s} must be a valid IPv4 or IPv6 address, got '{s}'\n", .{ label, value });
+            return error.InvalidListenHost;
+        };
+    }
+
+    pub fn healthcheckHost(self: Config) []const u8 {
+        if (std.mem.eql(u8, self.listen_host, "0.0.0.0")) return "127.0.0.1";
+        if (std.mem.eql(u8, self.listen_host, "::")) return "::1";
+        return self.listen_host;
+    }
+
+    pub fn formatListenAddress(self: Config, buffer: []u8) ![]const u8 {
+        if (needsBracketedHost(self.listen_host)) {
+            return std.fmt.bufPrint(buffer, "[{s}]:{d}", .{ self.listen_host, self.listen_port });
+        }
+        return std.fmt.bufPrint(buffer, "{s}:{d}", .{ self.listen_host, self.listen_port });
+    }
+
+    pub fn formatHealthcheckUrl(self: Config, buffer: []u8) ![]const u8 {
+        const host = self.healthcheckHost();
+        if (needsBracketedHost(host)) {
+            return std.fmt.bufPrint(buffer, "http://[{s}]:{d}/healthz", .{ host, self.listen_port });
+        }
+        return std.fmt.bufPrint(buffer, "http://{s}:{d}/healthz", .{ host, self.listen_port });
+    }
+
     fn applyEnvVar(config: *Config, name: []const u8, value: []const u8, allocator: std.mem.Allocator) !void {
-        if (std.mem.eql(u8, name, "NANOMASK_LISTEN_PORT")) {
+        if (std.mem.eql(u8, name, "NANOMASK_LISTEN_HOST")) {
+            try validateListenHostValue(value, "NANOMASK_LISTEN_HOST");
+            config.listen_host = try allocator.dupe(u8, value);
+            config.listen_host_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_LISTEN_PORT")) {
             config.listen_port = std.fmt.parseInt(u16, value, 10) catch {
                 std.debug.print("error: NANOMASK_LISTEN_PORT must be 1-65535, got '{s}'\n", .{value});
                 return error.InvalidPort;
@@ -426,6 +470,7 @@ pub const Config = struct {
         defer env.deinit();
 
         const env_keys = [_][]const u8{
+            "NANOMASK_LISTEN_HOST",
             "NANOMASK_LISTEN_PORT",
             "NANOMASK_TARGET_HOST",
             "NANOMASK_TARGET_PORT",
@@ -470,8 +515,18 @@ pub const Config = struct {
             const arg = args[i];
 
             if (std.mem.eql(u8, arg, "--help")) {
-                std.debug.print("Usage: nanomask [options]\n", .{});
+                printHelp();
                 return error.HelpRequested;
+            } else if (std.mem.eql(u8, arg, "--listen-host")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --listen-host\n", .{});
+                    return error.MissingValue;
+                }
+                try validateListenHostValue(args[i], "--listen-host");
+                if (config.listen_host_src == .env_var) allocator.free(config.listen_host);
+                config.listen_host = args[i];
+                config.listen_host_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--listen-port")) {
                 i += 1;
                 if (i >= args.len) {
@@ -842,6 +897,8 @@ const testing = std.testing;
 test "Config - parse valid arguments" {
     const args = [_][]const u8{
         "nanomask",
+        "--listen-host",
+        "0.0.0.0",
         "--listen-port",
         "9090",
         "--target-host",
@@ -859,6 +916,8 @@ test "Config - parse valid arguments" {
     var config = try Config.parse(std.testing.allocator, &args);
     defer config.deinit();
 
+    try testing.expectEqualStrings("0.0.0.0", config.listen_host);
+    try testing.expectEqual(ConfigSource.cli_flag, config.listen_host_src);
     try testing.expectEqual(@as(u16, 9090), config.listen_port);
     try testing.expectEqualStrings("api.example.com", config.target_host);
     try testing.expectEqual(@as(u16, 443), config.target_port);
@@ -871,11 +930,47 @@ test "Config - parse valid arguments" {
 test "Config - missing value" {
     const args = [_][]const u8{
         "nanomask",
-        "--listen-port",
+        "--listen-host",
     };
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.MissingValue, res);
+}
+
+test "Config - default listen host is sidecar-safe localhost" {
+    const args = [_][]const u8{"nanomask"};
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings("127.0.0.1", cfg.listen_host);
+    try testing.expectEqualStrings("127.0.0.1", cfg.healthcheckHost());
+}
+
+test "Config - gateway listen host is accepted" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--listen-host",
+        "0.0.0.0",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    var address_buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
+    try testing.expectEqualStrings("127.0.0.1", cfg.healthcheckHost());
+    try testing.expectEqualStrings("0.0.0.0:8081", try cfg.formatListenAddress(&address_buf));
+}
+
+test "Config - listen host env var is accepted" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_LISTEN_HOST", "0.0.0.0", std.testing.allocator);
+
+    try testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
+    try testing.expectEqual(ConfigSource.env_var, cfg.listen_host_src);
 }
 
 test "Config - invalid port" {
@@ -887,6 +982,17 @@ test "Config - invalid port" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidPort, res);
+}
+
+test "Config - invalid listen host" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--listen-host",
+        "not-an-ip",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidListenHost, res);
 }
 
 test "Config - out of range fuzzy threshold" {

@@ -21,6 +21,7 @@ Verify the proxy is healthy:
   curl http://$SERVICE_IP:{{ .Values.service.port }}/healthz
 {{- end }}
 
+Listener bind address: {{ .Values.proxy.listenHost }}:{{ .Values.proxy.listenPort }}
 Forwarding traffic to: {{ .Values.proxy.targetHost }}:{{ .Values.proxy.targetPort }}
 {{- if .Values.proxy.targetTls }} (TLS enabled){{ end }}
 

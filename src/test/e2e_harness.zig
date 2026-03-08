@@ -23,6 +23,14 @@ pub const RoundTripResult = struct {
     client_head: []u8,
     /// HTTP status returned to the client.
     status: http.Status,
+    /// Structured proxy logs captured during the request.
+    proxy_logs: []u8,
+    /// Number of response body reads observed by the client.
+    client_chunk_count: usize,
+    /// Time from starting to receive the response to the first body bytes.
+    first_chunk_latency_ns: ?u64,
+    /// Time from starting to receive the response to the end of the body.
+    total_response_latency_ns: u64,
     /// Allocator for freeing results.
     allocator: std.mem.Allocator,
 
@@ -31,6 +39,7 @@ pub const RoundTripResult = struct {
         self.allocator.free(self.upstream_head);
         self.allocator.free(self.client_body);
         self.allocator.free(self.client_head);
+        self.allocator.free(self.proxy_logs);
     }
 };
 
@@ -46,6 +55,10 @@ pub const HarnessConfig = struct {
     request_content_encoding: ?[]const u8 = null,
     /// Response body the mock upstream should return.
     upstream_response: []const u8 = "OK",
+    /// Optional chunked response body fragments from the mock upstream.
+    upstream_stream_chunks: []const []const u8 = &.{},
+    /// Delay between streamed upstream chunks in milliseconds.
+    upstream_inter_chunk_delay_ms: u64 = 0,
     /// Content-Type for the upstream response.
     upstream_content_type: []const u8 = "text/plain",
     /// Additional upstream response headers.
@@ -68,6 +81,19 @@ pub const HarnessConfig = struct {
     request_extra_headers: []const http.Header = &.{},
 };
 
+fn readAvailable(reader: *std.Io.Reader, buffer: []u8) !usize {
+    var targets = [_][]u8{buffer};
+    return reader.readVec(&targets) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => |e| return e,
+    };
+}
+
+fn elapsedSince(start_ns: @TypeOf(std.time.nanoTimestamp())) u64 {
+    const delta = std.time.nanoTimestamp() - start_ns;
+    return if (delta < 0) 0 else @intCast(delta);
+}
+
 /// Send a POST request to `uri` with `payload` using content-length encoding
 /// and return the response status and body.
 fn httpPost(
@@ -76,7 +102,14 @@ fn httpPost(
     payload: []const u8,
     content_type: ?[]const u8,
     extra_headers: []const http.Header,
-) !struct { status: http.Status, body: []u8, head: []u8 } {
+) !struct {
+    status: http.Status,
+    body: []u8,
+    head: []u8,
+    chunk_count: usize,
+    first_chunk_latency_ns: ?u64,
+    total_response_latency_ns: u64,
+} {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
@@ -99,6 +132,7 @@ fn httpPost(
     try req.connection.?.flush();
 
     var redirect_buf: [4096]u8 = undefined;
+    const receive_start = std.time.nanoTimestamp();
     var res = try req.receiveHead(&redirect_buf);
     const status = res.head.status;
     // Capture response head bytes before reader() invalidates them
@@ -109,17 +143,25 @@ fn httpPost(
     var resp_body = std.ArrayListUnmanaged(u8).empty;
     defer resp_body.deinit(allocator);
     var chunk: [4096]u8 = undefined;
+    var chunk_count: usize = 0;
+    var first_chunk_latency_ns: ?u64 = null;
     while (true) {
-        const n = reader.readSliceShort(&chunk) catch break;
+        const n = try readAvailable(reader, &chunk);
         if (n == 0) break;
+        chunk_count += 1;
+        if (first_chunk_latency_ns == null) {
+            first_chunk_latency_ns = elapsedSince(receive_start);
+        }
         try resp_body.appendSlice(allocator, chunk[0..n]);
-        if (n < chunk.len) break;
     }
 
     return .{
         .status = status,
         .body = try allocator.dupe(u8, resp_body.items),
         .head = head_bytes,
+        .chunk_count = chunk_count,
+        .first_chunk_latency_ns = first_chunk_latency_ns,
+        .total_response_latency_ns = elapsedSince(receive_start),
     };
 }
 
@@ -136,6 +178,8 @@ pub fn roundTrip(
         config.upstream_content_type,
         config.upstream_extra_headers,
     );
+    mock.response_stream_chunks = config.upstream_stream_chunks;
+    mock.response_inter_chunk_delay_ms = config.upstream_inter_chunk_delay_ms;
     defer mock.deinit();
     try mock.start();
 
@@ -161,7 +205,10 @@ pub fn roundTrip(
         fuzzy_matcher = try fuzzy_match.FuzzyMatcher.init(allocator, config.entity_names, &.{}, config.fuzzy_threshold);
     }
 
-    var log = try logger_mod.Logger.init(.error_, false, null);
+    var log_capture_buf: [64 * 1024]u8 = undefined;
+    var log_capture = std.io.fixedBufferStream(&log_capture_buf);
+    var log = try logger_mod.Logger.init(.info, false, null);
+    log.test_writer = log_capture.writer().any();
     defer log.deinit();
 
     var upstream_client = std.http.Client{ .allocator = allocator };
@@ -262,6 +309,7 @@ pub fn roundTrip(
     const recorded_head = mock.getRecordedHead() orelse "";
     const upstream_body = try allocator.dupe(u8, recorded_body);
     const upstream_head = try allocator.dupe(u8, recorded_head);
+    const proxy_logs = try allocator.dupe(u8, log_capture.getWritten());
 
     return .{
         .upstream_body = upstream_body,
@@ -269,6 +317,10 @@ pub fn roundTrip(
         .client_body = result.body,
         .client_head = result.head,
         .status = result.status,
+        .proxy_logs = proxy_logs,
+        .client_chunk_count = result.chunk_count,
+        .first_chunk_latency_ns = result.first_chunk_latency_ns,
+        .total_response_latency_ns = result.total_response_latency_ns,
         .allocator = allocator,
     };
 }

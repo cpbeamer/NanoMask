@@ -9,6 +9,8 @@ pub const MockUpstream = struct {
     net_server: std.net.Server,
     port: u16,
     response_body: []const u8,
+    response_stream_chunks: []const []const u8,
+    response_inter_chunk_delay_ms: u64,
     response_content_type: []const u8,
     response_extra_headers: []const http.Header,
     recorded_body: ?[]u8,
@@ -32,6 +34,8 @@ pub const MockUpstream = struct {
             .net_server = server,
             .port = port,
             .response_body = response_body,
+            .response_stream_chunks = &.{},
+            .response_inter_chunk_delay_ms = 0,
             .response_content_type = response_content_type,
             .response_extra_headers = response_extra_headers,
             .recorded_body = null,
@@ -113,10 +117,34 @@ pub const MockUpstream = struct {
         try headers.append(self.allocator, .{ .name = "Content-Type", .value = self.response_content_type });
         try headers.appendSlice(self.allocator, self.response_extra_headers);
 
-        try request.respond(self.response_body, .{
-            .status = .ok,
-            .extra_headers = headers.items,
+        if (self.response_stream_chunks.len == 0) {
+            try request.respond(self.response_body, .{
+                .status = .ok,
+                .extra_headers = headers.items,
+            });
+            return;
+        }
+
+        var resp_buf: [1024]u8 = undefined;
+        var response_writer = try request.respondStreaming(&resp_buf, .{
+            .respond_options = .{
+                .status = .ok,
+                .extra_headers = headers.items,
+            },
         });
+
+        for (self.response_stream_chunks, 0..) |chunk, i| {
+            if (chunk.len > 0) {
+                try response_writer.writer.writeAll(chunk);
+                try response_writer.flush();
+            }
+
+            if (self.response_inter_chunk_delay_ms > 0 and i + 1 < self.response_stream_chunks.len) {
+                std.Thread.sleep(self.response_inter_chunk_delay_ms * std.time.ns_per_ms);
+            }
+        }
+
+        try response_writer.end();
     }
 
     pub fn getRecordedBody(self: *const MockUpstream) ?[]const u8 {

@@ -40,6 +40,8 @@ spec:
           image: nanomask:0.1.0
           # Default payload policy: reject unsupported request bodies, bypass unsupported upstream responses.
           env:
+            - name: NANOMASK_LISTEN_HOST
+              value: "0.0.0.0"
             - name: NANOMASK_LISTEN_PORT
               value: "8081"
             - name: NANOMASK_TARGET_HOST
