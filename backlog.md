@@ -6,7 +6,8 @@
 > - Epic 3 (Configuration) ✅
 > - Epic 4.1 (TLS listener) ✅
 > - Epic 4.2 (Upstream TLS) ✅
-> - Phase 3 Epics 1–2, Phase 4 (remaining), and Phase 5 (Competitive Moat) are open
+> - Epic 8 (JSON Schema-Aware Redaction) ✅
+> - Phase 3 Epics 1–2, Phase 4 (remaining), and Phase 5 (Epics 7, 9) are open
 
 ---
 
@@ -647,7 +648,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 > **In plain English:** Instead of scanning every character of every request, tell the proxy *which JSON fields* are sensitive. It skips the safe fields entirely and instantly redacts the known-sensitive ones — making it 2–5x faster on structured data. This is NanoMask’s key advantage over competitors because Zig’s compile-time code generation produces custom-built redaction functions that no Go/Python tool can match.
 
-#### 8.1 — Schema definition format
+#### ✅ 8.1 — Schema definition format
 
 **Type**: Design / Feature  
 **Estimate**: 1 day  
@@ -685,7 +686,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 8.2 — Comptime schema codegen
+#### ✅ 8.2 — Comptime schema codegen
 
 **Type**: Feature  
 **Estimate**: 3–4 days  
@@ -714,7 +715,7 @@ The core idea is borrowed from the Linux kernel's RCU pattern: readers (request 
 
 ---
 
-#### 8.3 — HASH mode (deterministic pseudonymization)
+#### ✅ 8.3 — HASH mode (deterministic pseudonymization)
 
 **Type**: Feature  
 **Estimate**: 1–2 days  
@@ -831,7 +832,7 @@ Phase 4 (Production Readiness):
 Phase 5 (Competitive Moat):
   Epic 7 (Patterns):  7.1–7.5 (independent, parallelizable)
                        7.6 Custom Patterns (depends on 3.3)
-  Epic 8 (Schema):    8.1 Format ──► 8.2 Codegen ──► 8.3 HASH
+  Epic 8 (Schema):    8.1 Format ✅ ──► 8.2 Codegen ✅ ──► 8.3 HASH ✅
   Epic 9 (E2E):       9.1 Mock Server ──► 9.2 Compliance Suite
                        (9.2 depends on 7.x for full coverage)
 ```
