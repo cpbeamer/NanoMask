@@ -15,8 +15,10 @@ const observability_mod = @import("../infra/observability.zig");
 const Observability = observability_mod.Observability;
 const Route = observability_mod.Route;
 const redaction_audit = @import("../infra/redaction_audit.zig");
+const shutdown_mod = @import("../infra/shutdown.zig");
 const body_policy = @import("body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
+const upstream_client = @import("upstream_client.zig");
 
 // Unified single-pass pattern scanner (Phase 5 / Epic 7)
 const scanner = @import("../patterns/scanner.zig");
@@ -90,6 +92,57 @@ fn sendBodyPolicyResponse(
         },
     ) catch prefix;
     return sendTextResponse(request, status, message);
+}
+
+const RequestOutcome = enum {
+    normal,
+    timed_out,
+    drained_shutdown,
+};
+
+fn requestOutcomeLabel(outcome: RequestOutcome) []const u8 {
+    return switch (outcome) {
+        .normal => "normal",
+        .timed_out => "timed_out",
+        .drained_shutdown => "drained_shutdown",
+    };
+}
+
+fn timeoutPhaseLabel(phase: upstream_client.TimeoutPhase) []const u8 {
+    return switch (phase) {
+        .connect => "connect",
+        .read => "read",
+        .request => "request",
+    };
+}
+
+fn timeoutResponseMessage(phase: upstream_client.TimeoutPhase) []const u8 {
+    return switch (phase) {
+        .connect => "Gateway Timeout: upstream connect timed out\n",
+        .read => "Gateway Timeout: upstream response timed out\n",
+        .request => "Gateway Timeout: upstream request exceeded configured timeout\n",
+    };
+}
+
+fn logUpstreamTimeout(
+    log: *Logger,
+    session_id: []const u8,
+    target_host: []const u8,
+    phase: upstream_client.TimeoutPhase,
+    timeout_ms: u64,
+) void {
+    log.log(.warn, "upstream_timeout", session_id, &.{
+        .{ .key = "phase", .value = .{ .string = timeoutPhaseLabel(phase) } },
+        .{ .key = "timeout_ms", .value = .{ .uint = timeout_ms } },
+        .{ .key = "target_host", .value = .{ .string = target_host } },
+    });
+}
+
+fn sendTimeoutResponse(
+    request: *http.Server.Request,
+    phase: upstream_client.TimeoutPhase,
+) !usize {
+    return sendTextResponse(request, .gateway_timeout, timeoutResponseMessage(phase));
 }
 
 fn identityOnlyAcceptEncoding() @TypeOf(http.Client.Request.default_accept_encoding) {
@@ -244,6 +297,8 @@ pub const ProxyContext = struct {
     // Schema-aware redaction (Epic 8)
     schema: ?*const schema_mod.Schema = null,
     hasher: ?*hasher_mod.Hasher = null,
+    shutdown_state: *const shutdown_mod.ShutdownState,
+    upstream_timeouts: upstream_client.UpstreamTimeouts,
 
     /// Build scanner flags from the proxy context's enable fields.
     pub fn patternFlags(self: ProxyContext) scanner.PatternFlags {
@@ -282,6 +337,8 @@ pub fn handleRequest(
     var response_body_bytes: u64 = 0;
     var upstream_latency_us: u64 = 0;
     var upstream_latency_recorded = false;
+    var request_outcome: RequestOutcome = .normal;
+    var timeout_phase: ?upstream_client.TimeoutPhase = null;
     defer {
         const raw_total_latency = std.time.nanoTimestamp() - request_start;
         const total_latency_us: u64 = if (raw_total_latency < 0)
@@ -298,6 +355,28 @@ pub fn handleRequest(
         if (upstream_latency_recorded) {
             ctx.observability.recordUpstreamLatency(upstream_latency_us);
         }
+
+        const draining = ctx.shutdown_state.isDraining();
+        const effective_outcome: RequestOutcome = if (request_outcome == .normal and draining and route == .proxy)
+            .drained_shutdown
+        else
+            request_outcome;
+
+        var extra_buf: [5]Logger.KV = undefined;
+        var extra_len: usize = 0;
+        extra_buf[extra_len] = .{ .key = "status", .value = .{ .uint = @intFromEnum(response_status) } };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "total_latency_us", .value = .{ .uint = total_latency_us } };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "outcome", .value = .{ .string = requestOutcomeLabel(effective_outcome) } };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "draining", .value = .{ .boolean = draining } };
+        extra_len += 1;
+        if (timeout_phase) |phase| {
+            extra_buf[extra_len] = .{ .key = "timeout_phase", .value = .{ .string = timeoutPhaseLabel(phase) } };
+            extra_len += 1;
+        }
+        log.log(.info, "response_sent", session_id, extra_buf[0..extra_len]);
     }
     const method = request.head.method;
     const uri_str = request.head.target;
@@ -346,15 +425,16 @@ pub fn handleRequest(
         const readiness = ctx.observability.readinessSnapshot();
         const ready = readiness.isReady();
 
-        var json_buf: [512]u8 = undefined;
+        var json_buf: [640]u8 = undefined;
         const body = std.fmt.bufPrint(
             &json_buf,
-            \\{{"status":"{s}","startup":"{s}","entity_reload":"{s}","entity_reload_success_total":{d},"entity_reload_failure_total":{d},"version":"{s}"}}
+            \\{{"status":"{s}","startup":"{s}","entity_reload":"{s}","shutdown":"{s}","entity_reload_success_total":{d},"entity_reload_failure_total":{d},"version":"{s}"}}
         ,
             .{
                 if (ready) "ready" else "not_ready",
                 if (readiness.startup_ready) "ok" else "failed",
                 if (readiness.entity_reload_ready) "ok" else "failed",
+                if (readiness.shutdown_draining) "draining" else "running",
                 readiness.entity_reload_success_total,
                 readiness.entity_reload_failure_total,
                 Config.version,
@@ -484,6 +564,7 @@ pub fn handleRequest(
     const scheme = if (target_tls) "https" else "http";
     const target_url_str = try std.fmt.bufPrint(&url_buf, "{s}://{s}:{d}{s}", .{ scheme, target_host, target_port, uri_str });
     const target_uri = try std.Uri.parse(target_url_str);
+    var upstream_deadline = upstream_client.RequestDeadline.init(ctx.upstream_timeouts);
     const content_type_override: http.Client.Request.Headers.Value = if (request.head.content_type) |ct|
         .{ .override = ct }
     else
@@ -505,15 +586,27 @@ pub fn handleRequest(
         });
     }
 
-    var client_req = client.request(method, target_uri, .{
+    var client_req = upstream_client.requestWithTimeouts(client, method, target_uri, .{
         .headers = .{
             .content_type = content_type_override,
             .user_agent = .omit,
         },
         .extra_headers = request_headers.items,
-    }) catch |e| {
-        log.log(.error_, "upstream_connect_failed", session_id, &.{});
-        return e;
+    }, &upstream_deadline) catch |err| {
+        if (err == error.ConnectionTimedOut) {
+            request_outcome = .timed_out;
+            timeout_phase = .connect;
+            response_status = .gateway_timeout;
+            logUpstreamTimeout(log, session_id, target_host, .connect, ctx.upstream_timeouts.connect_timeout_ms);
+            response_body_bytes = try sendTimeoutResponse(request, .connect);
+            return;
+        }
+
+        log.log(.error_, "upstream_connect_failed", session_id, &.{
+            .{ .key = "error", .value = .{ .string = @errorName(err) } },
+            .{ .key = "target_host", .value = .{ .string = target_host } },
+        });
+        return err;
     };
     defer client_req.deinit();
     // Sets both the accept_encoding bitmask and the header string to identity
@@ -858,8 +951,30 @@ pub fn handleRequest(
             try conn.flush();
         }
     }
+
+    upstream_deadline.ensureWithinOverall() catch {
+        request_outcome = .timed_out;
+        timeout_phase = .request;
+        if (client_req.connection) |conn| conn.closing = true;
+        response_status = .gateway_timeout;
+        logUpstreamTimeout(log, session_id, target_host, .request, ctx.upstream_timeouts.request_timeout_ms);
+        response_body_bytes = try sendTimeoutResponse(request, .request);
+        return;
+    };
+
     // --- Read upstream response ---
     var redirect_buffer: [4096]u8 = undefined;
+    if (client_req.connection) |conn| {
+        upstream_deadline.armReadOperation(conn) catch {
+            request_outcome = .timed_out;
+            timeout_phase = .request;
+            conn.closing = true;
+            response_status = .gateway_timeout;
+            logUpstreamTimeout(log, session_id, target_host, .request, ctx.upstream_timeouts.request_timeout_ms);
+            response_body_bytes = try sendTimeoutResponse(request, .request);
+            return;
+        };
+    }
     var downstream_res = client_req.receiveHead(&redirect_buffer) catch |err| {
         const raw_upstream_latency = std.time.nanoTimestamp() - request_start;
         upstream_latency_us = if (raw_upstream_latency < 0)
@@ -867,6 +982,31 @@ pub fn handleRequest(
         else
             @intCast(@divTrunc(raw_upstream_latency, 1000));
         upstream_latency_recorded = true;
+
+        if (err == error.WouldBlock or err == error.UpstreamRequestTimedOut) {
+            const phase: upstream_client.TimeoutPhase = if (err == error.UpstreamRequestTimedOut)
+                .request
+            else
+                upstream_deadline.readTimeoutPhase();
+            request_outcome = .timed_out;
+            timeout_phase = phase;
+            if (client_req.connection) |conn| conn.closing = true;
+            response_status = .gateway_timeout;
+            logUpstreamTimeout(
+                log,
+                session_id,
+                target_host,
+                phase,
+                switch (phase) {
+                    .connect => ctx.upstream_timeouts.connect_timeout_ms,
+                    .read => ctx.upstream_timeouts.read_timeout_ms,
+                    .request => ctx.upstream_timeouts.request_timeout_ms,
+                },
+            );
+            response_body_bytes = sendTimeoutResponse(request, phase) catch 0;
+            return;
+        }
+
         log.log(.warn, "upstream_response_head_failed", session_id, &.{
             .{ .key = "error", .value = .{ .string = @errorName(err) } },
             .{ .key = "target_host", .value = .{ .string = target_host } },
@@ -980,7 +1120,40 @@ pub fn handleRequest(
 
         var resp_buf: [8192]u8 = undefined;
         while (true) {
-            const bytes_read = try readAvailable(downstream_reader, &resp_buf);
+            if (client_req.connection) |conn| {
+                upstream_deadline.armReadOperation(conn) catch {
+                    request_outcome = .timed_out;
+                    timeout_phase = .request;
+                    conn.closing = true;
+                    response_status = .gateway_timeout;
+                    logUpstreamTimeout(log, session_id, target_host, .request, ctx.upstream_timeouts.request_timeout_ms);
+                    response_body_bytes = try sendTimeoutResponse(request, .request);
+                    return;
+                };
+            }
+
+            const bytes_read = readAvailable(downstream_reader, &resp_buf) catch |err| {
+                if (err == error.WouldBlock or err == error.UpstreamRequestTimedOut) {
+                    const phase: upstream_client.TimeoutPhase = if (err == error.UpstreamRequestTimedOut)
+                        .request
+                    else
+                        upstream_deadline.readTimeoutPhase();
+                    request_outcome = .timed_out;
+                    timeout_phase = phase;
+                    if (client_req.connection) |conn| conn.closing = true;
+                    response_status = .gateway_timeout;
+                    logUpstreamTimeout(
+                        log,
+                        session_id,
+                        target_host,
+                        phase,
+                        if (phase == .read) ctx.upstream_timeouts.read_timeout_ms else ctx.upstream_timeouts.request_timeout_ms,
+                    );
+                    response_body_bytes = try sendTimeoutResponse(request, phase);
+                    return;
+                }
+                return err;
+            };
             if (bytes_read == 0) break;
 
             if (resp_body.items.len + bytes_read > max_body_size) {
@@ -1053,7 +1226,36 @@ pub fn handleRequest(
             if (response_class.policy == .bypass or !should_unmask_response) {
                 var resp_buf: [8192]u8 = undefined;
                 while (true) {
-                    const bytes_read = try readAvailable(downstream_reader, &resp_buf);
+                    if (client_req.connection) |conn| {
+                        upstream_deadline.armReadOperation(conn) catch {
+                            request_outcome = .timed_out;
+                            timeout_phase = .request;
+                            conn.closing = true;
+                            logUpstreamTimeout(log, session_id, target_host, .request, ctx.upstream_timeouts.request_timeout_ms);
+                            return;
+                        };
+                    }
+
+                    const bytes_read = readAvailable(downstream_reader, &resp_buf) catch |err| {
+                        if (err == error.WouldBlock or err == error.UpstreamRequestTimedOut) {
+                            const phase: upstream_client.TimeoutPhase = if (err == error.UpstreamRequestTimedOut)
+                                .request
+                            else
+                                upstream_deadline.readTimeoutPhase();
+                            request_outcome = .timed_out;
+                            timeout_phase = phase;
+                            if (client_req.connection) |conn| conn.closing = true;
+                            logUpstreamTimeout(
+                                log,
+                                session_id,
+                                target_host,
+                                phase,
+                                if (phase == .read) ctx.upstream_timeouts.read_timeout_ms else ctx.upstream_timeouts.request_timeout_ms,
+                            );
+                            return;
+                        }
+                        return err;
+                    };
                     if (bytes_read == 0) break;
                     try response_writer.writer.writeAll(resp_buf[0..bytes_read]);
                     response_body_bytes += bytes_read;
@@ -1065,7 +1267,36 @@ pub fn handleRequest(
 
                 var resp_buf: [8192]u8 = undefined;
                 while (true) {
-                    const bytes_read = try readAvailable(downstream_reader, &resp_buf);
+                    if (client_req.connection) |conn| {
+                        upstream_deadline.armReadOperation(conn) catch {
+                            request_outcome = .timed_out;
+                            timeout_phase = .request;
+                            conn.closing = true;
+                            logUpstreamTimeout(log, session_id, target_host, .request, ctx.upstream_timeouts.request_timeout_ms);
+                            return;
+                        };
+                    }
+
+                    const bytes_read = readAvailable(downstream_reader, &resp_buf) catch |err| {
+                        if (err == error.WouldBlock or err == error.UpstreamRequestTimedOut) {
+                            const phase: upstream_client.TimeoutPhase = if (err == error.UpstreamRequestTimedOut)
+                                .request
+                            else
+                                upstream_deadline.readTimeoutPhase();
+                            request_outcome = .timed_out;
+                            timeout_phase = phase;
+                            if (client_req.connection) |conn| conn.closing = true;
+                            logUpstreamTimeout(
+                                log,
+                                session_id,
+                                target_host,
+                                phase,
+                                if (phase == .read) ctx.upstream_timeouts.read_timeout_ms else ctx.upstream_timeouts.request_timeout_ms,
+                            );
+                            return;
+                        }
+                        return err;
+                    };
                     if (bytes_read == 0) break;
 
                     const unmasked = try active_entity_map.?.unmaskChunked(resp_buf[0..bytes_read], &unmask_state, allocator);
@@ -1090,14 +1321,6 @@ pub fn handleRequest(
         try response_writer.end();
     }
 
-    const raw_total_latency = std.time.nanoTimestamp() - request_start;
-    const total_latency_us: u64 = if (raw_total_latency < 0)
-        0
-    else
-        @intCast(@divTrunc(raw_total_latency, 1000));
-    log.log(.info, "response_sent", session_id, &.{
-        .{ .key = "total_latency_us", .value = .{ .uint = total_latency_us } },
-    });
 }
 
 // ===========================================================================

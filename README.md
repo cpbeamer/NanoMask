@@ -69,6 +69,9 @@ zig build run -- --tls-cert cert.pem --tls-key key.pem --entity-file entities.tx
 
 # Use environment variables (12-factor friendly)
 NANOMASK_TARGET_HOST=api.internal NANOMASK_TARGET_PORT=443 zig build run
+
+# Tune upstream timeouts and graceful shutdown draining
+zig build run -- --target-host api.openai.com --target-port 443 --target-tls --upstream-connect-timeout-ms 3000 --upstream-read-timeout-ms 45000 --upstream-request-timeout-ms 90000 --shutdown-drain-timeout-ms 45000
 ```
 
 Or pass entity names per-request via HTTP header:
@@ -123,6 +126,15 @@ NanoMask now preserves end-to-end response headers by default and only strips ho
 
 The local mock-upstream compliance suite includes streamed SSE and NDJSON flows with inter-chunk delays and asserts that the first downstream chunk arrives before the full upstream response completes. That gives NanoMask a regression check for first-token latency on loopback without relying on an external vendor.
 **Known limitation**: The compatibility matrix currently reports that Anthropic-style SSE streaming is collapsed into a single client chunk. The proxy forwards the data correctly, but incremental per-chunk flushing is not yet verified as arriving in separate reads for the SSE flow. Improving incremental flush fidelity is tracked as part of the NMV2-003 streaming follow-up.
+
+### Graceful Shutdown and Upstream Timeouts
+
+NanoMask now drains cleanly during shutdown and bounds upstream wait time by default.
+
+- On supported signal-handling paths (currently Unix `SIGINT` / `SIGTERM`), NanoMask stops accepting new connections, flips `/readyz` to HTTP 503 with `"shutdown":"draining"`, and waits for in-flight requests to finish for up to `--shutdown-drain-timeout-ms` / `NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS` (default `30000` ms).
+- `--upstream-connect-timeout-ms` bounds TCP connect and TLS establishment, `--upstream-read-timeout-ms` bounds how long NanoMask waits for the next upstream response bytes, and `--upstream-request-timeout-ms` caps the total upstream exchange. Setting any of them to `0` disables that timer.
+- Timeout failures return `504 Gateway Timeout` with a phase-specific message, and `response_sent` logs include `outcome="normal"`, `outcome="timed_out"`, or `outcome="drained_shutdown"`. Timed-out requests also include `timeout_phase` (`connect`, `read`, or `request`).
+- For Kubernetes rollouts, keep the pod `terminationGracePeriodSeconds` longer than the NanoMask drain window so the process can finish active work before the kubelet sends `SIGKILL`.
 
 ## Algorithms
 
@@ -333,6 +345,10 @@ NanoMask supports a strict configuration precedence:
 | Entity file | `--entity-file` | `NANOMASK_ENTITY_FILE` | none | Path to file containing entity aliases |
 | Fuzzy threshold | `--fuzzy-threshold` | `NANOMASK_FUZZY_THRESHOLD`| `0.80` (80%) | Minimum similarity for fuzzy match |
 | Max connections | `--max-connections` | `NANOMASK_MAX_CONNECTIONS`| `128` | Concurrent connection limit |
+| Upstream connect timeout | `--upstream-connect-timeout-ms` | `NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS` | `5000` | TCP connect and TLS establishment timeout in ms; `0` disables it |
+| Upstream read timeout | `--upstream-read-timeout-ms` | `NANOMASK_UPSTREAM_READ_TIMEOUT_MS` | `30000` | Maximum idle wait for the next upstream response bytes in ms; `0` disables it |
+| Upstream request timeout | `--upstream-request-timeout-ms` | `NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS` | `60000` | Overall upstream request deadline in ms, including connect, headers, and body; `0` disables it |
+| Shutdown drain timeout | `--shutdown-drain-timeout-ms` | `NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | Graceful shutdown drain window in ms before NanoMask exits; `0` skips waiting |
 | Log level | `--log-level` | `NANOMASK_LOG_LEVEL` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
 | Watch interval | `--watch-interval` | `NANOMASK_WATCH_INTERVAL` | `1000` | Entity file poll interval in ms |
 | Admin API | `--admin-api` | `NANOMASK_ADMIN_API` | disabled | Enable `/_admin/entities` REST endpoints |
@@ -356,7 +372,7 @@ NanoMask supports a strict configuration precedence:
 
 ### Structured Logging
 
-NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. Response forwarding logs now include `response_mode`, `buffer_reason`, and `flush_per_chunk` so operators can distinguish streamed pass-through traffic from intentionally buffered restore flows. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
+NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. `response_sent` now also records `outcome` and `draining`, and timed-out requests include `timeout_phase` so operators can distinguish normal completion from upstream timeout pressure or graceful-drain completions. Response forwarding logs include `response_mode`, `buffer_reason`, and `flush_per_chunk` so operators can distinguish streamed pass-through traffic from intentionally buffered restore flows. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
 
 When `--audit-log` is enabled, NanoMask emits additional `event="redaction_audit"` lines for every SSN match, exact entity mask, fuzzy entity match, pattern-library match, and schema `REDACT`, `HASH`, or `SCAN` action. Audit events include `stage`, `match_type`, `original_length`, `replacement_type`, and either `offset` or `field_path`; fuzzy events also include `confidence`. Original sensitive values are never written to the audit log.
 
@@ -376,11 +392,13 @@ To keep noisy payloads from overwhelming operators, NanoMask caps audit emission
 {"status":"ok","uptime_s":3600,"connections_active":5,"connections_total":1200,"version":"0.1.0"}
 ```
 
-`GET /readyz` is the readiness endpoint. It returns HTTP 200 while NanoMask is ready to serve traffic and HTTP 503 when startup state or entity hot-reload health is broken.
+`GET /readyz` is the readiness endpoint. It returns HTTP 200 while NanoMask is ready to serve traffic and HTTP 503 when startup state or entity hot-reload health is broken, or while NanoMask is draining during shutdown.
 
 ```json
-{"status":"ready","startup":"ok","entity_reload":"ok","entity_reload_success_total":3,"entity_reload_failure_total":0,"version":"0.1.0"}
+{"status":"ready","startup":"ok","entity_reload":"ok","shutdown":"running","entity_reload_success_total":3,"entity_reload_failure_total":0,"version":"0.1.0"}
 ```
+
+During shutdown drain, the same endpoint returns HTTP 503 with `{"status":"not_ready",...,"shutdown":"draining",...}`.
 
 `GET /metrics` exposes Prometheus text format on the same listener. The built-in series include:
 
@@ -391,6 +409,7 @@ To keep noisy payloads from overwhelming operators, NanoMask caps audit emission
 - request and response bytes processed
 - redaction matches by stage
 - active connections
+- shutdown draining gauge
 - entity reload success and failure totals
 - dropped structured log lines
 

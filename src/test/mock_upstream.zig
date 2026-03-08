@@ -11,12 +11,14 @@ pub const MockUpstream = struct {
     response_body: []const u8,
     response_stream_chunks: []const []const u8,
     response_inter_chunk_delay_ms: u64,
+    response_delay_ms: u64,
     response_content_type: []const u8,
     response_extra_headers: []const http.Header,
     recorded_body: ?[]u8,
     recorded_head: ?[]u8,
     thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
+    request_started: std.atomic.Value(bool),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -36,12 +38,14 @@ pub const MockUpstream = struct {
             .response_body = response_body,
             .response_stream_chunks = &.{},
             .response_inter_chunk_delay_ms = 0,
+            .response_delay_ms = 0,
             .response_content_type = response_content_type,
             .response_extra_headers = response_extra_headers,
             .recorded_body = null,
             .recorded_head = null,
             .thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
+            .request_started = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -88,6 +92,7 @@ pub const MockUpstream = struct {
         var stream_writer = connection.stream.writer(&write_buf);
         var server = http.Server.init(stream_reader.interface(), &stream_writer.interface);
         var request = try server.receiveHead();
+        self.request_started.store(true, .release);
 
         if (self.recorded_head) |old_head| self.allocator.free(old_head);
         self.recorded_head = try self.allocator.dupe(u8, request.head_buffer);
@@ -109,6 +114,10 @@ pub const MockUpstream = struct {
         defer headers.deinit(self.allocator);
         try headers.append(self.allocator, .{ .name = "Content-Type", .value = self.response_content_type });
         try headers.appendSlice(self.allocator, self.response_extra_headers);
+
+        if (self.response_delay_ms > 0) {
+            std.Thread.sleep(self.response_delay_ms * std.time.ns_per_ms);
+        }
 
         if (self.response_stream_chunks.len == 0) {
             try request.respond(self.response_body, .{
@@ -146,6 +155,10 @@ pub const MockUpstream = struct {
 
     pub fn getRecordedHead(self: *const MockUpstream) ?[]const u8 {
         return self.recorded_head;
+    }
+
+    pub fn hasStartedRequest(self: *const MockUpstream) bool {
+        return self.request_started.load(.acquire);
     }
 
     pub fn deinit(self: *MockUpstream) void {

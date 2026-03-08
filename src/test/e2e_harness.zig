@@ -3,12 +3,14 @@ const builtin = @import("builtin");
 const http = std.http;
 const MockUpstream = @import("mock_upstream.zig").MockUpstream;
 const proxy = @import("../net/proxy.zig");
+const proxy_server_mod = @import("../net/proxy_server.zig");
 const body_policy = @import("../net/body_policy.zig");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
 const admin = @import("../admin/admin.zig");
 const logger_mod = @import("../infra/logger.zig");
 const observability_mod = @import("../infra/observability.zig");
+const shutdown_mod = @import("../infra/shutdown.zig");
 const schema_mod = @import("../schema/schema.zig");
 const hasher_mod = @import("../schema/hasher.zig");
 
@@ -64,6 +66,8 @@ pub const HarnessConfig = struct {
     upstream_stream_chunks: []const []const u8 = &.{},
     /// Delay between streamed upstream chunks in milliseconds.
     upstream_inter_chunk_delay_ms: u64 = 0,
+    /// Delay before the mock upstream sends response headers/body.
+    upstream_response_delay_ms: u64 = 0,
     /// Content-Type for the upstream response.
     upstream_content_type: []const u8 = "text/plain",
     /// Additional upstream response headers.
@@ -84,6 +88,12 @@ pub const HarnessConfig = struct {
     unsupported_request_body_behavior: body_policy.UnsupportedBodyBehavior = .reject,
     /// Unsupported response body handling.
     unsupported_response_body_behavior: body_policy.UnsupportedBodyBehavior = .bypass,
+    /// Upstream TCP connect timeout in milliseconds.
+    upstream_connect_timeout_ms: u64 = 5_000,
+    /// Upstream response read timeout in milliseconds.
+    upstream_read_timeout_ms: u64 = 30_000,
+    /// Overall upstream request timeout in milliseconds.
+    upstream_request_timeout_ms: u64 = 60_000,
     /// Additional request headers to send (NMV2-002 header fidelity testing).
     request_extra_headers: []const http.Header = &.{},
 };
@@ -226,6 +236,7 @@ pub fn roundTrip(
     );
     mock.response_stream_chunks = config.upstream_stream_chunks;
     mock.response_inter_chunk_delay_ms = config.upstream_inter_chunk_delay_ms;
+    mock.response_delay_ms = config.upstream_response_delay_ms;
     defer mock.deinit();
     try mock.start();
 
@@ -264,6 +275,7 @@ pub fn roundTrip(
     var connections_total = std.atomic.Value(u64).init(0);
     const start_time = std.time.timestamp();
     var observability = observability_mod.Observability.init(&log, &active_connections);
+    var shutdown_state = shutdown_mod.ShutdownState{};
     observability.markStartupReady();
 
     const proxy_ctx = proxy.ProxyContext{
@@ -292,6 +304,12 @@ pub fn roundTrip(
         .enable_healthcare = config.enable_healthcare,
         .schema = config.schema,
         .hasher = config.hasher,
+        .shutdown_state = &shutdown_state,
+        .upstream_timeouts = .{
+            .connect_timeout_ms = config.upstream_connect_timeout_ms,
+            .read_timeout_ms = config.upstream_read_timeout_ms,
+            .request_timeout_ms = config.upstream_request_timeout_ms,
+        },
     };
 
     const ProxyThread = struct {
@@ -402,4 +420,118 @@ test "harness - invalid request target is rejected before network setup" {
     try std.testing.expectError(error.InvalidRequestTarget, roundTrip(allocator, "{}", .{
         .request_target = "api/data",
     }));
+}
+
+test "harness - graceful shutdown drains active request" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var mock = try MockUpstream.init(allocator, "upstream says hi", "text/plain", &.{});
+    mock.response_delay_ms = 150;
+    defer mock.deinit();
+    try mock.start();
+
+    const proxy_listener = try std.net.Address.listen(
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .reuse_address = true },
+    );
+
+    var log_capture_buf: [64 * 1024]u8 = undefined;
+    var log_capture = std.io.fixedBufferStream(&log_capture_buf);
+    var log = try logger_mod.Logger.init(.info, false, null);
+    log.test_writer = log_capture.writer().any();
+    defer log.deinit();
+
+    var upstream_client_instance = std.http.Client{ .allocator = allocator };
+    defer upstream_client_instance.deinit();
+
+    var active_connections = std.atomic.Value(u32).init(0);
+    var connections_total = std.atomic.Value(u64).init(0);
+    const start_time = std.time.timestamp();
+    var observability = observability_mod.Observability.init(&log, &active_connections);
+    var shutdown_state = shutdown_mod.ShutdownState{};
+    observability.markStartupReady();
+
+    var proxy_server = proxy_server_mod.ProxyServer{
+        .net_server = proxy_listener,
+        .ctx = .{
+            .allocator = allocator,
+            .target_host = "127.0.0.1",
+            .target_port = mock.port,
+            .entity_set = null,
+            .http_client = &upstream_client_instance,
+            .active_connections = &active_connections,
+            .admin_config = .{ .enabled = false, .token = null, .entity_file_sync = false, .entity_file = null, .fuzzy_threshold = 0.0 },
+            .tls_context = null,
+            .target_tls = false,
+            .max_body_size = 1024 * 1024,
+            .log = &log,
+            .observability = &observability,
+            .connections_total = &connections_total,
+            .start_time = start_time,
+            .unsupported_request_body_behavior = .reject,
+            .unsupported_response_body_behavior = .bypass,
+            .enable_email = false,
+            .enable_phone = false,
+            .enable_credit_card = false,
+            .enable_ip = false,
+            .enable_healthcare = false,
+            .schema = null,
+            .hasher = null,
+            .shutdown_state = &shutdown_state,
+            .upstream_timeouts = .{},
+        },
+        .max_connections = 16,
+        .drain_timeout_ms = 1_000,
+        .active_connections = &active_connections,
+        .logger = &log,
+        .observability = &observability,
+        .shutdown_state = &shutdown_state,
+    };
+    defer proxy_server.deinit();
+
+    const ServerThread = struct {
+        fn run(server: *proxy_server_mod.ProxyServer) void {
+            server.serve();
+        }
+    };
+    const ShutdownThread = struct {
+        fn run(server: *proxy_server_mod.ProxyServer, upstream: *MockUpstream) void {
+            while (!upstream.hasStartedRequest()) {
+                std.Thread.sleep(5 * std.time.ns_per_ms);
+            }
+            server.initiateShutdown("test");
+        }
+    };
+
+    const server_thread = try std.Thread.spawn(.{}, ServerThread.run, .{&proxy_server});
+    var server_thread_joined = false;
+    defer if (!server_thread_joined) server_thread.join();
+
+    const shutdown_thread = try std.Thread.spawn(.{}, ShutdownThread.run, .{ &proxy_server, &mock });
+    var shutdown_thread_joined = false;
+    defer if (!shutdown_thread_joined) shutdown_thread.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/shutdown", .{proxy_server.net_server.listen_address.getPort()});
+    const uri = try std.Uri.parse(url);
+
+    const response = try httpRequest(allocator, .POST, uri, "hello", "text/plain", &.{}); 
+    defer allocator.free(response.body);
+    defer allocator.free(response.head);
+
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expectEqualStrings("upstream says hi", response.body);
+
+    server_thread.join();
+    server_thread_joined = true;
+    shutdown_thread.join();
+    shutdown_thread_joined = true;
+
+    try std.testing.expect(std.mem.indexOf(u8, log_capture.getWritten(), "\"msg\":\"shutdown_requested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log_capture.getWritten(), "\"outcome\":\"drained_shutdown\"") != null);
+
+    const second_attempt = httpRequest(allocator, .POST, uri, "again", "text/plain", &.{});
+    try std.testing.expectError(error.ConnectionRefused, second_attempt);
 }

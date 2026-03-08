@@ -278,7 +278,7 @@ Give operators the minimum observability they need to run NanoMask in production
 
 Ops teams will not deploy what they cannot observe. Metrics and correct health checks are mandatory table stakes.
 
-### NMV2-008 - Add Graceful Shutdown, Draining, and Upstream Timeout Controls
+### NMV2-008 - Add Graceful Shutdown, Draining, and Upstream Timeout Controls ✅ COMPLETED
 
 **Priority:** P1  
 **Estimate:** 4 days  

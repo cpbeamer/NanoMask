@@ -586,6 +586,42 @@ test "e2e compliance - NDJSON response streams incrementally" {
     try std.testing.expectEqualStrings("chunked", transfer_encoding);
 }
 
+test "e2e compliance - upstream read timeout returns gateway timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var result = try harness.roundTrip(allocator, "{\"prompt\":\"Hello\"}", .{
+        .upstream_response_delay_ms = 200,
+        .upstream_read_timeout_ms = 50,
+        .upstream_request_timeout_ms = 1_000,
+        .upstream_content_type = "application/json",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(http.Status.gateway_timeout, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "upstream response timed out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"outcome\":\"timed_out\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"timeout_phase\":\"read\"") != null);
+}
+
+test "e2e compliance - overall upstream timeout returns gateway timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var result = try harness.roundTrip(allocator, "{\"prompt\":\"Hello\"}", .{
+        .upstream_response_delay_ms = 150,
+        .upstream_read_timeout_ms = 500,
+        .upstream_request_timeout_ms = 40,
+        .upstream_content_type = "application/json",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(http.Status.gateway_timeout, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.client_body, "upstream request exceeded configured timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"outcome\":\"timed_out\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"timeout_phase\":\"request\"") != null);
+}
+
 test "e2e compliance - readiness endpoint is separate from health" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const proxy = @import("net/proxy.zig");
 const entity_mask = @import("redaction/entity_mask.zig");
 const fuzzy_match = @import("redaction/fuzzy_match.zig");
@@ -18,137 +19,29 @@ const Observability = observability_mod.Observability;
 const schema_mod = @import("schema/schema.zig");
 const hasher_mod = @import("schema/hasher.zig");
 const body_policy = @import("net/body_policy.zig");
+const shutdown_mod = @import("infra/shutdown.zig");
+const proxy_server_mod = @import("net/proxy_server.zig");
+const upstream_client = @import("net/upstream_client.zig");
 
-const ThreadContext = struct {
-    allocator: std.mem.Allocator,
-    target_host: []const u8,
-    target_port: u16,
-    /// RCU-managed entity set — `null` when running in SSN-only mode.
-    /// Handler threads call acquire() at request start and release() when done.
-    entity_set: ?*VersionedEntitySet,
-    /// Shared HTTP client with built-in thread-safe connection pool.
-    /// The stdlib ConnectionPool uses std.Thread.Mutex internally,
-    /// so concurrent acquire/release from handler threads is safe.
-    /// Individual Request objects are per-handler (not thread-safe).
-    http_client: *std.http.Client,
-    active_connections: *std.atomic.Value(u32),
-    admin_config: admin.AdminConfig,
-    /// Optional TLS context — when present, each accepted connection performs
-    /// a TLS 1.3 handshake before HTTP processing.
-    tls_context: ?*tls_mod.TlsContext,
-    /// When true, the proxy uses HTTPS to connect to the upstream target.
-    target_tls: bool,
-    /// Maximum request body size in bytes for the proxy pipeline.
-    max_body_size: usize,
-    /// Structured JSON logger — thread-safe, shared across all handlers.
-    logger: *Logger,
-    observability: *Observability,
-    /// Lifetime connection counter for /healthz endpoint.
-    connections_total: *std.atomic.Value(u64),
-    /// Server start timestamp (epoch seconds) for uptime calculation.
-    start_time: i64,
-    unsupported_request_body_behavior: body_policy.UnsupportedBodyBehavior,
-    unsupported_response_body_behavior: body_policy.UnsupportedBodyBehavior,
-    // Pattern library enable flags (Phase 5 / Epic 7)
-    enable_email: bool,
-    enable_phone: bool,
-    enable_credit_card: bool,
-    enable_ip: bool,
-    enable_healthcare: bool,
-    // Schema-aware redaction (Epic 8)
-    schema: ?*const schema_mod.Schema,
-    hasher: ?*hasher_mod.Hasher,
-};
+var termination_signal_requested = std.atomic.Value(bool).init(false);
 
-fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
-    defer {
-        connection.stream.close();
-        _ = ctx.active_connections.fetchSub(1, .release);
-    }
-
-    // Generate a unique session ID for request correlation in structured logs.
-    var sid_buf: [8]u8 = undefined;
-    const session_id = logger_mod.generateSessionId(&sid_buf);
-
-    // Acquire a snapshot at the start of the request. This is lock-free —
-    // just an atomic load + fetchAdd. The snapshot stays valid for the
-    // entire request even if a hot-reload swaps the active version.
-    const snapshot: ?*EntitySnapshot = if (ctx.entity_set) |es| es.acquire() else null;
-    defer if (snapshot) |snap| {
-        if (ctx.entity_set) |es| es.release(snap);
-    };
-
-    var read_buf: [16 * 1024]u8 = undefined;
-    var write_buf: [16 * 1024]u8 = undefined;
-
-    var stream_reader = connection.stream.reader(&read_buf);
-    var stream_writer = connection.stream.writer(&write_buf);
-
-    // TLS handshake: wrap the raw stream with encrypted reader/writer
-    var tls_stream_buf: [32 * 1024]u8 = undefined;
-    var tls_stream: ?tls_mod.TlsServerStream = null;
-    const raw_reader_iface = stream_reader.interface();
-    const raw_writer_iface = &stream_writer.interface;
-    if (ctx.tls_context) |tls_ctx| {
-        tls_stream = tls_mod.accept(tls_ctx, raw_reader_iface, raw_writer_iface, &tls_stream_buf) catch |err| {
-            ctx.logger.log(.error_, "tls_handshake_failed", session_id, &.{
-                .{ .key = "error", .value = .{ .string = @errorName(err) } },
-            });
-            return;
-        };
-    }
-
-    // Use TLS stream reader/writer if handshake succeeded, otherwise raw stream
-    const final_reader = if (tls_stream) |*ts| ts.reader() else raw_reader_iface;
-    const final_writer = if (tls_stream) |*ts| ts.writer() else raw_writer_iface;
-    var server = std.http.Server.init(final_reader, final_writer);
-
-    var request = server.receiveHead() catch |err| {
-        ctx.logger.log(.error_, "receive_head_failed", session_id, &.{
-            .{ .key = "error", .value = .{ .string = @errorName(err) } },
-        });
-        return;
-    };
-
-    // Extract entity_map and fuzzy_matcher from the snapshot for the proxy
-    const em: ?*const entity_mask.EntityMap = if (snapshot) |s| &s.entity_map else null;
-    const fm: ?*const fuzzy_match.FuzzyMatcher = if (snapshot) |s| &s.fuzzy_matcher else null;
-
-    proxy.handleRequest(
-        &request,
-        .{
-            .allocator = ctx.allocator,
-            .client = ctx.http_client,
-            .target_host = ctx.target_host,
-            .target_port = ctx.target_port,
-            .target_tls = ctx.target_tls,
-            .session_entity_map = em,
-            .session_fuzzy_matcher = fm,
-            .entity_set = ctx.entity_set,
-            .admin_config = ctx.admin_config,
-            .max_body_size = ctx.max_body_size,
-            .log = ctx.logger,
-            .observability = ctx.observability,
-            .session_id = session_id,
-            .active_connections = ctx.active_connections,
-            .connections_total = ctx.connections_total,
-            .start_time = ctx.start_time,
-            .unsupported_request_body_behavior = ctx.unsupported_request_body_behavior,
-            .unsupported_response_body_behavior = ctx.unsupported_response_body_behavior,
-            .enable_email = ctx.enable_email,
-            .enable_phone = ctx.enable_phone,
-            .enable_credit_card = ctx.enable_credit_card,
-            .enable_ip = ctx.enable_ip,
-            .enable_healthcare = ctx.enable_healthcare,
-            .schema = ctx.schema,
-            .hasher = ctx.hasher,
-        },
-    ) catch |err| {
-        ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{
-            .{ .key = "error", .value = .{ .string = @errorName(err) } },
-        });
-    };
+fn handleTerminationSignal(sig: i32) callconv(.c) void {
+    _ = sig;
+    termination_signal_requested.store(true, .release);
 }
+
+fn installTerminationSignalHandlers() void {
+    if (builtin.os.tag == .windows) return;
+
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = handleTerminationSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+}
+
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -220,6 +113,10 @@ pub fn main() !void {
         .{ .key = "listen_address", .value = .{ .string = listen_address } },
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
+        .{ .key = "upstream_connect_timeout_ms", .value = .{ .uint = cfg.upstream_connect_timeout_ms } },
+        .{ .key = "upstream_read_timeout_ms", .value = .{ .uint = cfg.upstream_read_timeout_ms } },
+        .{ .key = "upstream_request_timeout_ms", .value = .{ .uint = cfg.upstream_request_timeout_ms } },
+        .{ .key = "shutdown_drain_timeout_ms", .value = .{ .uint = cfg.shutdown_drain_timeout_ms } },
         .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
         .{ .key = "unsupported_request_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_request_body_behavior) } },
         .{ .key = "unsupported_response_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_response_body_behavior) } },
@@ -367,6 +264,7 @@ pub fn main() !void {
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
         .{ .key = "max_connections", .value = .{ .uint = cfg.max_connections } },
+        .{ .key = "shutdown_drain_timeout_ms", .value = .{ .uint = cfg.shutdown_drain_timeout_ms } },
         .{ .key = "tls_enabled", .value = .{ .boolean = tls_enabled } },
     });
 
@@ -390,17 +288,6 @@ pub fn main() !void {
         std.debug.print("error: invalid listen address '{s}'\n", .{cfg.listen_host});
         std.process.exit(1);
     };
-
-    var net_server = try std.net.Address.listen(bind_address, .{
-        .reuse_address = true,
-    });
-    defer net_server.deinit();
-
-    log.log(.info, "server_listening", null, &.{
-        .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
-        .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
-        .{ .key = "listen_address", .value = .{ .string = listen_address } },
-    });
 
     // Shared HTTP client: the stdlib ConnectionPool is thread-safe (uses Mutex).
     // All handler threads share this client, enabling TCP connection reuse with
@@ -441,10 +328,6 @@ pub fn main() !void {
         // When neither flag is set, the default system CA scan applies.
     }
 
-    // NOTE: Upstream request timeouts are not yet configurable via std.http.Client.
-    // Long-running upstream calls will block the handler thread until completion.
-    // This is a known limitation to address when the stdlib exposes timeout options.
-
     const admin_config = admin.AdminConfig{
         .enabled = cfg.admin_api,
         .token = cfg.admin_token,
@@ -453,58 +336,84 @@ pub fn main() !void {
         .fuzzy_threshold = cfg.fuzzy_threshold,
     };
 
-    const ctx = ThreadContext{
-        .allocator = allocator,
-        .target_host = cfg.target_host,
-        .target_port = cfg.target_port,
-        .entity_set = entity_set,
-        .http_client = &http_client,
-        .active_connections = &active_connections,
-        .admin_config = admin_config,
-        .tls_context = if (tls_context) |*tc| tc else null,
-        .target_tls = cfg.target_tls,
-        .max_body_size = cfg.max_body_size,
-        .logger = &log,
-        .observability = &observability,
-        .connections_total = &connections_total,
-        .start_time = start_time,
-        .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
-        .unsupported_response_body_behavior = cfg.unsupported_response_body_behavior,
-        .enable_email = cfg.enable_email,
-        .enable_phone = cfg.enable_phone,
-        .enable_credit_card = cfg.enable_credit_card,
-        .enable_ip = cfg.enable_ip,
-        .enable_healthcare = cfg.enable_healthcare,
-        .schema = if (schema_instance) |*s| s else null,
-        .hasher = if (hasher_instance) |*h| h else null,
-    };
+    var shutdown_state = shutdown_mod.ShutdownState{};
 
     observability.markStartupReady();
 
-    while (true) {
-        const connection = net_server.accept() catch {
-            log.err("accept_failed", null);
-            continue;
-        };
+    const net_server = try std.net.Address.listen(bind_address, .{
+        .reuse_address = true,
+    });
 
-        _ = connections_total.fetchAdd(1, .monotonic);
+    log.log(.info, "server_listening", null, &.{
+        .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
+        .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
+        .{ .key = "listen_address", .value = .{ .string = listen_address } },
+    });
 
-        // Enforce connection limit to prevent thread exhaustion under load.
-        const current = active_connections.fetchAdd(1, .acquire);
-        if (current >= cfg.max_connections) {
-            log.warn("connection_limit_reached", null);
-            _ = active_connections.fetchSub(1, .release);
-            connection.stream.close();
-            continue;
+    var server = proxy_server_mod.ProxyServer{
+        .net_server = net_server,
+        .ctx = .{
+            .allocator = allocator,
+            .target_host = cfg.target_host,
+            .target_port = cfg.target_port,
+            .entity_set = entity_set,
+            .http_client = &http_client,
+            .active_connections = &active_connections,
+            .admin_config = admin_config,
+            .tls_context = if (tls_context) |*tc| tc else null,
+            .target_tls = cfg.target_tls,
+            .max_body_size = cfg.max_body_size,
+            .logger = &log,
+            .observability = &observability,
+            .connections_total = &connections_total,
+            .start_time = start_time,
+            .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
+            .unsupported_response_body_behavior = cfg.unsupported_response_body_behavior,
+            .enable_email = cfg.enable_email,
+            .enable_phone = cfg.enable_phone,
+            .enable_credit_card = cfg.enable_credit_card,
+            .enable_ip = cfg.enable_ip,
+            .enable_healthcare = cfg.enable_healthcare,
+            .schema = if (schema_instance) |*s| s else null,
+            .hasher = if (hasher_instance) |*h| h else null,
+            .shutdown_state = &shutdown_state,
+            .upstream_timeouts = .{
+                .connect_timeout_ms = cfg.upstream_connect_timeout_ms,
+                .read_timeout_ms = cfg.upstream_read_timeout_ms,
+                .request_timeout_ms = cfg.upstream_request_timeout_ms,
+            },
+        },
+        .max_connections = cfg.max_connections,
+        .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
+        .active_connections = &active_connections,
+        .logger = &log,
+        .observability = &observability,
+        .shutdown_state = &shutdown_state,
+    };
+    defer server.deinit();
+
+    termination_signal_requested.store(false, .release);
+    installTerminationSignalHandlers();
+
+    const ShutdownWatcher = struct {
+        fn run(ps: *proxy_server_mod.ProxyServer) void {
+            if (builtin.os.tag == .windows) return;
+
+            while (!ps.shutdown_state.isRequested()) {
+                if (termination_signal_requested.load(.acquire)) {
+                    ps.initiateShutdown("signal");
+                    return;
+                }
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+            }
         }
+    };
 
-        // Spawn a thread per connection for concurrent request handling.
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ connection, ctx }) catch {
-            log.err("thread_spawn_failed", null);
-            _ = active_connections.fetchSub(1, .release);
-            connection.stream.close();
-            continue;
-        };
-        thread.detach();
-    }
+    const maybe_shutdown_watcher = if (builtin.os.tag == .windows)
+        null
+    else
+        try std.Thread.spawn(.{}, ShutdownWatcher.run, .{&server});
+    defer if (maybe_shutdown_watcher) |signal_watcher| signal_watcher.join();
+
+    server.serve();
 }

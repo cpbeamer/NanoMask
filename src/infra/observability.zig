@@ -40,7 +40,6 @@ const stage_count = std.meta.fields(MatchStage).len;
 const latency_bucket_count = histogram_bounds_us.len + 1;
 
 fn initAtomicArray(comptime N: usize) [N]AtomicU64 {
-    @setEvalBranchQuota(10_000);
     var values: [N]AtomicU64 = undefined;
     for (&values) |*slot| {
         slot.* = AtomicU64.init(0);
@@ -49,7 +48,7 @@ fn initAtomicArray(comptime N: usize) [N]AtomicU64 {
 }
 
 fn initAtomicMatrix(comptime Rows: usize, comptime Cols: usize) [Rows][Cols]AtomicU64 {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(20_000);
     var values: [Rows][Cols]AtomicU64 = undefined;
     for (&values) |*row| {
         row.* = initAtomicArray(Cols);
@@ -103,13 +102,18 @@ fn writeMicrosAsSeconds(writer: anytype, micros: u64) !void {
 pub const ReadinessSnapshot = struct {
     startup_ready: bool,
     entity_reload_ready: bool,
+    shutdown_draining: bool,
     entity_reload_success_total: u64,
     entity_reload_failure_total: u64,
 
     pub fn isReady(self: ReadinessSnapshot) bool {
-        return self.startup_ready and self.entity_reload_ready;
+        return self.startup_ready and self.entity_reload_ready and !self.shutdown_draining;
     }
 };
+
+// HTTP status codes range from 100–599. We offset by 100 so index 0 = status 100.
+const status_array_offset = 100;
+const status_array_len = 500;
 
 pub const Observability = struct {
     logger: *Logger,
@@ -121,7 +125,7 @@ pub const Observability = struct {
     upstream_latency_buckets: [latency_bucket_count]AtomicU64 = initAtomicArray(latency_bucket_count),
     upstream_latency_count: AtomicU64 = AtomicU64.init(0),
     upstream_latency_sum_us: AtomicU64 = AtomicU64.init(0),
-    response_status_counts: [600]AtomicU64 = initAtomicArray(600),
+    response_status_counts: [status_array_len]AtomicU64 = initAtomicArray(status_array_len),
     request_bytes_total: AtomicU64 = AtomicU64.init(0),
     response_bytes_total: AtomicU64 = AtomicU64.init(0),
     redaction_stage_counts: [stage_count]AtomicU64 = initAtomicArray(stage_count),
@@ -129,6 +133,7 @@ pub const Observability = struct {
     entity_reload_failure_total: AtomicU64 = AtomicU64.init(0),
     startup_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     entity_reload_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    shutdown_draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(
         logger: *Logger,
@@ -154,10 +159,15 @@ pub const Observability = struct {
         self.entity_reload_ready.store(false, .release);
     }
 
+    pub fn markShutdownDraining(self: *Observability) void {
+        self.shutdown_draining.store(true, .release);
+    }
+
     pub fn readinessSnapshot(self: *const Observability) ReadinessSnapshot {
         return .{
             .startup_ready = self.startup_ready.load(.acquire),
             .entity_reload_ready = self.entity_reload_ready.load(.acquire),
+            .shutdown_draining = self.shutdown_draining.load(.acquire),
             .entity_reload_success_total = self.entity_reload_success_total.load(.acquire),
             .entity_reload_failure_total = self.entity_reload_failure_total.load(.acquire),
         };
@@ -179,8 +189,8 @@ pub const Observability = struct {
             &self.request_latency_sum_us[route_idx],
             total_latency_us,
         );
-        if (status_code < self.response_status_counts.len) {
-            _ = self.response_status_counts[status_code].fetchAdd(1, .monotonic);
+        if (status_code >= status_array_offset and status_code < status_array_offset + status_array_len) {
+            _ = self.response_status_counts[status_code - status_array_offset].fetchAdd(1, .monotonic);
         }
         _ = self.request_bytes_total.fetchAdd(request_bytes, .monotonic);
         _ = self.response_bytes_total.fetchAdd(response_bytes, .monotonic);
@@ -195,24 +205,9 @@ pub const Observability = struct {
         );
     }
 
-    pub fn recordAuditEvent(self: *Observability, event: Logger.AuditEvent) void {
-        if (std.mem.eql(u8, event.stage, "schema") and std.mem.eql(u8, event.match_type, "schema_keep")) {
-            return;
-        }
-
-        const stage: MatchStage = if (std.mem.eql(u8, event.stage, "entity_mask"))
-            .entity_mask
-        else if (std.mem.eql(u8, event.stage, "ssn"))
-            .ssn
-        else if (std.mem.eql(u8, event.stage, "pattern_library"))
-            .pattern_library
-        else if (std.mem.eql(u8, event.stage, "fuzzy_match"))
-            .fuzzy_match
-        else if (std.mem.eql(u8, event.stage, "schema"))
-            .schema
-        else
-            return;
-
+    /// Record a redaction stage hit. Callers are responsible for filtering
+    /// events that should not be counted (e.g. schema_keep).
+    pub fn recordAuditStage(self: *Observability, stage: MatchStage) void {
         _ = self.redaction_stage_counts[@intFromEnum(stage)].fetchAdd(1, .monotonic);
     }
 
@@ -304,14 +299,14 @@ pub const Observability = struct {
             \\# TYPE nanomask_http_responses_total counter
         );
         var wrote_status_metric = false;
-        for (self.response_status_counts, 0..) |counter, status_code| {
+        for (self.response_status_counts, 0..) |counter, idx| {
             const value = counter.load(.acquire);
             if (value == 0) continue;
             wrote_status_metric = true;
             try std.fmt.format(
                 writer,
                 "nanomask_http_responses_total{{code=\"{d}\"}} {d}\n",
-                .{ status_code, value },
+                .{ idx + status_array_offset, value },
             );
         }
         if (!wrote_status_metric) {
@@ -395,6 +390,15 @@ pub const Observability = struct {
             "nanomask_ready {d}\n",
             .{if (self.readinessSnapshot().isReady()) @as(u8, 1) else @as(u8, 0)},
         );
+        try writer.writeAll(
+            \\# HELP nanomask_shutdown_draining NanoMask shutdown drain state (1 = draining, 0 = running).
+            \\# TYPE nanomask_shutdown_draining gauge
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_shutdown_draining {d}\n",
+            .{if (self.shutdown_draining.load(.acquire)) @as(u8, 1) else @as(u8, 0)},
+        );
 
         return try buf.toOwnedSlice(allocator);
     }
@@ -423,11 +427,17 @@ test "Observability - readiness tracks startup and reload failures" {
     const failed = obs.readinessSnapshot();
     try std.testing.expect(!failed.isReady());
     try std.testing.expectEqual(@as(u64, 1), failed.entity_reload_failure_total);
+    try std.testing.expect(!failed.shutdown_draining);
 
     obs.markEntityReloadSuccess();
     const recovered = obs.readinessSnapshot();
     try std.testing.expect(recovered.isReady());
     try std.testing.expectEqual(@as(u64, 1), recovered.entity_reload_success_total);
+
+    obs.markShutdownDraining();
+    const draining = obs.readinessSnapshot();
+    try std.testing.expect(!draining.isReady());
+    try std.testing.expect(draining.shutdown_draining);
 }
 
 test "Observability - metrics render required series" {
@@ -447,12 +457,7 @@ test "Observability - metrics render required series" {
     obs.recordRequest(.proxy, 200, 12_500, 128, 256);
     obs.recordRequest(.metrics, 200, 800, 0, 512);
     obs.recordUpstreamLatency(7_500);
-    obs.recordAuditEvent(.{
-        .stage = "ssn",
-        .match_type = "ssn",
-        .original_length = 11,
-        .replacement_type = "mask",
-    });
+    obs.recordAuditStage(.ssn);
     obs.markEntityReloadFailure();
 
     const rendered = try obs.renderMetrics(std.testing.allocator);
@@ -469,4 +474,5 @@ test "Observability - metrics render required series" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nanomask_entity_reload_total{result=\"failure\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nanomask_log_dropped_lines_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nanomask_ready 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nanomask_shutdown_draining 0") != null);
 }

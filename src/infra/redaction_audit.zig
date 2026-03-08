@@ -38,7 +38,22 @@ pub const AuditEmitter = struct {
 
     pub fn emit(self: *AuditEmitter, event: Logger.AuditEvent) void {
         if (self.observability) |obs| {
-            obs.recordAuditEvent(event);
+            // Map string stage to enum and filter non-countable events
+            const stage: ?observability_mod.MatchStage = if (std.mem.eql(u8, event.stage, "entity_mask"))
+                .entity_mask
+            else if (std.mem.eql(u8, event.stage, "ssn"))
+                .ssn
+            else if (std.mem.eql(u8, event.stage, "pattern_library"))
+                .pattern_library
+            else if (std.mem.eql(u8, event.stage, "fuzzy_match"))
+                .fuzzy_match
+            else if (std.mem.eql(u8, event.stage, "schema"))
+                // schema_keep actions are informational — don't count as redaction matches
+                if (std.mem.eql(u8, event.match_type, "schema_keep")) null else observability_mod.MatchStage.schema
+            else
+                null;
+
+            if (stage) |s| obs.recordAuditStage(s);
         }
 
         if (!self.log.audit_enabled) return;

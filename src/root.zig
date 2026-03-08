@@ -10,8 +10,11 @@ pub const admin = @import("admin/admin.zig");
 pub const tls_server = @import("crypto/tls.zig");
 pub const logger = @import("infra/logger.zig");
 pub const observability = @import("infra/observability.zig");
+pub const shutdown = @import("infra/shutdown.zig");
 pub const redaction_audit = @import("infra/redaction_audit.zig");
 pub const body_policy = @import("net/body_policy.zig");
+pub const upstream_client = @import("net/upstream_client.zig");
+pub const proxy_server = @import("net/proxy_server.zig");
 
 // Pattern library (Phase 5 / Epic 7)
 pub const email = @import("patterns/email.zig");
@@ -44,8 +47,11 @@ test {
     _ = tls_server;
     _ = logger;
     _ = observability;
+    _ = shutdown;
     _ = body_policy;
     _ = redaction_audit;
+    _ = upstream_client;
+    _ = proxy_server;
     _ = @import("net/http_util.zig");
     // Pattern library
     _ = email;

@@ -70,6 +70,14 @@ pub const Config = struct {
     tls_no_system_ca_src: ConfigSource = .default,
     max_body_size: usize = 10 * 1024 * 1024,
     max_body_size_src: ConfigSource = .default,
+    upstream_connect_timeout_ms: u64 = 5_000,
+    upstream_connect_timeout_ms_src: ConfigSource = .default,
+    upstream_read_timeout_ms: u64 = 30_000,
+    upstream_read_timeout_ms_src: ConfigSource = .default,
+    upstream_request_timeout_ms: u64 = 60_000,
+    upstream_request_timeout_ms_src: ConfigSource = .default,
+    shutdown_drain_timeout_ms: u64 = 30_000,
+    shutdown_drain_timeout_ms_src: ConfigSource = .default,
     log_file: ?[]const u8 = null,
     log_file_src: ConfigSource = .default,
     audit_log: bool = false,
@@ -124,6 +132,7 @@ pub const Config = struct {
         InvalidTargetTlsFlag,
         InvalidNoSystemCaFlag,
         InvalidMaxBodySize,
+        InvalidTimeout,
         MissingAdminToken,
         InvalidAuditLogFlag,
         InvalidUnsupportedBodyBehavior,
@@ -198,6 +207,10 @@ pub const Config = struct {
             \\  --ca-file <path>            Custom CA bundle PEM for upstream TLS verification
             \\  --tls-no-system-ca          Suppress system CA bundle loading (use with --ca-file for self-signed certs)
             \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
+            \\  --upstream-connect-timeout-ms <ms>  Upstream TCP connect timeout in ms (0 disables, default: 5000)
+            \\  --upstream-read-timeout-ms <ms>     Upstream response read timeout in ms (0 disables, default: 30000)
+            \\  --upstream-request-timeout-ms <ms>  Overall upstream request timeout in ms (0 disables, default: 60000)
+            \\  --shutdown-drain-timeout-ms <ms>    Graceful shutdown drain window in ms (0 disables waiting, default: 30000)
             \\  --unsupported-request-body-behavior <mode>  Unsupported request body handling: bypass or reject (default: reject)
             \\  --unsupported-response-body-behavior <mode> Unsupported response body handling: bypass or reject (default: bypass)
             \\  --log-file <path>            Write structured JSON logs to file (default: stderr)
@@ -369,6 +382,18 @@ pub const Config = struct {
             };
             if (config.max_body_size == 0) return error.InvalidMaxBodySize;
             config.max_body_size_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS")) {
+            config.upstream_connect_timeout_ms = try parseTimeoutValue(value, "NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS");
+            config.upstream_connect_timeout_ms_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_UPSTREAM_READ_TIMEOUT_MS")) {
+            config.upstream_read_timeout_ms = try parseTimeoutValue(value, "NANOMASK_UPSTREAM_READ_TIMEOUT_MS");
+            config.upstream_read_timeout_ms_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS")) {
+            config.upstream_request_timeout_ms = try parseTimeoutValue(value, "NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS");
+            config.upstream_request_timeout_ms_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS")) {
+            config.shutdown_drain_timeout_ms = try parseTimeoutValue(value, "NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS");
+            config.shutdown_drain_timeout_ms_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR")) {
             config.unsupported_request_body_behavior = try parseUnsupportedBodyBehaviorValue(value, "NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR");
             config.unsupported_request_body_behavior_src = .env_var;
@@ -462,6 +487,13 @@ pub const Config = struct {
         };
     }
 
+    fn parseTimeoutValue(value: []const u8, label: []const u8) ParseError!u64 {
+        return std.fmt.parseInt(u64, value, 10) catch {
+            std.debug.print("error: {s} must be a non-negative integer in milliseconds, got '{s}'\n", .{ label, value });
+            return error.InvalidTimeout;
+        };
+    }
+
     /// Parses configuration from a slice of argument strings. Errors out via writer if not headless.
     pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Config {
         var config = Config{ .allocator = allocator };
@@ -488,6 +520,10 @@ pub const Config = struct {
             "NANOMASK_CA_FILE",
             "NANOMASK_TLS_NO_SYSTEM_CA",
             "NANOMASK_MAX_BODY_SIZE",
+            "NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS",
+            "NANOMASK_UPSTREAM_READ_TIMEOUT_MS",
+            "NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS",
+            "NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS",
             "NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR",
             "NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR",
             "NANOMASK_LOG_FILE",
@@ -728,6 +764,38 @@ pub const Config = struct {
                     return error.InvalidMaxBodySize;
                 }
                 config.max_body_size_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--upstream-connect-timeout-ms")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --upstream-connect-timeout-ms\n", .{});
+                    return error.MissingValue;
+                }
+                config.upstream_connect_timeout_ms = try parseTimeoutValue(args[i], "--upstream-connect-timeout-ms");
+                config.upstream_connect_timeout_ms_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--upstream-read-timeout-ms")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --upstream-read-timeout-ms\n", .{});
+                    return error.MissingValue;
+                }
+                config.upstream_read_timeout_ms = try parseTimeoutValue(args[i], "--upstream-read-timeout-ms");
+                config.upstream_read_timeout_ms_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--upstream-request-timeout-ms")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --upstream-request-timeout-ms\n", .{});
+                    return error.MissingValue;
+                }
+                config.upstream_request_timeout_ms = try parseTimeoutValue(args[i], "--upstream-request-timeout-ms");
+                config.upstream_request_timeout_ms_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--shutdown-drain-timeout-ms")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --shutdown-drain-timeout-ms\n", .{});
+                    return error.MissingValue;
+                }
+                config.shutdown_drain_timeout_ms = try parseTimeoutValue(args[i], "--shutdown-drain-timeout-ms");
+                config.shutdown_drain_timeout_ms_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--unsupported-request-body-behavior")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1350,6 +1418,43 @@ test "Config - healthcheck flag" {
     defer cfg.deinit();
 
     try testing.expect(cfg.healthcheck);
+}
+
+test "Config - upstream timeout flags" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--upstream-connect-timeout-ms",
+        "1500",
+        "--upstream-read-timeout-ms",
+        "2500",
+        "--upstream-request-timeout-ms",
+        "3500",
+        "--shutdown-drain-timeout-ms",
+        "4500",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(u64, 1500), cfg.upstream_connect_timeout_ms);
+    try testing.expectEqual(@as(u64, 2500), cfg.upstream_read_timeout_ms);
+    try testing.expectEqual(@as(u64, 3500), cfg.upstream_request_timeout_ms);
+    try testing.expectEqual(@as(u64, 4500), cfg.shutdown_drain_timeout_ms);
+}
+
+test "Config - upstream timeout env vars" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS", "1111", std.testing.allocator);
+    try Config.applyEnvVar(&cfg, "NANOMASK_UPSTREAM_READ_TIMEOUT_MS", "2222", std.testing.allocator);
+    try Config.applyEnvVar(&cfg, "NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS", "3333", std.testing.allocator);
+    try Config.applyEnvVar(&cfg, "NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS", "4444", std.testing.allocator);
+
+    try testing.expectEqual(@as(u64, 1111), cfg.upstream_connect_timeout_ms);
+    try testing.expectEqual(@as(u64, 2222), cfg.upstream_read_timeout_ms);
+    try testing.expectEqual(@as(u64, 3333), cfg.upstream_request_timeout_ms);
+    try testing.expectEqual(@as(u64, 4444), cfg.shutdown_drain_timeout_ms);
 }
 
 // --- Epic 8: Schema-aware redaction flag tests ---
