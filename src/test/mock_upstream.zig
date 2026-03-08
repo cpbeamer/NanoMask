@@ -56,6 +56,11 @@ pub const MockUpstream = struct {
         } else |_| {}
     }
 
+    fn flushResponseChunk(writer: *http.BodyWriter) !void {
+        try writer.writer.flush();
+        try writer.flush();
+    }
+
     fn acceptLoop(self: *MockUpstream) void {
         while (!self.should_stop.load(.acquire)) {
             const connection = self.net_server.accept() catch {
@@ -124,7 +129,7 @@ pub const MockUpstream = struct {
         for (self.response_stream_chunks, 0..) |chunk, i| {
             if (chunk.len > 0) {
                 try response_writer.writer.writeAll(chunk);
-                try response_writer.flush();
+                try flushResponseChunk(&response_writer);
             }
 
             if (self.response_inter_chunk_delay_ms > 0 and i + 1 < self.response_stream_chunks.len) {

@@ -595,24 +595,8 @@ fn finalizeStatus(report: *FlowResult) void {
     report.status = if (report.failure_reason == null) .pass else .fail;
 }
 
-fn isKnownAnthropicStreamingLimitation(report: FlowResult) bool {
-    const reason = report.failure_reason orelse return false;
-    return report.flow_id == .anthropic_sse and
-        report.status == .fail and
-        report.checks.request_header_fidelity == .pass and
-        report.checks.body_mutation == .pass and
-        report.checks.response_header_fidelity == .pass and
-        report.checks.path_query_fidelity == .pass and
-        report.checks.streaming == .fail and
-        std.mem.indexOf(u8, reason, "collapsed into") != null;
-}
-
 pub fn hasUnexpectedRegression(report: FlowResult) bool {
-    if (report.status == .pass) return false;
-    return switch (report.flow_id) {
-        .anthropic_sse => !isKnownAnthropicStreamingLimitation(report),
-        else => true,
-    };
+    return report.status == .fail;
 }
 
 pub fn hasUnexpectedRegressions(results: []const FlowResult) bool {
@@ -775,31 +759,7 @@ test "compatibility matrix - LiteLLM-style header flow" {
     try report.expectNoUnexpectedRegression();
 }
 
-test "compatibility matrix - known Anthropic streaming limitation is not a regression" {
-    const allocator = std.testing.allocator;
-    var report = FlowResult{
-        .flow_id = .anthropic_sse,
-        .id = "anthropic_sse",
-        .label = "Anthropic SSE streaming",
-        .vendor = "Anthropic-style",
-        .request_method = "POST",
-        .request_target = "/v1/messages",
-        .checks = .{
-            .request_header_fidelity = .pass,
-            .body_mutation = .pass,
-            .response_header_fidelity = .pass,
-            .streaming = .fail,
-            .path_query_fidelity = .pass,
-        },
-        .status = .fail,
-        .failure_reason = try allocator.dupe(u8, "streaming flow collapsed into 1 client chunk(s)"),
-    };
-    defer report.deinit(allocator);
-
-    try std.testing.expect(!hasUnexpectedRegression(report));
-}
-
-test "compatibility matrix - unexpected Anthropic failure still regresses" {
+test "compatibility matrix - any failed flow is a regression" {
     const allocator = std.testing.allocator;
     var report = FlowResult{
         .flow_id = .anthropic_sse,

@@ -200,6 +200,14 @@ fn readAvailable(reader: *std.Io.Reader, buffer: []u8) !usize {
         else => |e| return e,
     };
 }
+
+fn flushResponseChunk(writer: *http.BodyWriter) !void {
+    // BodyWriter.flush() only flushes the protocol output stream. We also need
+    // to drain the body writer buffer so chunked SSE/NDJSON data is emitted
+    // immediately instead of waiting for end().
+    try writer.writer.flush();
+    try writer.flush();
+}
 /// Bundles all context needed by the proxy pipeline, replacing the previous
 /// 14-parameter function signature for clarity and maintainability.
 pub const ProxyContext = struct {
@@ -881,7 +889,7 @@ pub fn handleRequest(
                     const bytes_read = try readAvailable(downstream_reader, &resp_buf);
                     if (bytes_read == 0) break;
                     try response_writer.writer.writeAll(resp_buf[0..bytes_read]);
-                    if (flush_response_per_chunk) try response_writer.flush();
+                    if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                 }
             } else {
                 var unmask_state = active_entity_map.?.initUnmaskChunkState();
@@ -896,7 +904,7 @@ pub fn handleRequest(
                     defer allocator.free(unmasked);
                     if (unmasked.len > 0) {
                         try response_writer.writer.writeAll(unmasked);
-                        if (flush_response_per_chunk) try response_writer.flush();
+                        if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                     }
                 }
 
@@ -904,7 +912,7 @@ pub fn handleRequest(
                 defer allocator.free(flushed);
                 if (flushed.len > 0) {
                     try response_writer.writer.writeAll(flushed);
-                    if (flush_response_per_chunk) try response_writer.flush();
+                    if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                 }
             }
         }
