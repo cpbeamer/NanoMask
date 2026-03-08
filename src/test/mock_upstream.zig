@@ -58,6 +58,12 @@ pub const MockUpstream = struct {
                 if (self.should_stop.load(.acquire)) return;
                 continue;
             };
+            // Check again after accept — stop() sends a sentinel connection to
+            // unblock the accept() call. Close it immediately and exit.
+            if (self.should_stop.load(.acquire)) {
+                connection.stream.close();
+                return;
+            }
             self.handleOne(connection) catch {};
             return;
         }
