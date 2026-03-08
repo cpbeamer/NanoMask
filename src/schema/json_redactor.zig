@@ -15,16 +15,34 @@ pub const RedactError = error{
 
 /// Context for SCAN-action fields that need the existing 3-stage pipeline.
 /// When null, SCAN fields are treated as KEEP (passed through untouched).
+///
+/// NOTE: This is an internal interface used exclusively by the proxy pipeline
+/// and redaction_audit module. The `scan_fn` signature may change between
+/// releases without external notice.
 pub const ScanContext = struct {
     /// Callback that runs the value through the full redaction pipeline.
+    /// Receives the raw field value, the dotted field path (e.g. "address.street"),
+    /// an opaque context pointer, and the allocator.
     /// Returns an owned slice with redacted content (caller frees).
-    scan_fn: *const fn (input: []const u8, ctx_ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
+    scan_fn: *const fn (input: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
     ctx_ptr: *anyopaque,
 };
 
 /// Hasher interface for HASH-action fields.
 pub const HasherInterface = struct {
     hash_fn: *const fn (original: []const u8, ctx_ptr: *anyopaque) anyerror![]const u8,
+    ctx_ptr: *anyopaque,
+};
+
+pub const AuditEvent = struct {
+    field_path: []const u8,
+    action: SchemaAction,
+    original_length: usize,
+    replacement_type: []const u8,
+};
+
+pub const AuditContext = struct {
+    audit_fn: *const fn (event: AuditEvent, ctx_ptr: *anyopaque) anyerror!void,
     ctx_ptr: *anyopaque,
 };
 
@@ -36,6 +54,17 @@ pub fn redactJson(
     schema: *const Schema,
     hasher: ?HasherInterface,
     scan_ctx: ?ScanContext,
+    allocator: std.mem.Allocator,
+) RedactError![]u8 {
+    return redactJsonWithAudit(input, schema, hasher, scan_ctx, null, allocator);
+}
+
+pub fn redactJsonWithAudit(
+    input: []const u8,
+    schema: *const Schema,
+    hasher: ?HasherInterface,
+    scan_ctx: ?ScanContext,
+    audit_ctx: ?AuditContext,
     allocator: std.mem.Allocator,
 ) RedactError![]u8 {
     if (input.len == 0) {
@@ -64,13 +93,13 @@ pub fn redactJson(
                 i = try skipWhitespace(input, i);
 
                 // Parse object contents
-                i = try parseObject(input, i, schema, hasher, scan_ctx, &result, &key_stack, allocator);
+                i = try parseObject(input, i, schema, hasher, scan_ctx, audit_ctx, &result, &key_stack, allocator);
             },
             '[' => {
                 // Top-level array — copy as-is or handle per-element
                 try result.append(allocator, '[');
                 i += 1;
-                i = try parseArray(input, i, schema, hasher, scan_ctx, &result, &key_stack, allocator);
+                i = try parseArray(input, i, schema, hasher, scan_ctx, audit_ctx, &result, &key_stack, allocator);
             },
             else => {
                 // Non-JSON or whitespace around root element
@@ -253,6 +282,10 @@ fn innerStringContent(raw: []const u8) []const u8 {
     return raw;
 }
 
+fn auditValueLength(raw: []const u8) usize {
+    return if (isStringValue(raw)) innerStringContent(raw).len else raw.len;
+}
+
 /// Parse the interior of a JSON object (after the opening `{`).
 /// Processes key-value pairs and applies schema actions.
 /// Returns index after the closing `}`.
@@ -262,6 +295,7 @@ fn parseObject(
     schema: *const Schema,
     hasher: ?HasherInterface,
     scan_ctx: ?ScanContext,
+    audit_ctx: ?AuditContext,
     result: *std.ArrayListUnmanaged(u8),
     key_stack: *std.ArrayListUnmanaged([]u8),
     allocator: std.mem.Allocator,
@@ -318,7 +352,7 @@ fn parseObject(
             const owned_key = try allocator.dupe(u8, key_name);
             try key_stack.append(allocator, owned_key);
 
-            i = try parseObject(input, i, schema, hasher, scan_ctx, result, key_stack, allocator);
+            i = try parseObject(input, i, schema, hasher, scan_ctx, audit_ctx, result, key_stack, allocator);
 
             // Free the owned key before removing from stack.
             // Using getLast + manual shrink to avoid pop() return type
@@ -339,7 +373,7 @@ fn parseObject(
             try result.append(allocator, '[');
             i += 1;
 
-            i = try parseArray(input, i, schema, hasher, scan_ctx, result, key_stack, allocator);
+            i = try parseArray(input, i, schema, hasher, scan_ctx, audit_ctx, result, key_stack, allocator);
             continue;
         }
 
@@ -358,6 +392,14 @@ fn parseObject(
                 try result.appendSlice(allocator, val_info.raw);
             },
             .redact => {
+                if (audit_ctx) |audit| {
+                    audit.audit_fn(.{
+                        .field_path = full_path,
+                        .action = .redact,
+                        .original_length = auditValueLength(val_info.raw),
+                        .replacement_type = if (isStringValue(val_info.raw)) "redacted" else "null",
+                    }, audit.ctx_ptr) catch return error.ScanFailed;
+                }
                 if (isStringValue(val_info.raw)) {
                     try result.appendSlice(allocator, "\"[REDACTED]\"");
                 } else {
@@ -365,9 +407,17 @@ fn parseObject(
                 }
             },
             .scan => {
+                if (audit_ctx) |audit| {
+                    audit.audit_fn(.{
+                        .field_path = full_path,
+                        .action = .scan,
+                        .original_length = auditValueLength(val_info.raw),
+                        .replacement_type = if (isStringValue(val_info.raw)) "scan_pipeline" else "pass_through",
+                    }, audit.ctx_ptr) catch return error.ScanFailed;
+                }
                 if (isStringValue(val_info.raw) and scan_ctx != null) {
                     const inner = innerStringContent(val_info.raw);
-                    const scanned = scan_ctx.?.scan_fn(inner, scan_ctx.?.ctx_ptr, allocator) catch return error.ScanFailed;
+                    const scanned = scan_ctx.?.scan_fn(inner, full_path, scan_ctx.?.ctx_ptr, allocator) catch return error.ScanFailed;
                     defer allocator.free(scanned);
                     try result.append(allocator, '"');
                     try result.appendSlice(allocator, scanned);
@@ -378,6 +428,14 @@ fn parseObject(
                 }
             },
             .hash => {
+                if (audit_ctx) |audit| {
+                    audit.audit_fn(.{
+                        .field_path = full_path,
+                        .action = .hash,
+                        .original_length = auditValueLength(val_info.raw),
+                        .replacement_type = if (isStringValue(val_info.raw) and hasher != null) "pseudonymized" else if (isStringValue(val_info.raw)) "redacted" else "null",
+                    }, audit.ctx_ptr) catch return error.HashFailed;
+                }
                 if (isStringValue(val_info.raw) and hasher != null) {
                     const inner = innerStringContent(val_info.raw);
                     const hashed = hasher.?.hash_fn(inner, hasher.?.ctx_ptr) catch return error.HashFailed;
@@ -406,6 +464,7 @@ fn parseArray(
     schema: *const Schema,
     hasher: ?HasherInterface,
     scan_ctx: ?ScanContext,
+    audit_ctx: ?AuditContext,
     result: *std.ArrayListUnmanaged(u8),
     key_stack: *std.ArrayListUnmanaged([]u8),
     allocator: std.mem.Allocator,
@@ -434,11 +493,11 @@ fn parseArray(
         if (i < input.len and input[i] == '{') {
             try result.append(allocator, '{');
             i += 1;
-            i = try parseObject(input, i, schema, hasher, scan_ctx, result, key_stack, allocator);
+            i = try parseObject(input, i, schema, hasher, scan_ctx, audit_ctx, result, key_stack, allocator);
         } else if (i < input.len and input[i] == '[') {
             try result.append(allocator, '[');
             i += 1;
-            i = try parseArray(input, i, schema, hasher, scan_ctx, result, key_stack, allocator);
+            i = try parseArray(input, i, schema, hasher, scan_ctx, audit_ctx, result, key_stack, allocator);
         } else {
             // Primitive value in array — pass through
             const val_info = try extractRawValue(input, i);
@@ -630,7 +689,7 @@ test "json_redactor - array of primitives" {
 
 test "json_redactor - SCAN with callback" {
     const ScanTestCtx = struct {
-        fn doScan(input_val: []const u8, _: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        fn doScan(input_val: []const u8, _: []const u8, _: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
             // Simple test: replace "SSN 123-45-6789" with "SSN ***-**-****"
             if (std.mem.indexOf(u8, input_val, "123-45-6789")) |pos| {
                 var buf = try alloc.alloc(u8, input_val.len - 11 + 13);
@@ -702,7 +761,7 @@ test "json_redactor - mixed actions comprehensive" {
 
 test "json_redactor - SCAN callback performs replacement" {
     const ScanUpperCtx = struct {
-        fn doScan(input_val: []const u8, _: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        fn doScan(input_val: []const u8, _: []const u8, _: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
             // Test adapter: uppercase the input to prove the callback ran
             var buf = try alloc.alloc(u8, input_val.len);
             for (input_val, 0..) |c, i| {

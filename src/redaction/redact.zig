@@ -10,6 +10,12 @@ const std = @import("std");
 
 const vector_len = 16;
 const Vector = @Vector(vector_len, u8);
+pub const ssn_replacement = "***-**-****";
+
+pub const SsnMatch = struct {
+    start: usize,
+    end: usize,
+};
 
 /// Produce a bitmask where bit `i` is set if `vec[i] == needle`.
 inline fn dashMask(vec: Vector) u16 {
@@ -18,20 +24,48 @@ inline fn dashMask(vec: Vector) u16 {
     return @bitCast(match_result);
 }
 
-/// Validate and redact a full SSN at `buf[start .. start+11]`.
-/// Returns true (and mutates in-place) if the pattern matches XXX-XX-XXXX.
-inline fn tryRedactAt(buf: []u8, start: usize) bool {
-    if (start + 11 > buf.len) return false;
+inline fn isSsnAt(input: []const u8, start: usize) bool {
+    if (start + 11 > input.len) return false;
 
-    const b = buf[start..][0..11];
+    const b = input[start..][0..11];
 
-    // Dashes at fixed offsets
     if (b[3] != '-' or b[6] != '-') return false;
 
-    // All other positions must be ASCII digits
     inline for ([_]usize{ 0, 1, 2, 4, 5, 7, 8, 9, 10 }) |off| {
         if (!std.ascii.isDigit(b[off])) return false;
     }
+
+    return true;
+}
+
+pub fn collectSsnMatches(input: []const u8, allocator: std.mem.Allocator) ![]SsnMatch {
+    if (input.len < 11) return try allocator.alloc(SsnMatch, 0);
+
+    var matches: std.ArrayListUnmanaged(SsnMatch) = .empty;
+    errdefer matches.deinit(allocator);
+
+    var i: usize = 0;
+    while (i + 11 <= input.len) {
+        if (isSsnAt(input, i)) {
+            try matches.append(allocator, .{
+                .start = i,
+                .end = i + 11,
+            });
+            i += 11;
+        } else {
+            i += 1;
+        }
+    }
+
+    return try matches.toOwnedSlice(allocator);
+}
+
+/// Validate and redact a full SSN at `buf[start .. start+11]`.
+/// Returns true (and mutates in-place) if the pattern matches XXX-XX-XXXX.
+inline fn tryRedactAt(buf: []u8, start: usize) bool {
+    if (!isSsnAt(buf, start)) return false;
+
+    const b = buf[start..][0..11];
 
     // Pattern confirmed — redact digits in-place
     inline for ([_]usize{ 0, 1, 2, 4, 5, 7, 8, 9, 10 }) |off| {
@@ -400,6 +434,18 @@ test "redactSsnChunked - equivalence vs single-pass on 1 MB payload" {
     defer allocator.free(chunked_result);
 
     try std.testing.expectEqualStrings(single_buf, chunked_result);
+}
+
+test "collectSsnMatches - captures all SSN spans" {
+    const allocator = std.testing.allocator;
+    const matches = try collectSsnMatches("alpha 123-45-6789 beta 987-65-4321", allocator);
+    defer allocator.free(matches);
+
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(@as(usize, 6), matches[0].start);
+    try std.testing.expectEqual(@as(usize, 17), matches[0].end);
+    try std.testing.expectEqual(@as(usize, 23), matches[1].start);
+    try std.testing.expectEqual(@as(usize, 34), matches[1].end);
 }
 
 // ---------------------------------------------------------------------------

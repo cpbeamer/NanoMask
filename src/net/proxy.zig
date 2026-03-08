@@ -11,6 +11,7 @@ const config_mod = @import("../infra/config.zig");
 const Config = config_mod.Config;
 const logger_mod = @import("../infra/logger.zig");
 const Logger = logger_mod.Logger;
+const redaction_audit = @import("../infra/redaction_audit.zig");
 const body_policy = @import("body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
 
@@ -28,6 +29,10 @@ const max_url_len = 2048;
 /// Maximum number of entities accepted via the X-ZPG-Entities header.
 /// Prevents Aho-Corasick construction DoS from oversized entity lists.
 const max_header_entities: usize = 100;
+
+/// Maximum bytes accumulated for audit on chunked (streamed) requests.
+/// Prevents unbounded memory growth when audit logging is enabled.
+const max_audit_body_size: usize = 1024 * 1024; // 1 MB
 
 /// Find a custom header value by name (case-insensitive).
 /// Delegates to the shared http_util implementation.
@@ -488,49 +493,118 @@ pub fn handleRequest(
                         .ctx_ptr = @ptrCast(@alignCast(h)),
                     } else null;
 
+                    // --- Inline audit: emit events during the primary redaction pass
+                    //     instead of re-running the pipeline afterwards (see observation #1).
+                    var emitter: ?redaction_audit.AuditEmitter = if (log.audit_enabled)
+                        redaction_audit.AuditEmitter.init(log, session_id)
+                    else
+                        null;
+                    defer if (emitter) |*e| e.finish();
+
+                    // Emit entity-mask audit events before schema processing
+                    if (emitter != null) {
+                        if (active_entity_map) |em| {
+                            try redaction_audit.emitEntityMaskAuditEvents(
+                                em,
+                                full_body.items,
+                                &emitter.?,
+                                allocator,
+                            );
+                        }
+                    }
+
                     // Build ScanContext to run SCAN-action values through the
-                    // full SSN + pattern + fuzzy redaction pipeline. This adapter
-                    // runs the same redaction stages as the chunked pipeline, but
-                    // on individual field values extracted by the JSON redactor.
-                    const ScanAdapter = struct {
-                        fn doScan(input_val: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
-                            const proxy_ctx: *const ProxyContext = @ptrCast(@alignCast(ctx_ptr));
+                    // full SSN + pattern + fuzzy redaction pipeline with inline
+                    // audit event emission.
+                    const ScanAuditState = struct {
+                        const Self = @This();
 
-                            // Stage 1: SSN redaction (in-place on a mutable copy)
-                            var current = try alloc.dupe(u8, input_val);
+                        proxy_ctx: *const ProxyContext,
+                        emitter: ?*redaction_audit.AuditEmitter,
 
-                            redact.redactSsn(current);
+                        fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+                            const self: *Self = @ptrCast(@alignCast(ctx_ptr));
 
-                            // Stage 2: Pattern library scan
-                            const pflags = proxy_ctx.patternFlags();
-                            if (pflags.anyEnabled()) {
-                                const scanned = try scanner.redact(current, pflags, alloc);
-                                alloc.free(current);
-                                current = scanned;
+                            if (self.emitter) |audit_emitter| {
+                                // Audit-aware path: emit text-stage audit events per-field
+                                return redaction_audit.runTextStages(
+                                    input_val,
+                                    field_path,
+                                    .{
+                                        .ssn = true,
+                                        .patterns = true,
+                                        .fuzzy = true,
+                                    },
+                                    self.proxy_ctx.session_entity_map,
+                                    self.proxy_ctx.session_fuzzy_matcher,
+                                    self.proxy_ctx.patternFlags(),
+                                    audit_emitter,
+                                    alloc,
+                                );
+                            } else {
+                                // Non-audit fast path: direct redaction
+                                var current = try alloc.dupe(u8, input_val);
+
+                                redact.redactSsn(current);
+
+                                const pflags = self.proxy_ctx.patternFlags();
+                                if (pflags.anyEnabled()) {
+                                    const scanned = try scanner.redact(current, pflags, alloc);
+                                    alloc.free(current);
+                                    current = scanned;
+                                }
+
+                                if (self.proxy_ctx.session_fuzzy_matcher) |fm| {
+                                    const em_aliases = if (self.proxy_ctx.session_entity_map) |em| em.getAliases() else &.{};
+                                    const fuzzed = try fm.fuzzyRedact(current, em_aliases, &.{}, alloc);
+                                    alloc.free(current);
+                                    current = fuzzed;
+                                }
+
+                                return current;
                             }
+                        }
 
-                            // Stage 3: Fuzzy entity matching
-                            if (proxy_ctx.session_fuzzy_matcher) |fm| {
-                                const em_aliases = if (proxy_ctx.session_entity_map) |em| em.getAliases() else &.{};
-                                const fuzzed = try fm.fuzzyRedact(current, em_aliases, &.{}, alloc);
-                                alloc.free(current);
-                                current = fuzzed;
+                        fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
+                            const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+                            if (self.emitter) |audit_emitter| {
+                                audit_emitter.emit(.{
+                                    .stage = "schema",
+                                    .match_type = switch (event.action) {
+                                        .redact => "schema_redact",
+                                        .hash => "schema_hash",
+                                        .scan => "schema_scan",
+                                        .keep => "schema_keep",
+                                    },
+                                    .field_path = event.field_path,
+                                    .original_length = event.original_length,
+                                    .replacement_type = event.replacement_type,
+                                });
                             }
-
-                            return current;
                         }
                     };
 
-                    const scan_ctx_iface: ?json_redactor.ScanContext = .{
-                        .scan_fn = &ScanAdapter.doScan,
-                        .ctx_ptr = @ptrCast(@constCast(&ctx)),
+                    var scan_audit_state = ScanAuditState{
+                        .proxy_ctx = &ctx,
+                        .emitter = if (emitter != null) &emitter.? else null,
                     };
 
-                    const redacted = try json_redactor.redactJson(
+                    const scan_ctx_iface: ?json_redactor.ScanContext = .{
+                        .scan_fn = &ScanAuditState.doScan,
+                        .ctx_ptr = @ptrCast(&scan_audit_state),
+                    };
+
+                    const audit_ctx: ?json_redactor.AuditContext = if (emitter != null) .{
+                        .audit_fn = &ScanAuditState.onSchemaAction,
+                        .ctx_ptr = @ptrCast(&scan_audit_state),
+                    } else null;
+
+                    const redacted = try json_redactor.redactJsonWithAudit(
                         masked_body,
                         active_schema,
                         hasher_iface,
                         scan_ctx_iface,
+                        audit_ctx,
                         allocator,
                     );
                     defer allocator.free(redacted);
@@ -563,6 +637,8 @@ pub fn handleRequest(
 
                 var body_read_buf: [8192]u8 = undefined;
                 var bytes_forwarded: usize = 0;
+                var audit_body: ?std.ArrayListUnmanaged(u8) = if (log.audit_enabled) .empty else null;
+                defer if (audit_body) |*buf| buf.deinit(allocator);
                 if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
                     var raw_chunk_buf: [8192]u8 = undefined;
                     while (true) {
@@ -578,6 +654,12 @@ pub fn handleRequest(
                         }
 
                         const raw_chunk = raw_chunk_buf[0..bytes_read];
+                        if (audit_body) |*buf| {
+                            // Cap audit accumulation to avoid unbounded memory growth
+                            if (buf.items.len + raw_chunk.len <= max_audit_body_size) {
+                                try buf.appendSlice(allocator, raw_chunk);
+                            }
+                        }
 
                         var masked_chunk: []u8 = undefined;
                         var masked_allocated = false;
@@ -694,6 +776,20 @@ pub fn handleRequest(
                     log.log(.warn, "body_read_failed", session_id, &.{
                         .{ .key = "error", .value = .{ .string = @errorName(err) } },
                     });
+                }
+
+                if (audit_body) |buf| {
+                    try redaction_audit.emitRequestAuditEvents(
+                        allocator,
+                        log,
+                        session_id,
+                        buf.items,
+                        active_entity_map,
+                        session_fuzzy_matcher,
+                        ctx.patternFlags(),
+                        null,
+                        null,
+                    );
                 }
 
                 try req_body.end();

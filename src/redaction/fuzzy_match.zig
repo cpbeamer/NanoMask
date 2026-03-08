@@ -24,6 +24,7 @@ const FuzzyMatch = struct {
     start: usize,
     end: usize, // exclusive
     variant_owner: usize, // index of the entity that owns this variant
+    confidence: f64,
 };
 
 // ---------------------------------------------------------------------------
@@ -316,6 +317,23 @@ fn splitName(name: []const u8) ?struct { first: []const u8, last: []const u8 } {
     return null;
 }
 
+pub const AuditMatch = struct {
+    start: usize,
+    end: usize,
+    variant_owner: usize,
+    confidence: f64,
+};
+
+pub const RedactResult = struct {
+    output: []u8,
+    matches: []AuditMatch,
+
+    pub fn deinit(self: *RedactResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.output);
+        allocator.free(self.matches);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // FuzzyMatcher
 // ---------------------------------------------------------------------------
@@ -415,11 +433,56 @@ pub const FuzzyMatcher = struct {
         masked_regions: []const MaskedRegion,
         allocator: std.mem.Allocator,
     ) ![]u8 {
-        // Collect fuzzy matches across all gaps
+        const result = try self.fuzzyRedactWithMatches(input, aliases, masked_regions, allocator);
+        defer allocator.free(result.matches);
+        return result.output;
+    }
+
+    pub fn fuzzyRedactWithMatches(
+        self: *const FuzzyMatcher,
+        input: []const u8,
+        aliases: []const []const u8,
+        masked_regions: []const MaskedRegion,
+        allocator: std.mem.Allocator,
+    ) !RedactResult {
+        const selected = try self.collectMatches(input, masked_regions, allocator);
+        errdefer allocator.free(selected);
+
+        if (selected.len == 0) {
+            return .{
+                .output = try allocator.dupe(u8, input),
+                .matches = selected,
+            };
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var pos: usize = 0;
+
+        for (selected) |m| {
+            try out.appendSlice(allocator, input[pos..m.start]);
+            if (m.variant_owner < aliases.len) {
+                try out.appendSlice(allocator, aliases[m.variant_owner]);
+            }
+            pos = m.end;
+        }
+        try out.appendSlice(allocator, input[pos..]);
+
+        return .{
+            .output = try out.toOwnedSlice(allocator),
+            .matches = selected,
+        };
+    }
+
+    pub fn collectMatches(
+        self: *const FuzzyMatcher,
+        input: []const u8,
+        masked_regions: []const MaskedRegion,
+        allocator: std.mem.Allocator,
+    ) ![]AuditMatch {
         var matches: std.ArrayListUnmanaged(FuzzyMatch) = .empty;
         defer matches.deinit(allocator);
 
-        // Build gap list: segments of input NOT covered by masked_regions
         const gaps = try buildGaps(input.len, masked_regions, allocator);
         defer allocator.free(gaps);
 
@@ -428,11 +491,8 @@ pub const FuzzyMatcher = struct {
             try self.scanGap(gap_text, gap.start, allocator, &matches);
         }
 
-        if (matches.items.len == 0) {
-            return try allocator.dupe(u8, input);
-        }
+        if (matches.items.len == 0) return try allocator.alloc(AuditMatch, 0);
 
-        // Sort by start, then longest first
         std.sort.block(FuzzyMatch, matches.items, {}, struct {
             fn lessThan(_: void, a: FuzzyMatch, b: FuzzyMatch) bool {
                 if (a.start != b.start) return a.start < b.start;
@@ -440,7 +500,6 @@ pub const FuzzyMatcher = struct {
             }
         }.lessThan);
 
-        // Greedy non-overlapping selection
         var selected: std.ArrayListUnmanaged(FuzzyMatch) = .empty;
         defer selected.deinit(allocator);
 
@@ -452,20 +511,20 @@ pub const FuzzyMatcher = struct {
             }
         }
 
-        // Build output
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        var pos: usize = 0;
+        var audit_matches: std.ArrayListUnmanaged(AuditMatch) = .empty;
+        errdefer audit_matches.deinit(allocator);
+        try audit_matches.ensureTotalCapacity(allocator, selected.items.len);
 
         for (selected.items) |m| {
-            try out.appendSlice(allocator, input[pos..m.start]);
-            if (m.variant_owner < aliases.len) {
-                try out.appendSlice(allocator, aliases[m.variant_owner]);
-            }
-            pos = m.end;
+            audit_matches.appendAssumeCapacity(.{
+                .start = m.start,
+                .end = m.end,
+                .variant_owner = m.variant_owner,
+                .confidence = m.confidence,
+            });
         }
-        try out.appendSlice(allocator, input[pos..]);
 
-        return try out.toOwnedSlice(allocator);
+        return try audit_matches.toOwnedSlice(allocator);
     }
 
     /// Scan a single gap region for fuzzy matches using a sliding window.
@@ -545,6 +604,7 @@ pub const FuzzyMatcher = struct {
                             .start = gap_offset + window_start,
                             .end = gap_offset + window_end,
                             .variant_owner = variant.entity_idx,
+                            .confidence = sim,
                         });
                     }
                 }
@@ -937,6 +997,22 @@ test "FuzzyMatcher - OCR corrupted full name" {
     const result = try fm.fuzzyRedact("Patient J0hn Doe was seen today.", &aliases, &.{}, allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Patient Entity_A was seen today.", result);
+}
+
+test "FuzzyMatcher - collectMatches captures confidence" {
+    const allocator = std.testing.allocator;
+
+    const names = [_][]const u8{"John Doe"};
+    const aliases = [_][]const u8{"Entity_A"};
+
+    var fm = try FuzzyMatcher.init(allocator, &names, &aliases, 0.80);
+    defer fm.deinit();
+
+    const matches = try fm.collectMatches("Patient J0hn Doe was seen today.", &.{}, allocator);
+    defer allocator.free(matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expect(matches[0].confidence >= 0.80);
 }
 
 test "FuzzyMatcher - ALL CAPS name" {

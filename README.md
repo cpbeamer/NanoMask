@@ -358,6 +358,16 @@ NanoMask supports a strict configuration precedence:
 
 NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. Response forwarding logs now include `response_mode`, `buffer_reason`, and `flush_per_chunk` so operators can distinguish streamed pass-through traffic from intentionally buffered restore flows. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
 
+When `--audit-log` is enabled, NanoMask emits additional `event="redaction_audit"` lines for every SSN match, exact entity mask, fuzzy entity match, pattern-library match, and schema `REDACT`, `HASH`, or `SCAN` action. Audit events include `stage`, `match_type`, `original_length`, `replacement_type`, and either `offset` or `field_path`; fuzzy events also include `confidence`. Original sensitive values are never written to the audit log.
+
+Example audit event:
+
+```json
+{"event":"redaction_audit","stage":"schema","match_type":"schema_hash","field_path":"internal_id","original_length":8,"replacement_type":"pseudonymized"}
+```
+
+To keep noisy payloads from overwhelming operators, NanoMask caps audit emission at 256 events per request and logs `audit_event_cap_reached` if additional events were dropped.
+
 ### Health Check
 
 `GET /healthz` returns HTTP 200 with a JSON body:

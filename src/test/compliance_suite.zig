@@ -254,6 +254,81 @@ test "e2e compliance - schema HASH round-trip" {
     try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"buffer_reason\":\"json_unhash\"") != null);
 }
 
+test "e2e compliance - audit log emits SSN events" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var result = try harness.roundTrip(allocator, "Patient SSN 123-45-6789 needs follow up.", .{
+        .audit_log = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"event\":\"redaction_audit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"stage\":\"ssn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"match_type\":\"ssn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"replacement_type\":\"mask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "123-45-6789") == null);
+}
+
+test "e2e compliance - audit log emits fuzzy entity events" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{"Jane Smith"};
+
+    var result = try harness.roundTrip(allocator, "Patient J4ne Smith checked in.", .{
+        .entity_names = &names,
+        .fuzzy_threshold = 0.80,
+        .audit_log = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"stage\":\"fuzzy_match\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"match_type\":\"entity_variant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"confidence\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "Jane Smith") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "J4ne Smith") == null);
+}
+
+test "e2e compliance - audit log emits schema events without leaking values" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const schema_content =
+        \\patient_name = REDACT
+        \\internal_id = HASH
+        \\notes = SCAN
+    ;
+    var schema_instance = try schema_mod.Schema.parseContent(schema_content, allocator);
+    defer schema_instance.deinit();
+
+    const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var hasher_instance = try hasher_mod.Hasher.init(key_hex, allocator);
+    defer hasher_instance.deinit();
+
+    var result = try harness.roundTrip(
+        allocator,
+        \\{"patient_name":"John Doe","internal_id":"PT-99001","notes":"SSN 123-45-6789 appears here"}
+    , .{
+        .schema = &schema_instance,
+        .hasher = &hasher_instance,
+        .audit_log = true,
+        .upstream_content_type = "application/json",
+    });
+    defer result.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"stage\":\"schema\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"match_type\":\"schema_redact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"match_type\":\"schema_hash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"match_type\":\"schema_scan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"field_path\":\"patient_name\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"field_path\":\"internal_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"field_path\":\"notes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"stage\":\"ssn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "John Doe") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "PT-99001") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "123-45-6789") == null);
+}
+
 test "e2e compliance - PDF request bypass" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;

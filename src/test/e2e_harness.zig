@@ -77,6 +77,8 @@ pub const HarnessConfig = struct {
     schema: ?*const schema_mod.Schema = null,
     /// Hasher for HASH-mode pseudonymisation (null = disabled).
     hasher: ?*hasher_mod.Hasher = null,
+    /// Enable audit event emission in captured proxy logs.
+    audit_log: bool = false,
     /// Unsupported request body handling.
     unsupported_request_body_behavior: body_policy.UnsupportedBodyBehavior = .reject,
     /// Unsupported response body handling.
@@ -250,7 +252,7 @@ pub fn roundTrip(
 
     var log_capture_buf: [64 * 1024]u8 = undefined;
     var log_capture = std.io.fixedBufferStream(&log_capture_buf);
-    var log = try logger_mod.Logger.init(.info, false, null);
+    var log = try logger_mod.Logger.init(.info, config.audit_log, null);
     log.test_writer = log_capture.writer().any();
     defer log.deinit();
 

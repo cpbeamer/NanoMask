@@ -27,6 +27,16 @@ pub const Match = struct {
     replacement: []const u8,
 };
 
+pub const RedactResult = struct {
+    output: []u8,
+    matches: []Match,
+
+    pub fn deinit(self: *RedactResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.output);
+        allocator.free(self.matches);
+    }
+};
+
 /// Flags controlling which patterns are active in the scan.
 pub const PatternFlags = struct {
     email: bool = false,
@@ -50,25 +60,19 @@ inline fn toMatch(m: anytype) Match {
     };
 }
 
-/// Redact all enabled patterns in a single pass over the input buffer.
-/// Returns an owned slice with redacted content (caller must free).
-pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocator) ![]u8 {
+fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocator) ![]Match {
     if (!flags.anyEnabled() or input.len < 3) {
-        return try allocator.dupe(u8, input);
+        return try allocator.alloc(Match, 0);
     }
 
-    // Phase 1: Single linear scan collecting all match spans.
     var spans = std.ArrayListUnmanaged(Match).empty;
-    defer spans.deinit(allocator);
+    errdefer spans.deinit(allocator);
 
     var cursor: usize = 0;
     while (cursor < input.len) {
-        // --- Email: triggers on '@', match may start before cursor ---
         if (flags.email and input[cursor] == '@') {
             if (email_mod.tryMatchAt(input, cursor)) |m| {
                 const match = toMatch(m);
-                // Overlap check: email expands left, so verify no collision
-                // with a previous match.
                 if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
                     try spans.append(allocator, match);
                     cursor = match.end;
@@ -77,7 +81,6 @@ pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocat
             }
         }
 
-        // --- Digit-triggered patterns: Phone, Credit Card, IPv4 ---
         if (std.ascii.isDigit(input[cursor])) {
             if (flags.phone) {
                 if (phone_mod.tryMatchAt(input, cursor)) |m| {
@@ -95,7 +98,6 @@ pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocat
             }
         }
 
-        // --- IP: digits for IPv4, hex/':' for IPv6 ---
         if (flags.ip) {
             if (ip_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));
@@ -104,7 +106,6 @@ pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocat
             }
         }
 
-        // --- Special-char phone triggers: '(' and '+' ---
         if (flags.phone and (input[cursor] == '(' or input[cursor] == '+')) {
             if (phone_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));
@@ -113,7 +114,6 @@ pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocat
             }
         }
 
-        // --- Healthcare: label keywords and ICD-10 codes ---
         if (flags.healthcare) {
             if (healthcare_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));
@@ -125,16 +125,33 @@ pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocat
         cursor += 1;
     }
 
-    // Phase 2: Build output from collected spans in one allocation.
-    if (spans.items.len == 0) {
-        return try allocator.dupe(u8, input);
+    return try spans.toOwnedSlice(allocator);
+}
+
+/// Redact all enabled patterns in a single pass over the input buffer.
+/// Returns an owned slice with redacted content (caller must free).
+pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocator) ![]u8 {
+    const result = try redactWithMatches(input, flags, allocator);
+    defer allocator.free(result.matches);
+    return result.output;
+}
+
+pub fn redactWithMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocator) !RedactResult {
+    const spans = try collectMatches(input, flags, allocator);
+    errdefer allocator.free(spans);
+
+    if (spans.len == 0) {
+        return .{
+            .output = try allocator.dupe(u8, input),
+            .matches = spans,
+        };
     }
 
     var result = std.ArrayListUnmanaged(u8).empty;
     errdefer result.deinit(allocator);
 
     var prev_end: usize = 0;
-    for (spans.items) |span| {
+    for (spans) |span| {
         // Emit text before this match
         if (span.start > prev_end) {
             try result.appendSlice(allocator, input[prev_end..span.start]);
@@ -152,7 +169,10 @@ pub fn redact(input: []const u8, flags: PatternFlags, allocator: std.mem.Allocat
         try result.appendSlice(allocator, input[prev_end..]);
     }
 
-    return try result.toOwnedSlice(allocator);
+    return .{
+        .output = try result.toOwnedSlice(allocator),
+        .matches = spans,
+    };
 }
 
 // ===========================================================================

@@ -19,6 +19,13 @@ const Match = struct {
     pattern_idx: usize,
 };
 
+pub const AuditMatch = struct {
+    start: usize,
+    end: usize,
+    pattern_idx: usize,
+    replacement: []const u8,
+};
+
 // ---------------------------------------------------------------------------
 // Word-boundary helpers
 // ---------------------------------------------------------------------------
@@ -547,6 +554,60 @@ pub const EntityMap = struct {
         return replaceAll(&self.forward_ac, input, self.alias_const_slices, allocator);
     }
 
+    /// Collect selected mask spans and their replacement aliases.
+    pub fn collectMaskMatches(self: *const EntityMap, input: []const u8, allocator: std.mem.Allocator) ![]AuditMatch {
+        const raw_matches = try self.forward_ac.search(input, allocator);
+        defer allocator.free(raw_matches);
+
+        if (raw_matches.len == 0) return try allocator.alloc(AuditMatch, 0);
+
+        var valid: std.ArrayListUnmanaged(Match) = .empty;
+        defer valid.deinit(allocator);
+        try valid.ensureTotalCapacity(allocator, raw_matches.len);
+
+        for (raw_matches) |m| {
+            if (isWordBoundaryBefore(input, m.start) and isWordBoundaryAfter(input, m.end)) {
+                valid.appendAssumeCapacity(m);
+            }
+        }
+
+        if (valid.items.len == 0) return try allocator.alloc(AuditMatch, 0);
+
+        std.sort.block(Match, valid.items, {}, struct {
+            fn lessThan(_: void, a: Match, b: Match) bool {
+                if (a.start != b.start) return a.start < b.start;
+                return (a.end - a.start) > (b.end - b.start);
+            }
+        }.lessThan);
+
+        var selected: std.ArrayListUnmanaged(Match) = .empty;
+        defer selected.deinit(allocator);
+        try selected.ensureTotalCapacity(allocator, valid.items.len);
+
+        var last_end: usize = 0;
+        for (valid.items) |m| {
+            if (m.start >= last_end) {
+                selected.appendAssumeCapacity(m);
+                last_end = m.end;
+            }
+        }
+
+        var audit_matches: std.ArrayListUnmanaged(AuditMatch) = .empty;
+        errdefer audit_matches.deinit(allocator);
+        try audit_matches.ensureTotalCapacity(allocator, selected.items.len);
+
+        for (selected.items) |m| {
+            audit_matches.appendAssumeCapacity(.{
+                .start = m.start,
+                .end = m.end,
+                .pattern_idx = m.pattern_idx,
+                .replacement = self.alias_const_slices[m.pattern_idx],
+            });
+        }
+
+        return try audit_matches.toOwnedSlice(allocator);
+    }
+
     /// Replace aliases back to real names.
     pub fn unmask(self: *const EntityMap, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         return replaceAll(&self.reverse_ac, input, self.name_const_slices, allocator);
@@ -739,6 +800,19 @@ test "EntityMap - multiple names" {
     const result = try em.mask("John Doe was seen by Dr. Smith today.", allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Entity_A was seen by Entity_B today.", result);
+}
+
+test "EntityMap - collectMaskMatches exposes selected aliases" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{ "John Doe", "Dr. Smith" });
+    defer em.deinit();
+
+    const matches = try em.collectMaskMatches("John Doe met Dr. Smith", allocator);
+    defer allocator.free(matches);
+
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqualStrings("Entity_A", matches[0].replacement);
+    try std.testing.expectEqualStrings("Entity_B", matches[1].replacement);
 }
 
 test "EntityMap - case insensitive matching" {

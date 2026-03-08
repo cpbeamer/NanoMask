@@ -117,6 +117,16 @@ pub const Logger = struct {
         boolean: bool,
     };
 
+    pub const AuditEvent = struct {
+        stage: []const u8,
+        match_type: []const u8,
+        offset: ?u64 = null,
+        field_path: ?[]const u8 = null,
+        original_length: u64,
+        replacement_type: []const u8,
+        confidence: ?f64 = null,
+    };
+
     /// Emit a structured JSON log line. Thread-safe — acquires mutex for the
     /// duration of the write so that lines are never interleaved.
     pub fn log(
@@ -150,11 +160,7 @@ pub const Logger = struct {
     pub fn auditRedaction(
         self: *Logger,
         session_id: []const u8,
-        stage: []const u8,
-        position: u64,
-        original_length: u64,
-        replacement: []const u8,
-        confidence: ?f64,
+        audit_event: AuditEvent,
     ) void {
         if (!self.audit_enabled) return;
 
@@ -166,18 +172,28 @@ pub const Logger = struct {
         writeTimestamp(w) catch return;
         w.writeAll("\",\"level\":\"") catch return;
         w.writeAll(levelStr(.info)) catch return;
-        w.writeAll("\",\"event\":\"redaction\",\"session_id\":\"") catch return;
+        w.writeAll("\",\"event\":\"redaction_audit\",\"session_id\":\"") catch return;
         w.writeAll(session_id) catch return;
         w.writeAll("\",\"stage\":\"") catch return;
-        w.writeAll(stage) catch return;
-        w.writeAll("\",\"position\":") catch return;
-        std.fmt.format(w, "{d}", .{position}) catch return;
-        w.writeAll(",\"original_length\":") catch return;
-        std.fmt.format(w, "{d}", .{original_length}) catch return;
-        w.writeAll(",\"replacement\":\"") catch return;
-        writeJsonEscaped(w, replacement) catch return;
+        writeJsonEscaped(w, audit_event.stage) catch return;
+        w.writeAll("\",\"match_type\":\"") catch return;
+        writeJsonEscaped(w, audit_event.match_type) catch return;
         w.writeAll("\"") catch return;
-        if (confidence) |c| {
+        if (audit_event.offset) |offset| {
+            w.writeAll(",\"offset\":") catch return;
+            std.fmt.format(w, "{d}", .{offset}) catch return;
+        }
+        if (audit_event.field_path) |field_path| {
+            w.writeAll(",\"field_path\":\"") catch return;
+            writeJsonEscaped(w, field_path) catch return;
+            w.writeAll("\"") catch return;
+        }
+        w.writeAll(",\"original_length\":") catch return;
+        std.fmt.format(w, "{d}", .{audit_event.original_length}) catch return;
+        w.writeAll(",\"replacement_type\":\"") catch return;
+        writeJsonEscaped(w, audit_event.replacement_type) catch return;
+        w.writeAll("\"") catch return;
+        if (audit_event.confidence) |c| {
             w.writeAll(",\"confidence\":") catch return;
             std.fmt.format(w, "{d:.2}", .{c}) catch return;
         }
@@ -435,14 +451,21 @@ test "Logger - audit redaction event emitted when enabled" {
         .owns_file = false,
     };
 
-    logger.auditRedaction("sess1234", "ssn", 42, 11, "***-**-****", null);
+    logger.auditRedaction("sess1234", .{
+        .stage = "ssn",
+        .match_type = "ssn",
+        .offset = 42,
+        .original_length = 11,
+        .replacement_type = "mask",
+    });
 
     const output = fbs.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"event\":\"redaction\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"event\":\"redaction_audit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"stage\":\"ssn\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"position\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"match_type\":\"ssn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"offset\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"original_length\":11") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"replacement\":\"***-**-****\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"replacement_type\":\"mask\"") != null);
 }
 
 test "Logger - audit redaction event with confidence" {
@@ -458,10 +481,18 @@ test "Logger - audit redaction event with confidence" {
         .owns_file = false,
     };
 
-    logger.auditRedaction("sess1234", "fuzzy_match", 100, 9, "Entity_A", 0.87);
+    logger.auditRedaction("sess1234", .{
+        .stage = "fuzzy_match",
+        .match_type = "entity_variant",
+        .field_path = "notes.patient_name",
+        .original_length = 9,
+        .replacement_type = "entity_alias",
+        .confidence = 0.87,
+    });
 
     const output = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"stage\":\"fuzzy_match\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"field_path\":\"notes.patient_name\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"confidence\":0.87") != null);
 }
 
@@ -478,7 +509,13 @@ test "Logger - audit disabled produces zero output" {
         .owns_file = false,
     };
 
-    logger.auditRedaction("sess1234", "ssn", 42, 11, "***-**-****", null);
+    logger.auditRedaction("sess1234", .{
+        .stage = "ssn",
+        .match_type = "ssn",
+        .offset = 42,
+        .original_length = 11,
+        .replacement_type = "mask",
+    });
     try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
 }
 
