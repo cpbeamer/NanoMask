@@ -70,6 +70,18 @@ pub const Config = struct {
     log_file_src: ConfigSource = .default,
     audit_log: bool = false,
     audit_log_src: ConfigSource = .default,
+    // --- Pattern library flags (Phase 5 / Epic 7) ---
+    enable_email: bool = false,
+    enable_email_src: ConfigSource = .default,
+    enable_phone: bool = false,
+    enable_phone_src: ConfigSource = .default,
+    enable_credit_card: bool = false,
+    enable_credit_card_src: ConfigSource = .default,
+    enable_ip: bool = false,
+    enable_ip_src: ConfigSource = .default,
+    healthcare: bool = false,
+    healthcare_src: ConfigSource = .default,
+
     /// When true, perform a health check probe against localhost and exit.
     /// Used by Docker HEALTHCHECK in scratch containers with no curl/wget.
     healthcheck: bool = false,
@@ -95,6 +107,7 @@ pub const Config = struct {
         InvalidMaxBodySize,
         MissingAdminToken,
         InvalidAuditLogFlag,
+        InvalidPatternFlag,
         UnknownFlag,
         OutOfMemory,
     };
@@ -147,6 +160,11 @@ pub const Config = struct {
             \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
             \\  --log-file <path>            Write structured JSON logs to file (default: stderr)
             \\  --audit-log                  Enable per-redaction audit events in log output
+            \\  --enable-email               Redact email addresses (default: disabled)
+            \\  --enable-phone               Redact US phone numbers (default: disabled)
+            \\  --enable-credit-card          Redact credit card numbers with Luhn validation (default: disabled)
+            \\  --enable-ip                  Redact IPv4/IPv6 addresses (default: disabled)
+            \\  --healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
             \\  --healthcheck                Probe /healthz on localhost and exit (for Docker HEALTHCHECK)
             \\  --help                     Print this help message and exit
             \\
@@ -297,7 +315,28 @@ pub const Config = struct {
                 return error.InvalidAuditLogFlag;
             }
             config.audit_log_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_EMAIL")) {
+            config.enable_email = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_email_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_PHONE")) {
+            config.enable_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_phone_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_CREDIT_CARD")) {
+            config.enable_credit_card = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_credit_card_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_IP")) {
+            config.enable_ip = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_ip_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_HEALTHCARE")) {
+            config.healthcare = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.healthcare_src = .env_var;
         }
+    }
+
+    fn parseBoolEnv(value: []const u8) ?bool {
+        if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) return true;
+        if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) return false;
+        return null;
     }
 
     /// Parses configuration from a slice of argument strings. Errors out via writer if not headless.
@@ -327,6 +366,11 @@ pub const Config = struct {
             "NANOMASK_MAX_BODY_SIZE",
             "NANOMASK_LOG_FILE",
             "NANOMASK_AUDIT_LOG",
+            "NANOMASK_ENABLE_EMAIL",
+            "NANOMASK_ENABLE_PHONE",
+            "NANOMASK_ENABLE_CREDIT_CARD",
+            "NANOMASK_ENABLE_IP",
+            "NANOMASK_HEALTHCARE",
         };
 
         for (env_keys) |key| {
@@ -558,6 +602,21 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--audit-log")) {
                 config.audit_log = true;
                 config.audit_log_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-email")) {
+                config.enable_email = true;
+                config.enable_email_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-phone")) {
+                config.enable_phone = true;
+                config.enable_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-credit-card")) {
+                config.enable_credit_card = true;
+                config.enable_credit_card_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-ip")) {
+                config.enable_ip = true;
+                config.enable_ip_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--healthcare")) {
+                config.healthcare = true;
+                config.healthcare_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
             } else {

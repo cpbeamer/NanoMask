@@ -10,6 +10,13 @@ pub const admin = @import("admin/admin.zig");
 pub const tls_server = @import("crypto/tls.zig");
 pub const logger = @import("infra/logger.zig");
 
+// Pattern library (Phase 5 / Epic 7)
+pub const email = @import("patterns/email.zig");
+pub const phone = @import("patterns/phone.zig");
+pub const credit_card = @import("patterns/credit_card.zig");
+pub const ip_address = @import("patterns/ip_address.zig");
+pub const healthcare = @import("patterns/healthcare.zig");
+
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
     _ = redact;
@@ -22,4 +29,10 @@ test {
     _ = tls_server;
     _ = logger;
     _ = @import("net/http_util.zig");
+    // Pattern library
+    _ = email;
+    _ = phone;
+    _ = credit_card;
+    _ = ip_address;
+    _ = healthcare;
 }

@@ -41,6 +41,12 @@ const ThreadContext = struct {
     connections_total: *std.atomic.Value(u64),
     /// Server start timestamp (epoch seconds) for uptime calculation.
     start_time: i64,
+    // Pattern library enable flags (Phase 5 / Epic 7)
+    enable_email: bool,
+    enable_phone: bool,
+    enable_credit_card: bool,
+    enable_ip: bool,
+    healthcare: bool,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -114,6 +120,11 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
             .active_connections = ctx.active_connections,
             .connections_total = ctx.connections_total,
             .start_time = ctx.start_time,
+            .enable_email = ctx.enable_email,
+            .enable_phone = ctx.enable_phone,
+            .enable_credit_card = ctx.enable_credit_card,
+            .enable_ip = ctx.enable_ip,
+            .healthcare = ctx.healthcare,
         },
     ) catch |err| {
         ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{
@@ -367,6 +378,11 @@ pub fn main() !void {
         .logger = &log,
         .connections_total = &connections_total,
         .start_time = start_time,
+        .enable_email = cfg.enable_email,
+        .enable_phone = cfg.enable_phone,
+        .enable_credit_card = cfg.enable_credit_card,
+        .enable_ip = cfg.enable_ip,
+        .healthcare = cfg.healthcare,
     };
 
     while (true) {

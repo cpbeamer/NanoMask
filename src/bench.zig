@@ -2,6 +2,11 @@ const std = @import("std");
 const redact = @import("redaction/redact.zig");
 const entity_mask = @import("redaction/entity_mask.zig");
 const fuzzy_match = @import("redaction/fuzzy_match.zig");
+const email_pattern = @import("patterns/email.zig");
+const phone_pattern = @import("patterns/phone.zig");
+const credit_card_pattern = @import("patterns/credit_card.zig");
+const ip_address_pattern = @import("patterns/ip_address.zig");
+const healthcare_pattern = @import("patterns/healthcare.zig");
 
 /// Write a formatted string to stderr via std.debug.print for reliable output.
 fn println(comptime fmt: []const u8, args: anytype) void {
@@ -215,6 +220,160 @@ pub fn main() !void {
             @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
         println("Stage3C | Chunked Fuzzy Match | {d:>8.1} MB/s | {d:>4} iter x {d} bytes ({}B chunks)", .{
             mb_per_sec, iterations, payload_size, chunk_size,
+        });
+    }
+
+    println("", .{});
+    println("--- Pattern Library ---", .{});
+    println("", .{});
+
+    // --- Stage 4: Email Redaction ---
+    {
+        const payload_size = 1024 * 1024;
+        const payload = try allocator.alloc(u8, payload_size);
+        defer allocator.free(payload);
+        @memset(payload, 'a');
+
+        const sample = " user@example.com ";
+        var pos: usize = 100;
+        while (pos + sample.len <= payload_size) {
+            @memcpy(payload[pos..][0..sample.len], sample);
+            pos += 200;
+        }
+
+        var timer = std.time.Timer.start() catch return;
+        const iterations = 100;
+        var run: usize = 0;
+        while (run < iterations) : (run += 1) {
+            const result = try email_pattern.redactEmails(payload, allocator);
+            allocator.free(result);
+        }
+        const elapsed_ns = timer.read();
+        const total_bytes = payload_size * iterations;
+        const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
+            @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
+        println("Stage 4 | Email Redaction     | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
+            mb_per_sec, iterations, payload_size,
+        });
+    }
+
+    // --- Stage 5: Phone Redaction ---
+    {
+        const payload_size = 1024 * 1024;
+        const payload = try allocator.alloc(u8, payload_size);
+        defer allocator.free(payload);
+        @memset(payload, 'a');
+
+        const sample = " (555) 234-5678 ";
+        var pos: usize = 100;
+        while (pos + sample.len <= payload_size) {
+            @memcpy(payload[pos..][0..sample.len], sample);
+            pos += 200;
+        }
+
+        var timer = std.time.Timer.start() catch return;
+        const iterations = 100;
+        var run: usize = 0;
+        while (run < iterations) : (run += 1) {
+            const result = try phone_pattern.redactPhones(payload, allocator);
+            allocator.free(result);
+        }
+        const elapsed_ns = timer.read();
+        const total_bytes = payload_size * iterations;
+        const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
+            @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
+        println("Stage 5 | Phone Redaction     | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
+            mb_per_sec, iterations, payload_size,
+        });
+    }
+
+    // --- Stage 6: Credit Card Redaction ---
+    {
+        const payload_size = 1024 * 1024;
+        const payload = try allocator.alloc(u8, payload_size);
+        defer allocator.free(payload);
+        @memset(payload, 'a');
+
+        const sample = " 4111-1111-1111-1111 ";
+        var pos: usize = 100;
+        while (pos + sample.len <= payload_size) {
+            @memcpy(payload[pos..][0..sample.len], sample);
+            pos += 200;
+        }
+
+        var timer = std.time.Timer.start() catch return;
+        const iterations = 100;
+        var run: usize = 0;
+        while (run < iterations) : (run += 1) {
+            const result = try credit_card_pattern.redactCreditCards(payload, allocator);
+            allocator.free(result);
+        }
+        const elapsed_ns = timer.read();
+        const total_bytes = payload_size * iterations;
+        const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
+            @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
+        println("Stage 6 | Credit Card Redact  | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
+            mb_per_sec, iterations, payload_size,
+        });
+    }
+
+    // --- Stage 7: IP Address Redaction ---
+    {
+        const payload_size = 1024 * 1024;
+        const payload = try allocator.alloc(u8, payload_size);
+        defer allocator.free(payload);
+        @memset(payload, 'a');
+
+        const sample = " 192.168.1.42 ";
+        var pos: usize = 100;
+        while (pos + sample.len <= payload_size) {
+            @memcpy(payload[pos..][0..sample.len], sample);
+            pos += 200;
+        }
+
+        var timer = std.time.Timer.start() catch return;
+        const iterations = 100;
+        var run: usize = 0;
+        while (run < iterations) : (run += 1) {
+            const result = try ip_address_pattern.redactIpAddresses(payload, allocator);
+            allocator.free(result);
+        }
+        const elapsed_ns = timer.read();
+        const total_bytes = payload_size * iterations;
+        const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
+            @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
+        println("Stage 7 | IP Address Redact   | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
+            mb_per_sec, iterations, payload_size,
+        });
+    }
+
+    // --- Stage 8: Healthcare ID Redaction ---
+    {
+        const payload_size = 1024 * 1024;
+        const payload = try allocator.alloc(u8, payload_size);
+        defer allocator.free(payload);
+        @memset(payload, 'a');
+
+        const sample = " MRN: 12345678 ";
+        var pos: usize = 100;
+        while (pos + sample.len <= payload_size) {
+            @memcpy(payload[pos..][0..sample.len], sample);
+            pos += 200;
+        }
+
+        var timer = std.time.Timer.start() catch return;
+        const iterations = 100;
+        var run: usize = 0;
+        while (run < iterations) : (run += 1) {
+            const result = try healthcare_pattern.redactHealthcare(payload, allocator);
+            allocator.free(result);
+        }
+        const elapsed_ns = timer.read();
+        const total_bytes = payload_size * iterations;
+        const mb_per_sec = (@as(f64, @floatFromInt(total_bytes)) /
+            @as(f64, @floatFromInt(elapsed_ns))) * 1_000_000_000.0 / (1024.0 * 1024.0);
+        println("Stage 8 | Healthcare Redact   | {d:>8.1} MB/s | {d:>4} iter x {d} bytes", .{
+            mb_per_sec, iterations, payload_size,
         });
     }
 
