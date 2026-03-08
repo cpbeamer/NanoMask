@@ -84,7 +84,8 @@ pub const Config = struct {
     // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
     schema_file: ?[]const u8 = null,
     schema_file_src: ConfigSource = .default,
-    schema_default: []const u8 = "SCAN",
+    /// Owned action string when overridden by env/CLI; null = "SCAN" default.
+    schema_default: ?[]u8 = null,
     schema_default_src: ConfigSource = .default,
     hash_key: ?[]const u8 = null,
     hash_key_src: ConfigSource = .default,
@@ -156,10 +157,8 @@ pub const Config = struct {
         if (self.hash_key_file != null and self.hash_key_file_src == .env_var) {
             self.allocator.free(self.hash_key_file.?);
         }
-        // schema_default is a borrowed static literal ("SCAN") by default.
-        // Only free when overridden from an env var or CLI flag (duped in both paths).
-        if (self.schema_default_src == .env_var or self.schema_default_src == .cli_flag) {
-            self.allocator.free(@constCast(self.schema_default));
+        if (self.schema_default) |sd| {
+            self.allocator.free(sd);
         }
     }
 
@@ -257,27 +256,19 @@ pub const Config = struct {
             if (config.watch_interval_ms == 0) return error.InvalidWatchInterval;
             config.watch_interval_ms_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_API")) {
-            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
-                config.admin_api = true;
-            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
-                config.admin_api = false;
-            } else {
+            config.admin_api = parseBoolEnv(value) orelse {
                 std.debug.print("error: NANOMASK_ADMIN_API must be true/false or 1/0, got '{s}'\n", .{value});
                 return error.InvalidAdminFlag;
-            }
+            };
             config.admin_api_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_TOKEN")) {
             config.admin_token = try allocator.dupe(u8, value);
             config.admin_token_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FILE_SYNC")) {
-            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
-                config.entity_file_sync = true;
-            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
-                config.entity_file_sync = false;
-            } else {
+            config.entity_file_sync = parseBoolEnv(value) orelse {
                 std.debug.print("error: NANOMASK_ENTITY_FILE_SYNC must be true/false or 1/0, got '{s}'\n", .{value});
                 return error.InvalidAdminFlag;
-            }
+            };
             config.entity_file_sync_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_TLS_CERT")) {
             config.tls_cert = try allocator.dupe(u8, value);
@@ -298,14 +289,10 @@ pub const Config = struct {
                 return error.TlsKeyNotFound;
             }
         } else if (std.mem.eql(u8, name, "NANOMASK_TARGET_TLS")) {
-            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
-                config.target_tls = true;
-            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
-                config.target_tls = false;
-            } else {
+            config.target_tls = parseBoolEnv(value) orelse {
                 std.debug.print("error: NANOMASK_TARGET_TLS must be true/false or 1/0, got '{s}'\n", .{value});
                 return error.InvalidTargetTlsFlag;
-            }
+            };
             config.target_tls_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_CA_FILE")) {
             config.ca_file = try allocator.dupe(u8, value);
@@ -317,14 +304,10 @@ pub const Config = struct {
                 return error.CaFileNotFound;
             }
         } else if (std.mem.eql(u8, name, "NANOMASK_TLS_NO_SYSTEM_CA")) {
-            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
-                config.tls_no_system_ca = true;
-            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
-                config.tls_no_system_ca = false;
-            } else {
+            config.tls_no_system_ca = parseBoolEnv(value) orelse {
                 std.debug.print("error: NANOMASK_TLS_NO_SYSTEM_CA must be true/false or 1/0, got '{s}'\n", .{value});
                 return error.InvalidNoSystemCaFlag;
-            }
+            };
             config.tls_no_system_ca_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_MAX_BODY_SIZE")) {
             config.max_body_size = std.fmt.parseInt(usize, value, 10) catch {
@@ -337,14 +320,10 @@ pub const Config = struct {
             config.log_file = try allocator.dupe(u8, value);
             config.log_file_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_AUDIT_LOG")) {
-            if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
-                config.audit_log = true;
-            } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
-                config.audit_log = false;
-            } else {
+            config.audit_log = parseBoolEnv(value) orelse {
                 std.debug.print("error: NANOMASK_AUDIT_LOG must be true/false or 1/0, got '{s}'\n", .{value});
                 return error.InvalidAuditLogFlag;
-            }
+            };
             config.audit_log_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_EMAIL")) {
             config.enable_email = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
@@ -378,7 +357,22 @@ pub const Config = struct {
                 std.debug.print("error: NANOMASK_SCHEMA_DEFAULT must be REDACT, KEEP, or SCAN, got '{s}'\n", .{value});
                 return error.InvalidSchemaDefault;
             }
+            // Note: schema_default is now ?[]u8; duped value is freed in deinit()
         } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY")) {
+            // Validate 64 hex chars at parse time (same as CLI --hash-key)
+            if (value.len != 64) {
+                std.debug.print("error: NANOMASK_HASH_KEY must be exactly 64 hex characters, got {d}\n", .{value.len});
+                return error.InvalidHashKey;
+            }
+            for (value) |ch| {
+                switch (ch) {
+                    '0'...'9', 'a'...'f', 'A'...'F' => {},
+                    else => {
+                        std.debug.print("error: NANOMASK_HASH_KEY contains non-hex character\n", .{});
+                        return error.InvalidHashKey;
+                    },
+                }
+            }
             config.hash_key = try allocator.dupe(u8, value);
             config.hash_key_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY_FILE")) {
@@ -705,10 +699,8 @@ pub const Config = struct {
                     return error.MissingValue;
                 }
                 if (std.mem.eql(u8, args[i], "REDACT") or std.mem.eql(u8, args[i], "KEEP") or std.mem.eql(u8, args[i], "SCAN")) {
-                    // Free previous env-var-duped value if being overridden
-                    if (config.schema_default_src == .env_var) {
-                        allocator.free(@constCast(config.schema_default));
-                    }
+                    // Free previous duped value if being overridden
+                    if (config.schema_default) |prev| allocator.free(prev);
                     config.schema_default = try allocator.dupe(u8, args[i]);
                     config.schema_default_src = .cli_flag;
                 } else {
@@ -1197,7 +1189,7 @@ test "Config - schema-default flag valid values" {
     var cfg = try Config.parse(std.testing.allocator, &args);
     defer cfg.deinit();
 
-    try testing.expectEqualStrings("REDACT", cfg.schema_default);
+    try testing.expectEqualStrings("REDACT", cfg.schema_default.?);
     try testing.expectEqual(ConfigSource.cli_flag, cfg.schema_default_src);
 }
 

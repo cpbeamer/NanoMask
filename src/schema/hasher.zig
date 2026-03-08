@@ -50,16 +50,18 @@ pub const Hasher = struct {
         };
         defer file.close();
 
-        var buf: [128]u8 = undefined;
-        const bytes_read = file.reader().readAll(&buf) catch {
+        // Read entire key file (max 128 bytes — key is 64 hex chars)
+        const contents = file.readToEndAlloc(allocator, 128) catch {
             return error.HashKeyFileReadError;
         };
-        if (bytes_read < 64) {
+        defer allocator.free(contents);
+
+        if (contents.len < 64) {
             std.debug.print("error: hash key file must contain at least 64 hex characters\n", .{});
             return error.InvalidHashKey;
         }
 
-        const hex_str = std.mem.trim(u8, buf[0..bytes_read], " \t\n\r");
+        const hex_str = std.mem.trim(u8, contents, " \t\n\r");
         if (hex_str.len < 64) {
             return error.InvalidHashKey;
         }
@@ -77,9 +79,10 @@ pub const Hasher = struct {
     }
 
     /// Produce a deterministic pseudonym for the given value.
-    /// Returns a stable `PSEUDO_<16hex>` token. Same input + same session key
-    /// always yields the same output. Stores the reverse mapping for later unhashing.
-    pub fn hash(self: *Hasher, original: []const u8) ![]const u8 {
+    /// Returns a caller-owned `PSEUDO_<16hex>` token. Same input + same
+    /// session key always yields the same output. Caller must free the
+    /// returned slice. Stores the reverse mapping for later unhashing.
+    pub fn hash(self: *Hasher, original: []const u8) ![]u8 {
         // Compute HMAC-SHA256
         var mac: [32]u8 = undefined;
         const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -113,7 +116,9 @@ pub const Hasher = struct {
             self.allocator.free(token);
         }
 
-        return gop.key_ptr.*;
+        // Return a caller-owned copy. The internal map retains its own
+        // copy — callers are not exposed to evictAll() invalidation.
+        return try self.allocator.dupe(u8, gop.key_ptr.*);
     }
 
     /// Look up the original value for a pseudonym token.
@@ -198,7 +203,9 @@ test "hasher - deterministic output" {
     defer h.deinit();
 
     const t1 = try h.hash("John Doe");
+    defer std.testing.allocator.free(t1);
     const t2 = try h.hash("John Doe");
+    defer std.testing.allocator.free(t2);
 
     // Same input → same output
     try std.testing.expectEqualStrings(t1, t2);
@@ -213,7 +220,9 @@ test "hasher - different inputs produce different tokens" {
     defer h.deinit();
 
     const t1 = try h.hash("John Doe");
+    defer std.testing.allocator.free(t1);
     const t2 = try h.hash("Jane Smith");
+    defer std.testing.allocator.free(t2);
 
     try std.testing.expect(!std.mem.eql(u8, t1, t2));
 }
@@ -224,6 +233,7 @@ test "hasher - round-trip hash then unhash" {
 
     const original = "Patient Zero";
     const token = try h.hash(original);
+    defer std.testing.allocator.free(token);
     const restored = h.unhash(token);
 
     try std.testing.expect(restored != null);
@@ -247,7 +257,9 @@ test "hasher - explicit key produces consistent results" {
     defer h2.deinit();
 
     const t1 = try h1.hash("test value");
+    defer std.testing.allocator.free(t1);
     const t2 = try h2.hash("test value");
+    defer std.testing.allocator.free(t2);
 
     try std.testing.expectEqualStrings(t1, t2);
 }
@@ -257,6 +269,7 @@ test "hasher - unhashJson replaces tokens in response" {
     defer h.deinit();
 
     const token = try h.hash("John Doe");
+    defer std.testing.allocator.free(token);
 
     // Build a mock response containing the token
     const response = try std.fmt.allocPrint(std.testing.allocator, "Hello {s}, welcome back!", .{token});
@@ -297,12 +310,13 @@ test "hasher - multiple unique values" {
     var h = try Hasher.init(null, std.testing.allocator);
     defer h.deinit();
 
-    var tokens: [100][]const u8 = undefined;
+    var tokens: [100][]u8 = undefined;
     for (0..100) |i| {
         var name_buf: [32]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "Patient_{d}", .{i}) catch unreachable;
         tokens[i] = try h.hash(name);
     }
+    defer for (&tokens) |t| std.testing.allocator.free(t);
 
     // Verify all tokens are unique
     for (0..100) |i| {

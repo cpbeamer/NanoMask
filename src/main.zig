@@ -275,9 +275,9 @@ pub fn main() !void {
             std.debug.print("error: failed to load schema file: {}\n", .{err});
             std.process.exit(1);
         };
-        // Override default action from CLI if provided
-        if (!std.mem.eql(u8, cfg.schema_default, "SCAN")) {
-            schema_instance.?.default_action = schema_mod.SchemaAction.parse(cfg.schema_default) catch .scan;
+        // Override default action from CLI/env if provided
+        if (cfg.schema_default) |sd| {
+            schema_instance.?.default_action = schema_mod.SchemaAction.parse(sd) catch .scan;
         }
         log.log(.info, "schema_loaded", null, &.{
             .{ .key = "file", .value = .{ .string = sf } },

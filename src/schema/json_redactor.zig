@@ -381,7 +381,7 @@ fn parseObject(
                 if (isStringValue(val_info.raw) and hasher != null) {
                     const inner = innerStringContent(val_info.raw);
                     const hashed = hasher.?.hash_fn(inner, hasher.?.ctx_ptr) catch return error.HashFailed;
-                    // hashed is owned by the hasher's reverse map — do not free
+                    defer allocator.free(@constCast(hashed));
                     try result.append(allocator, '"');
                     try result.appendSlice(allocator, hashed);
                     try result.append(allocator, '"');

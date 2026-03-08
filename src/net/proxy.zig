@@ -231,7 +231,7 @@ pub fn handleRequest(
 
     // --- Request path: apply privacy pipeline to outbound body ---
     if (has_body) {
-        // Schema-aware mode: buffer full body and run JSON redactor
+        // Schema-aware mode: buffer full body, apply entity masking, then JSON redactor
         if (ctx.schema) |active_schema| {
             var req_body_transfer_buf: [8192]u8 = undefined;
             var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
@@ -258,6 +258,20 @@ pub fn handleRequest(
                     if (bytes_read < chunk_buf.len) break;
                 }
 
+                // Stage 0: Entity masking on the full body (same as chunked path).
+                // Runs Aho-Corasick replacement so named entities are masked before
+                // the JSON redactor sees them.
+                var masked_body: []u8 = undefined;
+                var masked_allocated = false;
+                if (active_entity_map) |em| {
+                    masked_body = try em.mask(full_body.items, allocator);
+                    masked_allocated = true;
+                } else {
+                    masked_body = try allocator.dupe(u8, full_body.items);
+                    masked_allocated = true;
+                }
+                defer if (masked_allocated) allocator.free(masked_body);
+
                 // Build hasher interface if a hasher is present
                 const hasher_iface: ?json_redactor.HasherInterface = if (ctx.hasher) |h| .{
                     .hash_fn = &struct {
@@ -270,28 +284,35 @@ pub fn handleRequest(
                 } else null;
 
                 // Build ScanContext to run SCAN-action values through the
-                // full SSN + pattern redaction pipeline. This adapter runs
-                // the same redaction stages as the chunked pipeline, but on
-                // individual field values extracted by the JSON redactor.
+                // full SSN + pattern + fuzzy redaction pipeline. This adapter
+                // runs the same redaction stages as the chunked pipeline, but
+                // on individual field values extracted by the JSON redactor.
                 const ScanAdapter = struct {
                     fn doScan(input_val: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
                         const proxy_ctx: *const ProxyContext = @ptrCast(@alignCast(ctx_ptr));
 
                         // Stage 1: SSN redaction (in-place on a mutable copy)
-                        const mutable = try alloc.dupe(u8, input_val);
+                        var current = try alloc.dupe(u8, input_val);
 
-                        redact.redactSsn(mutable);
+                        redact.redactSsn(current);
 
                         // Stage 2: Pattern library scan
                         const pflags = proxy_ctx.patternFlags();
                         if (pflags.anyEnabled()) {
-                            const scanned = try scanner.redact(mutable, pflags, alloc);
-                            alloc.free(mutable);
-                            return scanned;
+                            const scanned = try scanner.redact(current, pflags, alloc);
+                            alloc.free(current);
+                            current = scanned;
                         }
 
-                        // No patterns enabled — return the SSN-redacted buffer
-                        return mutable;
+                        // Stage 3: Fuzzy entity matching
+                        if (proxy_ctx.session_fuzzy_matcher) |fm| {
+                            const em_aliases = if (proxy_ctx.session_entity_map) |em| em.getAliases() else &.{};
+                            const fuzzed = try fm.fuzzyRedact(current, em_aliases, &.{}, alloc);
+                            alloc.free(current);
+                            current = fuzzed;
+                        }
+
+                        return current;
                     }
                 };
 
@@ -301,7 +322,7 @@ pub fn handleRequest(
                 };
 
                 const redacted = try json_redactor.redactJson(
-                    full_body.items,
+                    masked_body,
                     active_schema,
                     hasher_iface,
                     scan_ctx_iface,
@@ -517,8 +538,6 @@ pub fn handleRequest(
     });
 
     if (method.responseHasBody()) {
-        // When a hasher is active, buffer the full response so we can
-        // replace PSEUDO_ tokens with their originals before sending.
         const has_hasher = ctx.hasher != null;
 
         var unmask_state: ?entity_mask.AcChunkState = null;
@@ -527,66 +546,58 @@ pub fn handleRequest(
         }
         defer if (unmask_state) |*s| s.deinit(allocator);
 
-        if (has_hasher) {
-            // Buffer full response for unhashing
-            var resp_body = std.ArrayListUnmanaged(u8).empty;
-            defer resp_body.deinit(allocator);
+        // Unified read loop: accumulate unmasked response body.
+        // When a hasher is active, the full body is buffered for PSEUDO_
+        // token replacement. Otherwise, chunks are streamed directly.
+        var resp_body = std.ArrayListUnmanaged(u8).empty;
+        defer resp_body.deinit(allocator);
 
-            var resp_buf: [8192]u8 = undefined;
-            while (true) {
-                const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
-                if (bytes_read == 0) break;
+        var resp_buf: [8192]u8 = undefined;
+        while (true) {
+            const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
+            if (bytes_read == 0) break;
 
-                const raw_chunk = resp_buf[0..bytes_read];
+            const raw_chunk = resp_buf[0..bytes_read];
 
-                if (active_entity_map) |em| {
-                    const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
-                    defer allocator.free(unmasked);
-                    if (unmasked.len > 0) try resp_body.appendSlice(allocator, unmasked);
-                } else {
-                    try resp_body.appendSlice(allocator, raw_chunk);
-                }
-
-                if (bytes_read < resp_buf.len) break;
-            }
-
-            // Flush unmask state
             if (active_entity_map) |em| {
-                const flushed = try unmask_state.?.flushUnmask(em, allocator);
-                defer allocator.free(flushed);
-                if (flushed.len > 0) try resp_body.appendSlice(allocator, flushed);
-            }
-
-            // Unhash PSEUDO_ tokens in the buffered response
-            const unhashed = try ctx.hasher.?.unhashJson(resp_body.items, allocator);
-            defer allocator.free(unhashed);
-            if (unhashed.len > 0) try response_writer.writer.writeAll(unhashed);
-        } else {
-            // No hasher — stream response directly (existing behavior)
-            var resp_buf: [8192]u8 = undefined;
-            while (true) {
-                const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
-                if (bytes_read == 0) break;
-
-                const raw_chunk = resp_buf[0..bytes_read];
-
-                if (active_entity_map) |em| {
-                    const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
-                    defer allocator.free(unmasked);
-                    if (unmasked.len > 0) try response_writer.writer.writeAll(unmasked);
+                const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
+                defer allocator.free(unmasked);
+                if (unmasked.len > 0) {
+                    if (has_hasher) {
+                        try resp_body.appendSlice(allocator, unmasked);
+                    } else {
+                        try response_writer.writer.writeAll(unmasked);
+                    }
+                }
+            } else {
+                if (has_hasher) {
+                    try resp_body.appendSlice(allocator, raw_chunk);
                 } else {
                     try response_writer.writer.writeAll(raw_chunk);
                 }
-
-                if (bytes_read < resp_buf.len) break;
             }
 
-            // Flush unmask state
-            if (active_entity_map) |em| {
-                const flushed = try unmask_state.?.flushUnmask(em, allocator);
-                defer allocator.free(flushed);
-                if (flushed.len > 0) try response_writer.writer.writeAll(flushed);
+            if (bytes_read < resp_buf.len) break;
+        }
+
+        // Flush unmask state
+        if (active_entity_map) |em| {
+            const flushed = try unmask_state.?.flushUnmask(em, allocator);
+            defer allocator.free(flushed);
+            if (flushed.len > 0) {
+                if (has_hasher) {
+                    try resp_body.appendSlice(allocator, flushed);
+                } else {
+                    try response_writer.writer.writeAll(flushed);
+                }
             }
+        }
+
+        // Unhash PSEUDO_ tokens in the buffered response (hasher path only)
+        if (has_hasher) {
+            const unhashed = try ctx.hasher.?.unhashJson(resp_body.items, allocator);
+            defer allocator.free(unhashed);
+            if (unhashed.len > 0) try response_writer.writer.writeAll(unhashed);
         }
     }
     
