@@ -36,6 +36,7 @@ const managed_headers = [_][]const u8{
     "host",
     "content-type",
     "content-length",
+    "content-disposition",
     "accept-encoding",
     "x-zpg-entities",
     "content-encoding",

@@ -250,6 +250,8 @@ test "e2e compliance - schema HASH round-trip" {
 
     // Response-path unhashing: the client should see the original value restored
     try std.testing.expect(std.mem.indexOf(u8, result.client_body, "PT-99001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"response_mode\":\"buffered\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"buffer_reason\":\"json_unhash\"") != null);
 }
 
 test "e2e compliance - PDF request bypass" {
@@ -409,6 +411,7 @@ test "e2e compliance - response header fidelity" {
 
     const upstream_resp_headers = [_]http.Header{
         .{ .name = "Set-Cookie", .value = "session=abc123; Path=/; HttpOnly" },
+        .{ .name = "Cache-Control", .value = "no-store" },
         .{ .name = "x-ratelimit-remaining", .value = "42" },
         .{ .name = "x-request-id", .value = "resp-trace-789" },
         .{ .name = "x-custom-vendor", .value = "metadata-value" },
@@ -426,9 +429,85 @@ test "e2e compliance - response header fidelity" {
     const rate_limit = http_util.findHeader(result.client_head, "x-ratelimit-remaining") orelse return error.MissingHeader;
     try std.testing.expectEqualStrings("42", rate_limit);
 
+    const cache_control = http_util.findHeader(result.client_head, "Cache-Control") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("no-store", cache_control);
+
     const req_id = http_util.findHeader(result.client_head, "x-request-id") orelse return error.MissingHeader;
     try std.testing.expectEqualStrings("resp-trace-789", req_id);
 
     const vendor = http_util.findHeader(result.client_head, "x-custom-vendor") orelse return error.MissingHeader;
     try std.testing.expectEqualStrings("metadata-value", vendor);
+
+    const content_type = http_util.findHeader(result.client_head, "Content-Type") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("text/plain", content_type);
+}
+
+test "e2e compliance - SSE response streams incrementally" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const body = "{\"prompt\":\"Hello\"}";
+
+    const stream_chunks = [_][]const u8{
+        "data: first\n\n",
+        "data: second\n\n",
+        "data: third\n\n",
+    };
+    const extra_headers = [_]http.Header{
+        .{ .name = "Accept", .value = "text/event-stream" },
+    };
+
+    var result = try harness.roundTrip(allocator, body, .{
+        .request_extra_headers = &extra_headers,
+        .upstream_stream_chunks = &stream_chunks,
+        .upstream_inter_chunk_delay_ms = 75,
+        .upstream_content_type = "text/event-stream",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "data: first\n\ndata: second\n\ndata: third\n\n",
+        result.client_body,
+    );
+    try std.testing.expect(result.first_chunk_latency_ns != null);
+    try std.testing.expect(result.client_chunk_count >= 2);
+    try std.testing.expect(result.first_chunk_latency_ns.? < 200 * std.time.ns_per_ms);
+    try std.testing.expect(result.total_response_latency_ns >= 120 * std.time.ns_per_ms);
+
+    const content_type = http_util.findHeader(result.client_head, "Content-Type") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("text/event-stream", content_type);
+    const transfer_encoding = http_util.findHeader(result.client_head, "Transfer-Encoding") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("chunked", transfer_encoding);
+}
+
+test "e2e compliance - NDJSON response streams incrementally" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const body = "{\"prompt\":\"Hello\"}";
+
+    const stream_chunks = [_][]const u8{
+        "{\"delta\":\"one\"}\n",
+        "{\"delta\":\"two\"}\n",
+        "{\"delta\":\"three\"}\n",
+    };
+
+    var result = try harness.roundTrip(allocator, body, .{
+        .upstream_stream_chunks = &stream_chunks,
+        .upstream_inter_chunk_delay_ms = 60,
+        .upstream_content_type = "application/x-ndjson",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "{\"delta\":\"one\"}\n{\"delta\":\"two\"}\n{\"delta\":\"three\"}\n",
+        result.client_body,
+    );
+    try std.testing.expect(result.first_chunk_latency_ns != null);
+    try std.testing.expect(result.client_chunk_count >= 2);
+    try std.testing.expect(result.first_chunk_latency_ns.? < 150 * std.time.ns_per_ms);
+    try std.testing.expect(result.total_response_latency_ns >= 100 * std.time.ns_per_ms);
+
+    const content_type = http_util.findHeader(result.client_head, "Content-Type") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("application/x-ndjson", content_type);
+    const transfer_encoding = http_util.findHeader(result.client_head, "Transfer-Encoding") orelse return error.MissingHeader;
+    try std.testing.expectEqualStrings("chunked", transfer_encoding);
 }

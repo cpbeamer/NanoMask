@@ -145,6 +145,61 @@ fn responseHasBody(method: http.Method, status: http.Status) bool {
         status != .no_content and
         status != .not_modified;
 }
+
+const ResponseForwardingMode = enum {
+    no_body,
+    stream_passthrough,
+    stream_unmask,
+    buffered,
+};
+
+fn responseModeLabel(mode: ResponseForwardingMode) []const u8 {
+    return switch (mode) {
+        .no_body => "no_body",
+        .stream_passthrough => "stream_passthrough",
+        .stream_unmask => "stream_unmask",
+        .buffered => "buffered",
+    };
+}
+
+fn responseBufferReason(mode: ResponseForwardingMode) []const u8 {
+    return switch (mode) {
+        .buffered => "json_unhash",
+        else => "-",
+    };
+}
+
+fn trimMediaType(raw: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, raw, ';') orelse raw.len;
+    return std.mem.trim(u8, raw[0..end], " \t");
+}
+
+fn isEventStreamContentType(content_type: ?[]const u8) bool {
+    const raw = content_type orelse return false;
+    return std.ascii.eqlIgnoreCase(trimMediaType(raw), "text/event-stream");
+}
+
+fn shouldFlushResponsePerChunk(
+    mode: ResponseForwardingMode,
+    transfer_encoding: http.TransferEncoding,
+    kind: body_policy.BodyKind,
+    content_type: ?[]const u8,
+) bool {
+    return switch (mode) {
+        .stream_passthrough, .stream_unmask => transfer_encoding == .chunked or
+            kind == .ndjson or
+            isEventStreamContentType(content_type),
+        .no_body, .buffered => false,
+    };
+}
+
+fn readAvailable(reader: *std.Io.Reader, buffer: []u8) !usize {
+    var targets = [_][]u8{buffer};
+    return reader.readVec(&targets) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => |e| return e,
+    };
+}
 /// Bundles all context needed by the proxy pipeline, replacing the previous
 /// 14-parameter function signature for clarity and maintainability.
 pub const ProxyContext = struct {
@@ -668,6 +723,22 @@ pub fn handleRequest(
         can_unmask or can_unhash,
         ctx.unsupported_response_body_behavior,
     );
+    const should_buffer_response = response_class.policy != .bypass and can_unhash;
+    const should_unmask_response = response_class.policy != .bypass and can_unmask and !should_buffer_response;
+    const response_mode: ResponseForwardingMode = if (!response_has_body)
+        .no_body
+    else if (should_buffer_response)
+        .buffered
+    else if (should_unmask_response)
+        .stream_unmask
+    else
+        .stream_passthrough;
+    const flush_response_per_chunk = shouldFlushResponsePerChunk(
+        response_mode,
+        downstream_res.head.transfer_encoding,
+        response_kind,
+        downstream_res.head.content_type,
+    );
 
     log.log(.info, "upstream_forwarded", session_id, &.{
         .{ .key = "status", .value = .{ .uint = @intFromEnum(downstream_res.head.status) } },
@@ -676,6 +747,9 @@ pub fn handleRequest(
         .{ .key = "body_policy", .value = .{ .string = @tagName(response_class.policy) } },
         .{ .key = "content_type", .value = .{ .string = body_policy.contentTypeForLog(response_class.content_type) } },
         .{ .key = "content_encoding", .value = .{ .string = body_policy.contentEncodingForLog(response_class.content_encoding) } },
+        .{ .key = "response_mode", .value = .{ .string = responseModeLabel(response_mode) } },
+        .{ .key = "buffer_reason", .value = .{ .string = responseBufferReason(response_mode) } },
+        .{ .key = "flush_per_chunk", .value = .{ .boolean = flush_response_per_chunk } },
     });
 
     if (response_class.policy == .reject) {
@@ -692,11 +766,10 @@ pub fn handleRequest(
     // --- Collect end-to-end response headers for forwarding (NMV2-002) ---
     // Duplicate headers before calling downstream_res.reader(), which invalidates
     // the parsed head string slices in the stdlib response object.
-    const resp_extra_skip = [_][]const u8{"content-disposition"};
     const resp_e2e_headers = try http_util.collectEndToEndHeaders(
         header_allocator,
         downstream_res.head.bytes,
-        &resp_extra_skip,
+        &.{},
     );
 
     // Merge managed response headers with collected end-to-end headers.
@@ -721,9 +794,9 @@ pub fn handleRequest(
     }
     const response_headers = response_headers_list.items;
 
-    if (response_has_body and can_unhash) {
+    if (response_has_body and should_buffer_response) {
         var transfer_buf: [8192]u8 = undefined;
-        var downstream_reader = downstream_res.reader(&transfer_buf);
+        const downstream_reader = downstream_res.reader(&transfer_buf);
         var resp_body = std.ArrayListUnmanaged(u8).empty;
         defer resp_body.deinit(allocator);
 
@@ -735,7 +808,7 @@ pub fn handleRequest(
 
         var resp_buf: [8192]u8 = undefined;
         while (true) {
-            const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
+            const bytes_read = try readAvailable(downstream_reader, &resp_buf);
             if (bytes_read == 0) break;
 
             if (resp_body.items.len + bytes_read > max_body_size) {
@@ -755,8 +828,6 @@ pub fn handleRequest(
             } else {
                 try resp_body.appendSlice(allocator, raw_chunk);
             }
-
-            if (bytes_read < resp_buf.len) break;
         }
 
         if (can_unmask) {
@@ -777,6 +848,7 @@ pub fn handleRequest(
 
         var resp_buf8: [8192]u8 = undefined;
         var response_writer = try request.respondStreaming(&resp_buf8, .{
+            .content_length = unhashed.len,
             .respond_options = .{
                 .status = downstream_res.head.status,
                 .extra_headers = response_headers,
@@ -785,25 +857,31 @@ pub fn handleRequest(
         if (unhashed.len > 0) try response_writer.writer.writeAll(unhashed);
         try response_writer.end();
     } else {
+        const response_content_length: ?u64 = switch (response_mode) {
+            .stream_passthrough => downstream_res.head.content_length,
+            .buffered, .stream_unmask, .no_body => null,
+        };
         var resp_buf8: [8192]u8 = undefined;
         var response_writer = try request.respondStreaming(&resp_buf8, .{
+            .content_length = response_content_length,
             .respond_options = .{
                 .status = downstream_res.head.status,
                 .extra_headers = response_headers,
+                .transfer_encoding = if (response_mode == .no_body) .none else null,
             },
         });
 
         if (response_has_body) {
             var transfer_buf: [8192]u8 = undefined;
-            var downstream_reader = downstream_res.reader(&transfer_buf);
+            const downstream_reader = downstream_res.reader(&transfer_buf);
 
-            if (response_class.policy == .bypass or !can_unmask) {
+            if (response_class.policy == .bypass or !should_unmask_response) {
                 var resp_buf: [8192]u8 = undefined;
                 while (true) {
-                    const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
+                    const bytes_read = try readAvailable(downstream_reader, &resp_buf);
                     if (bytes_read == 0) break;
                     try response_writer.writer.writeAll(resp_buf[0..bytes_read]);
-                    if (bytes_read < resp_buf.len) break;
+                    if (flush_response_per_chunk) try response_writer.flush();
                 }
             } else {
                 var unmask_state = active_entity_map.?.initUnmaskChunkState();
@@ -811,19 +889,23 @@ pub fn handleRequest(
 
                 var resp_buf: [8192]u8 = undefined;
                 while (true) {
-                    const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
+                    const bytes_read = try readAvailable(downstream_reader, &resp_buf);
                     if (bytes_read == 0) break;
 
                     const unmasked = try active_entity_map.?.unmaskChunked(resp_buf[0..bytes_read], &unmask_state, allocator);
                     defer allocator.free(unmasked);
-                    if (unmasked.len > 0) try response_writer.writer.writeAll(unmasked);
-
-                    if (bytes_read < resp_buf.len) break;
+                    if (unmasked.len > 0) {
+                        try response_writer.writer.writeAll(unmasked);
+                        if (flush_response_per_chunk) try response_writer.flush();
+                    }
                 }
 
                 const flushed = try unmask_state.flushUnmask(active_entity_map.?, allocator);
                 defer allocator.free(flushed);
-                if (flushed.len > 0) try response_writer.writer.writeAll(flushed);
+                if (flushed.len > 0) {
+                    try response_writer.writer.writeAll(flushed);
+                    if (flush_response_per_chunk) try response_writer.flush();
+                }
             }
         }
 
