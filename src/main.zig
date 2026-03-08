@@ -13,6 +13,8 @@ const admin = @import("admin/admin.zig");
 const tls_mod = @import("crypto/tls.zig");
 const logger_mod = @import("infra/logger.zig");
 const Logger = logger_mod.Logger;
+const schema_mod = @import("schema/schema.zig");
+const hasher_mod = @import("schema/hasher.zig");
 
 const ThreadContext = struct {
     allocator: std.mem.Allocator,
@@ -47,6 +49,9 @@ const ThreadContext = struct {
     enable_credit_card: bool,
     enable_ip: bool,
     enable_healthcare: bool,
+    // Schema-aware redaction (Epic 8)
+    schema: ?*const schema_mod.Schema,
+    hasher: ?*hasher_mod.Hasher,
 };
 
 fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
@@ -125,6 +130,8 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
             .enable_credit_card = ctx.enable_credit_card,
             .enable_ip = ctx.enable_ip,
             .enable_healthcare = ctx.enable_healthcare,
+            .schema = ctx.schema,
+            .hasher = ctx.hasher,
         },
     ) catch |err| {
         ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{
@@ -259,6 +266,53 @@ pub fn main() !void {
         log.warn("ssn_only_mode", null);
     }
 
+    // --- Schema-aware redaction setup (Epic 8) ---
+    var schema_instance: ?schema_mod.Schema = null;
+    defer if (schema_instance) |*s| s.deinit();
+
+    if (cfg.schema_file) |sf| {
+        schema_instance = schema_mod.Schema.loadFromFile(sf, allocator) catch |err| {
+            std.debug.print("error: failed to load schema file: {}\n", .{err});
+            std.process.exit(1);
+        };
+        // Override default action from CLI if provided
+        if (!std.mem.eql(u8, cfg.schema_default, "SCAN")) {
+            schema_instance.?.default_action = schema_mod.SchemaAction.parse(cfg.schema_default) catch .scan;
+        }
+        log.log(.info, "schema_loaded", null, &.{
+            .{ .key = "file", .value = .{ .string = sf } },
+            .{ .key = "fields", .value = .{ .uint = schema_instance.?.fieldCount() } },
+        });
+    }
+
+    var hasher_instance: ?hasher_mod.Hasher = null;
+    defer if (hasher_instance) |*h| h.deinit();
+
+    // Only create a hasher when an explicit key is provided or the schema
+    // actually contains HASH-action fields. This avoids unnecessary
+    // crypto-random key generation for schemas with no HASH rules.
+    const needs_hasher = cfg.hash_key != null or cfg.hash_key_file != null or
+        (if (schema_instance) |*s| s.hasHashFields() else false);
+
+    if (needs_hasher) {
+        if (cfg.hash_key_file) |kf| {
+            hasher_instance = hasher_mod.Hasher.initFromFile(kf, allocator) catch |err| {
+                std.debug.print("error: failed to load hash key file: {}\n", .{err});
+                std.process.exit(1);
+            };
+        } else {
+            hasher_instance = hasher_mod.Hasher.init(cfg.hash_key, allocator) catch |err| {
+                std.debug.print("error: failed to initialise hasher: {}\n", .{err});
+                std.process.exit(1);
+            };
+        }
+        const hex = hasher_instance.?.keyHex();
+        log.log(.info, "hasher_initialized", null, &.{
+            .{ .key = "key_source", .value = .{ .string = if (cfg.hash_key != null) "cli" else if (cfg.hash_key_file != null) "file" else "auto" } },
+            .{ .key = "key_prefix", .value = .{ .string = hex[0..8] } },
+        });
+    }
+
     // --- TLS setup ---
     var tls_context: ?tls_mod.TlsContext = null;
     defer if (tls_context) |*tc| tc.deinit();
@@ -383,6 +437,8 @@ pub fn main() !void {
         .enable_credit_card = cfg.enable_credit_card,
         .enable_ip = cfg.enable_ip,
         .enable_healthcare = cfg.enable_healthcare,
+        .schema = if (schema_instance) |*s| s else null,
+        .hasher = if (hasher_instance) |*h| h else null,
     };
 
     while (true) {

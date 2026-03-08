@@ -18,6 +18,11 @@ pub const ip_address = @import("patterns/ip_address.zig");
 pub const healthcare = @import("patterns/healthcare.zig");
 pub const pattern_scanner = @import("patterns/scanner.zig");
 
+// Schema-aware redaction (Phase 5 / Epic 8)
+pub const schema = @import("schema/schema.zig");
+pub const json_redactor = @import("schema/json_redactor.zig");
+pub const hasher = @import("schema/hasher.zig");
+
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
     _ = redact;
@@ -37,4 +42,8 @@ test {
     _ = ip_address;
     _ = healthcare;
     _ = pattern_scanner;
+    // Schema-aware redaction
+    _ = schema;
+    _ = json_redactor;
+    _ = hasher;
 }

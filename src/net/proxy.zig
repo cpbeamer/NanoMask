@@ -15,6 +15,11 @@ const Logger = logger_mod.Logger;
 // Unified single-pass pattern scanner (Phase 5 / Epic 7)
 const scanner = @import("../patterns/scanner.zig");
 
+// Schema-aware JSON redaction (Phase 5 / Epic 8)
+const schema_mod = @import("../schema/schema.zig");
+const json_redactor = @import("../schema/json_redactor.zig");
+const hasher_mod = @import("../schema/hasher.zig");
+
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
 
@@ -72,6 +77,9 @@ pub const ProxyContext = struct {
     enable_credit_card: bool,
     enable_ip: bool,
     enable_healthcare: bool,
+    // Schema-aware redaction (Epic 8)
+    schema: ?*const schema_mod.Schema = null,
+    hasher: ?*hasher_mod.Hasher = null,
 
     /// Build scanner flags from the proxy context's enable fields.
     pub fn patternFlags(self: ProxyContext) scanner.PatternFlags {
@@ -223,157 +231,249 @@ pub fn handleRequest(
 
     // --- Request path: apply privacy pipeline to outbound body ---
     if (has_body) {
-        var ac_state: ?entity_mask.AcChunkState = null;
-        if (active_entity_map) |em| ac_state = em.initChunkState();
-        defer if (ac_state) |*s| s.deinit(allocator);
+        // Schema-aware mode: buffer full body and run JSON redactor
+        if (ctx.schema) |active_schema| {
+            var req_body_transfer_buf: [8192]u8 = undefined;
+            var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
 
-        var ssn_state = redact.SsnChunkState{};
+            var body_read_buf: [8192]u8 = undefined;
+            if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
+                // Buffer entire body for JSON parsing
+                var full_body = std.ArrayListUnmanaged(u8).empty;
+                defer full_body.deinit(allocator);
 
-        var fuzzy_state: ?fuzzy_match.FuzzyMatcher.FuzzyChunkState = null;
-        if (session_fuzzy_matcher) |fm| fuzzy_state = fm.initChunkState();
-        defer if (fuzzy_state) |*s| s.deinit(allocator);
+                var chunk_buf: [8192]u8 = undefined;
+                while (true) {
+                    const bytes_read = try body_reader.readSliceShort(&chunk_buf);
+                    if (bytes_read == 0) break;
 
-        var req_body_transfer_buf: [8192]u8 = undefined;
-        var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
-        
-        var body_read_buf: [8192]u8 = undefined;
-        var bytes_forwarded: usize = 0;
-        if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
-            var raw_chunk_buf: [8192]u8 = undefined;
-            while (true) {
-                const bytes_read = try body_reader.readSliceShort(&raw_chunk_buf);
-                if (bytes_read == 0) break;
+                    if (full_body.items.len + bytes_read > max_body_size) {
+                        log.log(.warn, "body_too_large", session_id, &.{
+                            .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
+                        });
+                        return error.PayloadTooLarge;
+                    }
+                    try full_body.appendSlice(allocator, chunk_buf[0..bytes_read]);
 
-                bytes_forwarded += bytes_read;
-                if (bytes_forwarded > max_body_size) {
-                    log.log(.warn, "body_too_large", session_id, &.{
-                        .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
-                    });
-                    return error.PayloadTooLarge;
+                    if (bytes_read < chunk_buf.len) break;
                 }
-                
-                const raw_chunk = raw_chunk_buf[0..bytes_read];
-                
-                var masked_chunk: []u8 = undefined;
-                var masked_allocated = false;
+
+                // Build hasher interface if a hasher is present
+                const hasher_iface: ?json_redactor.HasherInterface = if (ctx.hasher) |h| .{
+                    .hash_fn = &struct {
+                        fn call(orig: []const u8, ctx_ptr: *anyopaque) anyerror![]const u8 {
+                            const hh: *hasher_mod.Hasher = @ptrCast(@alignCast(ctx_ptr));
+                            return hh.hash(orig);
+                        }
+                    }.call,
+                    .ctx_ptr = @ptrCast(@alignCast(h)),
+                } else null;
+
+                // Build ScanContext to run SCAN-action values through the
+                // full SSN + pattern redaction pipeline. This adapter runs
+                // the same redaction stages as the chunked pipeline, but on
+                // individual field values extracted by the JSON redactor.
+                const ScanAdapter = struct {
+                    fn doScan(input_val: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+                        const proxy_ctx: *const ProxyContext = @ptrCast(@alignCast(ctx_ptr));
+
+                        // Stage 1: SSN redaction (in-place on a mutable copy)
+                        const mutable = try alloc.dupe(u8, input_val);
+
+                        redact.redactSsn(mutable);
+
+                        // Stage 2: Pattern library scan
+                        const pflags = proxy_ctx.patternFlags();
+                        if (pflags.anyEnabled()) {
+                            const scanned = try scanner.redact(mutable, pflags, alloc);
+                            alloc.free(mutable);
+                            return scanned;
+                        }
+
+                        // No patterns enabled — return the SSN-redacted buffer
+                        return mutable;
+                    }
+                };
+
+                const scan_ctx_iface: ?json_redactor.ScanContext = .{
+                    .scan_fn = &ScanAdapter.doScan,
+                    .ctx_ptr = @ptrCast(@constCast(&ctx)),
+                };
+
+                const redacted = try json_redactor.redactJson(
+                    full_body.items,
+                    active_schema,
+                    hasher_iface,
+                    scan_ctx_iface,
+                    allocator,
+                );
+                defer allocator.free(redacted);
+
+                try req_body.writer.writeAll(redacted);
+            } else |err| {
+                log.log(.warn, "body_read_failed", session_id, &.{
+                    .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                });
+            }
+
+            try req_body.end();
+            if (client_req.connection) |conn| {
+                try conn.flush();
+            }
+        } else {
+            // --- Chunked streaming pipeline (non-schema mode) ---
+            var ac_state: ?entity_mask.AcChunkState = null;
+            if (active_entity_map) |em| ac_state = em.initChunkState();
+            defer if (ac_state) |*s| s.deinit(allocator);
+
+            var ssn_state = redact.SsnChunkState{};
+
+            var fuzzy_state: ?fuzzy_match.FuzzyMatcher.FuzzyChunkState = null;
+            if (session_fuzzy_matcher) |fm| fuzzy_state = fm.initChunkState();
+            defer if (fuzzy_state) |*s| s.deinit(allocator);
+
+            var req_body_transfer_buf: [8192]u8 = undefined;
+            var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
+
+            var body_read_buf: [8192]u8 = undefined;
+            var bytes_forwarded: usize = 0;
+            if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
+                var raw_chunk_buf: [8192]u8 = undefined;
+                while (true) {
+                    const bytes_read = try body_reader.readSliceShort(&raw_chunk_buf);
+                    if (bytes_read == 0) break;
+
+                    bytes_forwarded += bytes_read;
+                    if (bytes_forwarded > max_body_size) {
+                        log.log(.warn, "body_too_large", session_id, &.{
+                            .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
+                        });
+                        return error.PayloadTooLarge;
+                    }
+
+                    const raw_chunk = raw_chunk_buf[0..bytes_read];
+
+                    var masked_chunk: []u8 = undefined;
+                    var masked_allocated = false;
+                    if (active_entity_map) |em| {
+                        masked_chunk = try em.maskChunked(raw_chunk, &ac_state.?, allocator);
+                        masked_allocated = true;
+                    } else {
+                        masked_chunk = try allocator.dupe(u8, raw_chunk);
+                        masked_allocated = true;
+                    }
+                    defer if (masked_allocated) allocator.free(masked_chunk);
+
+                    const ssn_res = redact.redactSsnChunked(masked_chunk, &ssn_state);
+
+                    // --- Pattern library: single-pass scan (after SSN, before fuzzy) ---
+                    const scanner_flags = ctx.patternFlags();
+                    var pattern_finalized = ssn_res.finalized;
+                    var pattern_emitted = ssn_res.emitted;
+
+                    var pf_alloc: ?[]u8 = null;
+                    var pe_alloc: ?[]u8 = null;
+                    defer if (pf_alloc) |a| allocator.free(a);
+                    defer if (pe_alloc) |a| allocator.free(a);
+
+                    if (scanner_flags.anyEnabled()) {
+                        if (pattern_finalized.len > 0) {
+                            const buf = try scanner.redact(pattern_finalized, scanner_flags, allocator);
+                            pf_alloc = buf;
+                            pattern_finalized = buf;
+                        }
+                        if (pattern_emitted.len > 0) {
+                            const buf = try scanner.redact(pattern_emitted, scanner_flags, allocator);
+                            pe_alloc = buf;
+                            pattern_emitted = buf;
+                        }
+                    }
+
+                    if (session_fuzzy_matcher) |fm| {
+                        const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
+                        if (pattern_finalized.len > 0) {
+                            const f1 = try fm.fuzzyRedactChunked(pattern_finalized, &fuzzy_state.?, em_aliases, &.{}, allocator);
+                            defer allocator.free(f1);
+                            if (f1.len > 0) try req_body.writer.writeAll(f1);
+                        }
+                        if (pattern_emitted.len > 0) {
+                            const f2 = try fm.fuzzyRedactChunked(pattern_emitted, &fuzzy_state.?, em_aliases, &.{}, allocator);
+                            defer allocator.free(f2);
+                            if (f2.len > 0) try req_body.writer.writeAll(f2);
+                        }
+                    } else {
+                        if (pattern_finalized.len > 0) try req_body.writer.writeAll(pattern_finalized);
+                        if (pattern_emitted.len > 0) try req_body.writer.writeAll(pattern_emitted);
+                    }
+
+                    // readSliceShort returns < buffer.len if and only if it reached EOF.
+                    // Breaking here prevents another read call that panics if the stream is already .ready
+                    if (bytes_read < raw_chunk_buf.len) break;
+                }
+
+                // Flushes
+                var ac_flushed: ?[]u8 = null;
                 if (active_entity_map) |em| {
-                    masked_chunk = try em.maskChunked(raw_chunk, &ac_state.?, allocator);
-                    masked_allocated = true;
-                } else {
-                    masked_chunk = try allocator.dupe(u8, raw_chunk);
-                    masked_allocated = true;
+                    ac_flushed = try ac_state.?.flush(em, allocator);
                 }
-                defer if (masked_allocated) allocator.free(masked_chunk);
+                defer if (ac_flushed) |f| allocator.free(f);
 
-                const ssn_res = redact.redactSsnChunked(masked_chunk, &ssn_state);
+                var ssn_final_emissions: std.ArrayListUnmanaged(u8) = .empty;
+                defer ssn_final_emissions.deinit(allocator);
 
-                // --- Pattern library: single-pass scan (after SSN, before fuzzy) ---
-                const scanner_flags = ctx.patternFlags();
-                var pattern_finalized = ssn_res.finalized;
-                var pattern_emitted = ssn_res.emitted;
-
-                var pf_alloc: ?[]u8 = null;
-                var pe_alloc: ?[]u8 = null;
-                defer if (pf_alloc) |a| allocator.free(a);
-                defer if (pe_alloc) |a| allocator.free(a);
-
-                if (scanner_flags.anyEnabled()) {
-                    if (pattern_finalized.len > 0) {
-                        const buf = try scanner.redact(pattern_finalized, scanner_flags, allocator);
-                        pf_alloc = buf;
-                        pattern_finalized = buf;
+                if (ac_flushed) |f| {
+                    if (f.len > 0) {
+                        const ssn_res = redact.redactSsnChunked(f, &ssn_state);
+                        if (ssn_res.finalized.len > 0) try ssn_final_emissions.appendSlice(allocator, ssn_res.finalized);
+                        if (ssn_res.emitted.len > 0) try ssn_final_emissions.appendSlice(allocator, ssn_res.emitted);
                     }
-                    if (pattern_emitted.len > 0) {
-                        const buf = try scanner.redact(pattern_emitted, scanner_flags, allocator);
-                        pe_alloc = buf;
-                        pattern_emitted = buf;
-                    }
+                }
+
+                const ssn_flushed = ssn_state.flush();
+                if (ssn_flushed.len > 0) {
+                    try ssn_final_emissions.appendSlice(allocator, ssn_flushed);
                 }
 
                 if (session_fuzzy_matcher) |fm| {
                     const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
-                    if (pattern_finalized.len > 0) {
-                        const f1 = try fm.fuzzyRedactChunked(pattern_finalized, &fuzzy_state.?, em_aliases, &.{}, allocator);
-                        defer allocator.free(f1);
-                        if (f1.len > 0) try req_body.writer.writeAll(f1);
+
+                    const pattern_result = if (ssn_final_emissions.items.len > 0 and ctx.patternFlags().anyEnabled())
+                        try scanner.redact(ssn_final_emissions.items, ctx.patternFlags(), allocator)
+                    else
+                        null;
+                    defer if (pattern_result) |pr| allocator.free(pr);
+
+                    const final_buf = pattern_result orelse ssn_final_emissions.items;
+                    if (final_buf.len > 0) {
+                        const f_res = try fm.fuzzyRedactChunked(final_buf, &fuzzy_state.?, em_aliases, &.{}, allocator);
+                        defer allocator.free(f_res);
+                        if (f_res.len > 0) try req_body.writer.writeAll(f_res);
                     }
-                    if (pattern_emitted.len > 0) {
-                        const f2 = try fm.fuzzyRedactChunked(pattern_emitted, &fuzzy_state.?, em_aliases, &.{}, allocator);
-                        defer allocator.free(f2);
-                        if (f2.len > 0) try req_body.writer.writeAll(f2);
-                    }
+                    const fuzzy_flushed = try fuzzy_state.?.flush(fm, em_aliases, &.{}, allocator);
+                    defer allocator.free(fuzzy_flushed);
+                    if (fuzzy_flushed.len > 0) try req_body.writer.writeAll(fuzzy_flushed);
                 } else {
-                    if (pattern_finalized.len > 0) try req_body.writer.writeAll(pattern_finalized);
-                    if (pattern_emitted.len > 0) try req_body.writer.writeAll(pattern_emitted);
+                    const pattern_result = if (ssn_final_emissions.items.len > 0 and ctx.patternFlags().anyEnabled())
+                        try scanner.redact(ssn_final_emissions.items, ctx.patternFlags(), allocator)
+                    else
+                        null;
+                    defer if (pattern_result) |pr| allocator.free(pr);
+
+                    const final_buf = pattern_result orelse ssn_final_emissions.items;
+                    if (final_buf.len > 0) {
+                        try req_body.writer.writeAll(final_buf);
+                    }
                 }
-                
-                // readSliceShort returns < buffer.len if and only if it reached EOF.
-                // Breaking here prevents another read call that panics if the stream is already .ready
-                if (bytes_read < raw_chunk_buf.len) break;
-            }
-            
-            // Flushes
-            var ac_flushed: ?[]u8 = null;
-            if (active_entity_map) |em| {
-                ac_flushed = try ac_state.?.flush(em, allocator);
-            }
-            defer if (ac_flushed) |f| allocator.free(f);
-
-            var ssn_final_emissions: std.ArrayListUnmanaged(u8) = .empty;
-            defer ssn_final_emissions.deinit(allocator);
-
-            if (ac_flushed) |f| {
-                if (f.len > 0) {
-                    const ssn_res = redact.redactSsnChunked(f, &ssn_state);
-                    if (ssn_res.finalized.len > 0) try ssn_final_emissions.appendSlice(allocator, ssn_res.finalized);
-                    if (ssn_res.emitted.len > 0) try ssn_final_emissions.appendSlice(allocator, ssn_res.emitted);
-                }
-            }
-            
-            const ssn_flushed = ssn_state.flush();
-            if (ssn_flushed.len > 0) {
-                try ssn_final_emissions.appendSlice(allocator, ssn_flushed);
+            } else |err| {
+                log.log(.warn, "body_read_failed", session_id, &.{
+                    .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                });
             }
 
-            if (session_fuzzy_matcher) |fm| {
-                const em_aliases = if (active_entity_map) |em| em.getAliases() else &.{};
-
-                const pattern_result = if (ssn_final_emissions.items.len > 0 and ctx.patternFlags().anyEnabled())
-                    try scanner.redact(ssn_final_emissions.items, ctx.patternFlags(), allocator)
-                else
-                    null;
-                defer if (pattern_result) |pr| allocator.free(pr);
-
-                const final_buf = pattern_result orelse ssn_final_emissions.items;
-                if (final_buf.len > 0) {
-                    const f_res = try fm.fuzzyRedactChunked(final_buf, &fuzzy_state.?, em_aliases, &.{}, allocator);
-                    defer allocator.free(f_res);
-                    if (f_res.len > 0) try req_body.writer.writeAll(f_res);
-                }
-                const fuzzy_flushed = try fuzzy_state.?.flush(fm, em_aliases, &.{}, allocator);
-                defer allocator.free(fuzzy_flushed);
-                if (fuzzy_flushed.len > 0) try req_body.writer.writeAll(fuzzy_flushed);
-            } else {
-                const pattern_result = if (ssn_final_emissions.items.len > 0 and ctx.patternFlags().anyEnabled())
-                    try scanner.redact(ssn_final_emissions.items, ctx.patternFlags(), allocator)
-                else
-                    null;
-                defer if (pattern_result) |pr| allocator.free(pr);
-
-                const final_buf = pattern_result orelse ssn_final_emissions.items;
-                if (final_buf.len > 0) {
-                    try req_body.writer.writeAll(final_buf);
-                }
+            try req_body.end();
+            if (client_req.connection) |conn| {
+                try conn.flush();
             }
-        } else |err| {
-            log.log(.warn, "body_read_failed", session_id, &.{
-                .{ .key = "error", .value = .{ .string = @errorName(err) } },
-            });
-        }
-        
-        try req_body.end();
-        if (client_req.connection) |conn| {
-            try conn.flush();
         }
     } else {
         try client_req.sendBodilessUnflushed();
@@ -407,7 +507,7 @@ pub fn handleRequest(
     var transfer_buf: [8192]u8 = undefined;
     var downstream_reader = downstream_res.reader(&transfer_buf);
 
-    // --- Response path: unmask aliases back to real names ---
+    // --- Response path: unmask aliases and unhash PSEUDO_ tokens ---
     var resp_buf8: [8192]u8 = undefined;
     var response_writer = try request.respondStreaming(&resp_buf8, .{
         .respond_options = .{
@@ -417,35 +517,76 @@ pub fn handleRequest(
     });
 
     if (method.responseHasBody()) {
+        // When a hasher is active, buffer the full response so we can
+        // replace PSEUDO_ tokens with their originals before sending.
+        const has_hasher = ctx.hasher != null;
+
         var unmask_state: ?entity_mask.AcChunkState = null;
         if (active_entity_map) |em| {
             unmask_state = em.initUnmaskChunkState();
         }
         defer if (unmask_state) |*s| s.deinit(allocator);
 
-        var resp_buf: [8192]u8 = undefined;
-        while (true) {
-            const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
-            if (bytes_read == 0) break;
-            
-            const raw_chunk = resp_buf[0..bytes_read];
-            
-            if (active_entity_map) |em| {
-                const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
-                defer allocator.free(unmasked);
-                if (unmasked.len > 0) try response_writer.writer.writeAll(unmasked);
-            } else {
-                try response_writer.writer.writeAll(raw_chunk);
+        if (has_hasher) {
+            // Buffer full response for unhashing
+            var resp_body = std.ArrayListUnmanaged(u8).empty;
+            defer resp_body.deinit(allocator);
+
+            var resp_buf: [8192]u8 = undefined;
+            while (true) {
+                const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
+                if (bytes_read == 0) break;
+
+                const raw_chunk = resp_buf[0..bytes_read];
+
+                if (active_entity_map) |em| {
+                    const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
+                    defer allocator.free(unmasked);
+                    if (unmasked.len > 0) try resp_body.appendSlice(allocator, unmasked);
+                } else {
+                    try resp_body.appendSlice(allocator, raw_chunk);
+                }
+
+                if (bytes_read < resp_buf.len) break;
             }
-            
-            if (bytes_read < resp_buf.len) break;
-        }
-        
-        // Flush unmask state
-        if (active_entity_map) |em| {
-            const flushed = try unmask_state.?.flushUnmask(em, allocator);
-            defer allocator.free(flushed);
-            if (flushed.len > 0) try response_writer.writer.writeAll(flushed);
+
+            // Flush unmask state
+            if (active_entity_map) |em| {
+                const flushed = try unmask_state.?.flushUnmask(em, allocator);
+                defer allocator.free(flushed);
+                if (flushed.len > 0) try resp_body.appendSlice(allocator, flushed);
+            }
+
+            // Unhash PSEUDO_ tokens in the buffered response
+            const unhashed = try ctx.hasher.?.unhashJson(resp_body.items, allocator);
+            defer allocator.free(unhashed);
+            if (unhashed.len > 0) try response_writer.writer.writeAll(unhashed);
+        } else {
+            // No hasher — stream response directly (existing behavior)
+            var resp_buf: [8192]u8 = undefined;
+            while (true) {
+                const bytes_read = try downstream_reader.readSliceShort(&resp_buf);
+                if (bytes_read == 0) break;
+
+                const raw_chunk = resp_buf[0..bytes_read];
+
+                if (active_entity_map) |em| {
+                    const unmasked = try em.unmaskChunked(raw_chunk, &unmask_state.?, allocator);
+                    defer allocator.free(unmasked);
+                    if (unmasked.len > 0) try response_writer.writer.writeAll(unmasked);
+                } else {
+                    try response_writer.writer.writeAll(raw_chunk);
+                }
+
+                if (bytes_read < resp_buf.len) break;
+            }
+
+            // Flush unmask state
+            if (active_entity_map) |em| {
+                const flushed = try unmask_state.?.flushUnmask(em, allocator);
+                defer allocator.free(flushed);
+                if (flushed.len > 0) try response_writer.writer.writeAll(flushed);
+            }
         }
     }
     

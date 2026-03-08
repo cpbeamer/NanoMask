@@ -81,6 +81,15 @@ pub const Config = struct {
     enable_ip_src: ConfigSource = .default,
     enable_healthcare: bool = false,
     enable_healthcare_src: ConfigSource = .default,
+    // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
+    schema_file: ?[]const u8 = null,
+    schema_file_src: ConfigSource = .default,
+    schema_default: []const u8 = "SCAN",
+    schema_default_src: ConfigSource = .default,
+    hash_key: ?[]const u8 = null,
+    hash_key_src: ConfigSource = .default,
+    hash_key_file: ?[]const u8 = null,
+    hash_key_file_src: ConfigSource = .default,
 
     /// When true, perform a health check probe against localhost and exit.
     /// Used by Docker HEALTHCHECK in scratch containers with no curl/wget.
@@ -108,6 +117,10 @@ pub const Config = struct {
         MissingAdminToken,
         InvalidAuditLogFlag,
         InvalidPatternFlag,
+        InvalidSchemaDefault,
+        SchemaFileNotFound,
+        InvalidHashKey,
+        HashKeyFileNotFound,
         UnknownFlag,
         OutOfMemory,
     };
@@ -133,6 +146,20 @@ pub const Config = struct {
         }
         if (self.log_file != null and self.log_file_src == .env_var) {
             self.allocator.free(self.log_file.?);
+        }
+        if (self.schema_file != null and self.schema_file_src == .env_var) {
+            self.allocator.free(self.schema_file.?);
+        }
+        if (self.hash_key != null and self.hash_key_src == .env_var) {
+            self.allocator.free(self.hash_key.?);
+        }
+        if (self.hash_key_file != null and self.hash_key_file_src == .env_var) {
+            self.allocator.free(self.hash_key_file.?);
+        }
+        // schema_default is a borrowed static literal ("SCAN") by default.
+        // Only free when overridden from an env var or CLI flag (duped in both paths).
+        if (self.schema_default_src == .env_var or self.schema_default_src == .cli_flag) {
+            self.allocator.free(@constCast(self.schema_default));
         }
     }
 
@@ -165,6 +192,10 @@ pub const Config = struct {
             \\  --enable-credit-card          Redact credit card numbers with Luhn validation (default: disabled)
             \\  --enable-ip                  Redact IPv4/IPv6 addresses (default: disabled)
             \\  --enable-healthcare           Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
+            \\  --schema-file <path>          JSON schema file for field-level redaction (Epic 8)
+            \\  --schema-default <action>     Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
+            \\  --hash-key <hex>              64-char hex HMAC key for HASH-mode pseudonymization
+            \\  --hash-key-file <path>        File containing 64-char hex HMAC key
             \\  --healthcheck                Probe /healthz on localhost and exit (for Docker HEALTHCHECK)
             \\  --help                     Print this help message and exit
             \\
@@ -330,6 +361,35 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_HEALTHCARE")) {
             config.enable_healthcare = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_healthcare_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_FILE")) {
+            config.schema_file = try allocator.dupe(u8, value);
+            config.schema_file_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open schema file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.SchemaFileNotFound;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_DEFAULT")) {
+            if (std.mem.eql(u8, value, "REDACT") or std.mem.eql(u8, value, "KEEP") or std.mem.eql(u8, value, "SCAN")) {
+                config.schema_default = try allocator.dupe(u8, value);
+                config.schema_default_src = .env_var;
+            } else {
+                std.debug.print("error: NANOMASK_SCHEMA_DEFAULT must be REDACT, KEEP, or SCAN, got '{s}'\n", .{value});
+                return error.InvalidSchemaDefault;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY")) {
+            config.hash_key = try allocator.dupe(u8, value);
+            config.hash_key_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY_FILE")) {
+            config.hash_key_file = try allocator.dupe(u8, value);
+            config.hash_key_file_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.HashKeyFileNotFound;
+            }
         }
     }
 
@@ -371,6 +431,10 @@ pub const Config = struct {
             "NANOMASK_ENABLE_CREDIT_CARD",
             "NANOMASK_ENABLE_IP",
             "NANOMASK_ENABLE_HEALTHCARE",
+            "NANOMASK_SCHEMA_FILE",
+            "NANOMASK_SCHEMA_DEFAULT",
+            "NANOMASK_HASH_KEY",
+            "NANOMASK_HASH_KEY_FILE",
         };
 
         for (env_keys) |key| {
@@ -617,6 +681,82 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-healthcare")) {
                 config.enable_healthcare = true;
                 config.enable_healthcare_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--schema-file")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --schema-file\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.schema_file != null and config.schema_file_src == .env_var) {
+                    allocator.free(config.schema_file.?);
+                }
+                config.schema_file = args[i];
+                config.schema_file_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open schema file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.SchemaFileNotFound;
+                }
+            } else if (std.mem.eql(u8, arg, "--schema-default")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --schema-default\n", .{});
+                    return error.MissingValue;
+                }
+                if (std.mem.eql(u8, args[i], "REDACT") or std.mem.eql(u8, args[i], "KEEP") or std.mem.eql(u8, args[i], "SCAN")) {
+                    // Free previous env-var-duped value if being overridden
+                    if (config.schema_default_src == .env_var) {
+                        allocator.free(@constCast(config.schema_default));
+                    }
+                    config.schema_default = try allocator.dupe(u8, args[i]);
+                    config.schema_default_src = .cli_flag;
+                } else {
+                    std.debug.print("error: --schema-default must be REDACT, KEEP, or SCAN, got '{s}'\n", .{args[i]});
+                    return error.InvalidSchemaDefault;
+                }
+            } else if (std.mem.eql(u8, arg, "--hash-key")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --hash-key\n", .{});
+                    return error.MissingValue;
+                }
+                // Validate 64 hex chars at parse time for fail-fast behavior
+                if (args[i].len != 64) {
+                    std.debug.print("error: --hash-key must be exactly 64 hex characters (32 bytes), got {d} chars\n", .{args[i].len});
+                    return error.InvalidHashKey;
+                }
+                for (args[i]) |ch| {
+                    switch (ch) {
+                        '0'...'9', 'a'...'f', 'A'...'F' => {},
+                        else => {
+                            std.debug.print("error: --hash-key contains non-hex character '{c}'\n", .{ch});
+                            return error.InvalidHashKey;
+                        },
+                    }
+                }
+                if (config.hash_key != null and config.hash_key_src == .env_var) {
+                    allocator.free(config.hash_key.?);
+                }
+                config.hash_key = args[i];
+                config.hash_key_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--hash-key-file")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --hash-key-file\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.hash_key_file != null and config.hash_key_file_src == .env_var) {
+                    allocator.free(config.hash_key_file.?);
+                }
+                config.hash_key_file = args[i];
+                config.hash_key_file_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.HashKeyFileNotFound;
+                }
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
             } else {
@@ -1044,4 +1184,104 @@ test "Config - healthcheck flag" {
     defer cfg.deinit();
 
     try testing.expect(cfg.healthcheck);
+}
+
+// --- Epic 8: Schema-aware redaction flag tests ---
+
+test "Config - schema-default flag valid values" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--schema-default", "REDACT",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings("REDACT", cfg.schema_default);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.schema_default_src);
+}
+
+test "Config - schema-default invalid value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--schema-default", "DELETE",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidSchemaDefault, res);
+}
+
+test "Config - schema-default missing value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--schema-default",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
+}
+
+test "Config - hash-key valid 64 hex chars" {
+    const valid_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const args = [_][]const u8{
+        "nanomask",
+        "--hash-key", valid_key,
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings(valid_key, cfg.hash_key.?);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.hash_key_src);
+}
+
+test "Config - hash-key invalid length" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--hash-key", "tooshort",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidHashKey, res);
+}
+
+test "Config - hash-key invalid hex chars" {
+    // 64 chars but contains 'g' which is not valid hex
+    const args = [_][]const u8{
+        "nanomask",
+        "--hash-key", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidHashKey, res);
+}
+
+test "Config - hash-key missing value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--hash-key",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
+}
+
+test "Config - hash-key-file not found" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--hash-key-file", "nonexistent_hash_key_12345.txt",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.HashKeyFileNotFound, res);
+}
+
+test "Config - schema-file not found" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--schema-file", "nonexistent_schema_12345.txt",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.SchemaFileNotFound, res);
 }
