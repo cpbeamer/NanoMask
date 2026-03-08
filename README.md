@@ -12,6 +12,8 @@ NanoMask is a high-throughput HTTP reverse proxy that **de-identifies protected 
 
 Built for **VA claims processing** and DoD environments where OCR-scanned clinical documents contain inconsistent patient name spellings, SSNs, and other PII that must never reach third-party services.
 
+NanoMask currently operates on HTTP text and JSON payloads. It does not perform OCR, PDF parsing, image parsing, archive extraction, or generic file ingestion itself; run those extraction steps upstream and send the resulting text or JSON through the proxy.
+
 ## Why NanoMask?
 
 | Problem | NanoMask's Answer |
@@ -33,6 +35,9 @@ Built for **VA claims processing** and DoD environments where OCR-scanned clinic
 ```bash
 # Build the proxy (ReleaseFast for production)
 zig build -Doptimize=ReleaseFast
+
+# Print the full runtime help surface
+.\zig-out\bin\NanoMask.exe --help
 
 # Run with defaults (listens on :8081, forwards to httpbin.org:80)
 zig build run
@@ -72,6 +77,9 @@ NANOMASK_TARGET_HOST=api.internal NANOMASK_TARGET_PORT=443 zig build run
 
 # Tune upstream timeouts and graceful shutdown draining
 zig build run -- --target-host api.openai.com --target-port 443 --target-tls --upstream-connect-timeout-ms 3000 --upstream-read-timeout-ms 45000 --upstream-request-timeout-ms 90000 --shutdown-drain-timeout-ms 45000
+
+# Enable the optional pattern library plus schema-aware JSON actions
+zig build run -- --target-host api.openai.com --target-port 443 --target-tls --enable-email --enable-phone --enable-credit-card --enable-ip --enable-healthcare --schema-file schema.json --schema-default SCAN --hash-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 Or pass entity names per-request via HTTP header:
@@ -90,6 +98,20 @@ The proxy transforms the outbound request to:
 ```
 
 And transparently restores `Entity_A` → `John Doe` in the upstream response.
+
+### Supported Features
+
+Core redaction and restore surface:
+- SSN redaction is always available for supported text and JSON bodies.
+- Entity masking and response unmasking can be driven from `--entity-file` / `NANOMASK_ENTITY_FILE` or per-request `X-ZPG-Entities`.
+- Fuzzy matching targets OCR-style name drift in text that has already been extracted into the HTTP payload.
+- Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, and healthcare identifiers.
+- Optional schema-aware JSON mode exposes `KEEP`, `REDACT`, `SCAN`, and `HASH` actions through `--schema-file`, `--schema-default`, `--hash-key`, and `--hash-key-file`.
+
+Current limits:
+- NanoMask operates on HTTP request and response bodies. It does not ingest PDFs, Office files, images, audio, video, or other generic files for inline redaction.
+- PDF, image, audio, video, and octet-stream payloads are bypassed or rejected according to the configured body policy; they are not transformed inline.
+- Schema mode currently applies to JSON request bodies, and HASH restore still buffers JSON responses before unhashing.
 
 ### Payload Policy
 
@@ -345,6 +367,7 @@ NanoMask supports a strict configuration precedence:
 | Entity file | `--entity-file` | `NANOMASK_ENTITY_FILE` | none | Path to file containing entity aliases |
 | Fuzzy threshold | `--fuzzy-threshold` | `NANOMASK_FUZZY_THRESHOLD`| `0.80` (80%) | Minimum similarity for fuzzy match |
 | Max connections | `--max-connections` | `NANOMASK_MAX_CONNECTIONS`| `128` | Concurrent connection limit |
+| Max body size | `--max-body-size` | `NANOMASK_MAX_BODY_SIZE` | `10485760` | Maximum request body size in bytes before NanoMask rejects the payload |
 | Upstream connect timeout | `--upstream-connect-timeout-ms` | `NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS` | `5000` | TCP connect and TLS establishment timeout in ms; `0` disables it |
 | Upstream read timeout | `--upstream-read-timeout-ms` | `NANOMASK_UPSTREAM_READ_TIMEOUT_MS` | `30000` | Maximum idle wait for the next upstream response bytes in ms; `0` disables it |
 | Upstream request timeout | `--upstream-request-timeout-ms` | `NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS` | `60000` | Overall upstream request deadline in ms, including connect, headers, and body; `0` disables it |
@@ -363,6 +386,15 @@ NanoMask supports a strict configuration precedence:
 | Suppress system CAs | `--tls-no-system-ca` | `NANOMASK_TLS_NO_SYSTEM_CA` | disabled | Suppress system CA bundle; use with `--ca-file` for self-signed certs |
 | Log file | `--log-file` | `NANOMASK_LOG_FILE` | stderr | Write structured JSON logs to file (append mode) |
 | Audit log | `--audit-log` | `NANOMASK_AUDIT_LOG` | disabled | Enable per-redaction audit events in log output |
+| Email redaction | `--enable-email` | `NANOMASK_ENABLE_EMAIL` | disabled | Enable built-in email address redaction |
+| Phone redaction | `--enable-phone` | `NANOMASK_ENABLE_PHONE` | disabled | Enable built-in phone number redaction |
+| Credit card redaction | `--enable-credit-card` | `NANOMASK_ENABLE_CREDIT_CARD` | disabled | Enable built-in credit card redaction with Luhn validation |
+| IP address redaction | `--enable-ip` | `NANOMASK_ENABLE_IP` | disabled | Enable built-in IPv4 and IPv6 redaction |
+| Healthcare pattern redaction | `--enable-healthcare` | `NANOMASK_ENABLE_HEALTHCARE` | disabled | Enable built-in healthcare identifier redaction |
+| Schema file | `--schema-file` | `NANOMASK_SCHEMA_FILE` | none | Load JSON field-level redaction rules from a file |
+| Schema default action | `--schema-default` | `NANOMASK_SCHEMA_DEFAULT` | `SCAN` | Default schema action for unlisted JSON keys: `REDACT`, `KEEP`, or `SCAN` |
+| HASH key | `--hash-key` | `NANOMASK_HASH_KEY` | none | Inline 64-character hex HMAC key for schema `HASH` actions |
+| HASH key file | `--hash-key-file` | `NANOMASK_HASH_KEY_FILE` | none | File containing the 64-character hex HMAC key for schema `HASH` actions |
 
 *Note: Per-request `X-ZPG-Entities` header overrides the entity names loaded from the file or compiled defaults.*
 

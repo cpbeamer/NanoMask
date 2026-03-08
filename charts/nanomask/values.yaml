@@ -44,6 +44,10 @@ proxy:
   auditLog: false
   # -- Maximum request body size in bytes (default 10 MB).
   maxBodySize: 10485760
+  # -- Unsupported request body handling: bypass or reject.
+  unsupportedRequestBodyBehavior: reject
+  # -- Unsupported response body handling: bypass or reject.
+  unsupportedResponseBodyBehavior: bypass
   # -- Upstream TCP connect timeout in milliseconds (0 disables).
   upstreamConnectTimeoutMs: 5000
   # -- Upstream response read timeout in milliseconds (0 disables).
@@ -57,7 +61,7 @@ proxy:
 adminApi:
   # -- Enable the /_admin/entities REST API.
   enabled: false
-  # -- Bearer token required for admin endpoints (leave empty to disable auth).
+  # -- Bearer token required for admin endpoints when adminApi.enabled is true.
   token: ""
 
 # ── Entity list ──────────────────────────────────────────────────────
@@ -65,6 +69,42 @@ entities:
   # -- Newline-delimited entity names to redact (mounted as a ConfigMap).
   # Leave empty to run in SSN-only mode.
   data: ""
+  # -- File watcher poll interval in milliseconds for mounted entity files.
+  watchIntervalMs: 1000
+
+# -- Optional pattern-library redaction toggles.
+features:
+  # -- Redact email addresses.
+  email: false
+  # -- Redact phone numbers.
+  phone: false
+  # -- Redact credit card numbers with Luhn validation.
+  creditCard: false
+  # -- Redact IPv4 and IPv6 addresses.
+  ipAddress: false
+  # -- Redact healthcare identifiers such as MRN, ICD-10, and insurance IDs.
+  healthcarePatterns: false
+
+# -- Optional schema-aware JSON redaction.
+schema:
+  # -- Filename to write inside the schema ConfigMap volume.
+  fileName: schema.json
+  # -- Inline JSON schema document. Leave empty to disable schema mode.
+  data: ""
+  # -- Default action for keys not listed in the schema: REDACT, KEEP, or SCAN.
+  defaultAction: SCAN
+
+# -- Optional HASH-mode key configuration.
+hashing:
+  # -- Inline 64-character hex key exposed as NANOMASK_HASH_KEY.
+  # Prefer an external secret manager for production workloads.
+  # Empty string = disabled (Helm treats "" as falsy).
+  key: ""
+  # -- Filename to write when mounting a hash key file.
+  fileName: hash-key.txt
+  # -- File contents exposed through NANOMASK_HASH_KEY_FILE.
+  # Set only one of hashing.key or hashing.fileData.
+  fileData: ""
 
 # ── Listener TLS (client → NanoMask) ─────────────────────────────────
 tls:

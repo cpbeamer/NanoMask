@@ -9,6 +9,7 @@
 #
 # NanoMask performs inline redaction for JSON and text payloads.
 # Common binary formats such as PDF, image/*, audio/*, video/*, and octet-stream bodies are bypassed unchanged.
+# It does not perform OCR or PDF/image parsing itself; feed OCR-derived text or JSON into the proxy.
 #
 apiVersion: v1
 kind: Pod
@@ -33,8 +34,9 @@ spec:
           while true; do
             echo "Sending request through NanoMask sidecar..."
             curl -s -X POST http://localhost:8081/post \
+              -H "X-ZPG-Entities: Jane Smith" \
               -H "Content-Type: application/json" \
-              -d '{"patient": "Jane Smith", "ssn": "123-45-6789", "notes": "Routine checkup"}'
+              -d '{"patient": "Jane Smith", "patient_email": "jane.smith@example.com", "patient_phone": "202-555-0147", "patient_id": "A1234567", "notes": "SSN 123-45-6789, card 4111-1111-1111-1111, source 203.0.113.7, MRN MRN123456"}'
             echo ""
             sleep 10
           done
@@ -63,6 +65,26 @@ spec:
           value: "bypass"
         - name: NANOMASK_LOG_LEVEL
           value: info
+        - name: NANOMASK_AUDIT_LOG
+          value: "true"
+        - name: NANOMASK_ENABLE_EMAIL
+          value: "true"
+        - name: NANOMASK_ENABLE_PHONE
+          value: "true"
+        - name: NANOMASK_ENABLE_CREDIT_CARD
+          value: "true"
+        - name: NANOMASK_ENABLE_IP
+          value: "true"
+        - name: NANOMASK_ENABLE_HEALTHCARE
+          value: "true"
+        - name: NANOMASK_SCHEMA_FILE
+          value: /etc/nanomask/schema/schema.json
+        - name: NANOMASK_SCHEMA_DEFAULT
+          value: SCAN
+        # ⚠️ EXAMPLE ONLY — never use this key in production.
+        # In production, prefer a mounted Secret or external secret manager.
+        - name: NANOMASK_HASH_KEY
+          value: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       ports:
         - containerPort: 8081
           protocol: TCP
@@ -94,3 +116,25 @@ spec:
         allowPrivilegeEscalation: false
         capabilities:
           drop: ["ALL"]
+      volumeMounts:
+        - name: schema
+          mountPath: /etc/nanomask/schema
+          readOnly: true
+  volumes:
+    - name: schema
+      configMap:
+        name: nanomask-sidecar-schema
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nanomask-sidecar-schema
+data:
+  schema.json: |
+    {
+      "patient": "KEEP",
+      "patient_email": "REDACT",
+      "patient_phone": "REDACT",
+      "patient_id": "HASH",
+      "notes": "SCAN"
+    }

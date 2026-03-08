@@ -184,50 +184,58 @@ pub const Config = struct {
         }
     }
 
+    pub const help_text =
+        \\Usage: nanomask [options]
+        \\
+        \\Core proxy:
+        \\  --listen-host <ip>                  Host/IP to bind on (default: 127.0.0.1)
+        \\  --listen-port <u16>                 Port to listen on (default: 8081)
+        \\  --target-host <string>              Upstream target host (default: httpbin.org)
+        \\  --target-port <u16>                 Upstream target port (default: 80)
+        \\  --target-tls                        Enable TLS for upstream connections (default: disabled)
+        \\  --max-connections <u32>             Maximum concurrent connections (default: 128)
+        \\  --max-body-size <bytes>             Maximum request body size in bytes (default: 10485760)
+        \\  --entity-file <path>                Path to file containing entity aliases (default: none)
+        \\  --watch-interval <ms>               Entity file poll interval in ms (default: 1000)
+        \\  --fuzzy-threshold <f32>             Threshold for fuzzy matching (0.0 - 1.0) (default: 0.8)
+        \\
+        \\Safety and operations:
+        \\  --log-level <level>                 Logging level: debug, info, warn, error (default: info)
+        \\  --log-file <path>                   Write structured JSON logs to file (default: stderr)
+        \\  --audit-log                         Enable per-redaction audit events in log output
+        \\  --tls-cert <path>                   PEM certificate file for TLS (requires --tls-key)
+        \\  --tls-key <path>                    PEM private key file for TLS (requires --tls-cert)
+        \\  --ca-file <path>                    Custom CA bundle PEM for upstream TLS verification
+        \\  --tls-no-system-ca                  Suppress system CA loading (use with --ca-file for self-signed certs)
+        \\  --upstream-connect-timeout-ms <ms>  Upstream TCP connect timeout in ms (0 disables, default: 5000)
+        \\  --upstream-read-timeout-ms <ms>     Upstream response read timeout in ms (0 disables, default: 30000)
+        \\  --upstream-request-timeout-ms <ms>  Overall upstream request timeout in ms (0 disables, default: 60000)
+        \\  --shutdown-drain-timeout-ms <ms>    Graceful shutdown drain window in ms (0 disables waiting, default: 30000)
+        \\  --unsupported-request-body-behavior <mode>   Unsupported request body handling: bypass or reject (default: reject)
+        \\  --unsupported-response-body-behavior <mode>  Unsupported response body handling: bypass or reject (default: bypass)
+        \\
+        \\Admin and utilities:
+        \\  --admin-api                         Enable /_admin/entities REST endpoints (default: disabled)
+        \\  --admin-token <secret>              Require Bearer token for admin endpoints
+        \\  --entity-file-sync                  Write API entity changes back to entity file
+        \\  --healthcheck                       Probe /healthz on the local listener and exit
+        \\  --help                              Print this help message and exit
+        \\
+        \\Optional detection features:
+        \\  --enable-email                      Redact email addresses (default: disabled)
+        \\  --enable-phone                      Redact phone numbers (default: disabled)
+        \\  --enable-credit-card                Redact credit card numbers with Luhn validation (default: disabled)
+        \\  --enable-ip                         Redact IPv4/IPv6 addresses (default: disabled)
+        \\  --enable-healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
+        \\  --schema-file <path>                JSON schema file for field-level redaction
+        \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
+        \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
+        \\  --hash-key-file <path>              File containing the 64-char hex HMAC key
+        \\
+    ;
+
     pub fn printHelp() void {
-        std.debug.print(
-            \\Usage: nanomask [options]
-            \\
-            \\Options:
-            \\  --listen-host <ip>         Host/IP to bind on (default: 127.0.0.1)
-            \\  --listen-port <u16>        Port to listen on (default: 8081)
-            \\  --target-host <string>     Upstream target host (default: httpbin.org)
-            \\  --target-port <u16>        Upstream target port (default: 80)
-            \\  --entity-file <path>       Path to file containing entity aliases (default: none)
-            \\  --fuzzy-threshold <f32>    Threshold for fuzzy matching (0.0 - 1.0) (default: 0.8)
-            \\  --max-connections <u32>    Maximum concurrent connections (default: 128)
-            \\  --log-level <level>        Logging level: debug, info, warn, error (default: info)
-            \\  --watch-interval <ms>      Entity file poll interval in ms (default: 1000)
-            \\  --admin-api                 Enable /_admin/entities REST endpoints (default: disabled)
-            \\  --admin-token <secret>      Require Bearer token for admin endpoints
-            \\  --entity-file-sync          Write API entity changes back to entity file
-            \\  --tls-cert <path>           PEM certificate file for TLS (requires --tls-key)
-            \\  --tls-key <path>            PEM private key file for TLS (requires --tls-cert)
-            \\  --target-tls                Enable TLS for upstream connections (default: disabled)
-            \\  --ca-file <path>            Custom CA bundle PEM for upstream TLS verification
-            \\  --tls-no-system-ca          Suppress system CA bundle loading (use with --ca-file for self-signed certs)
-            \\  --max-body-size <bytes>      Maximum request body size in bytes (default: 10485760 = 10 MB)
-            \\  --upstream-connect-timeout-ms <ms>  Upstream TCP connect timeout in ms (0 disables, default: 5000)
-            \\  --upstream-read-timeout-ms <ms>     Upstream response read timeout in ms (0 disables, default: 30000)
-            \\  --upstream-request-timeout-ms <ms>  Overall upstream request timeout in ms (0 disables, default: 60000)
-            \\  --shutdown-drain-timeout-ms <ms>    Graceful shutdown drain window in ms (0 disables waiting, default: 30000)
-            \\  --unsupported-request-body-behavior <mode>  Unsupported request body handling: bypass or reject (default: reject)
-            \\  --unsupported-response-body-behavior <mode> Unsupported response body handling: bypass or reject (default: bypass)
-            \\  --log-file <path>            Write structured JSON logs to file (default: stderr)
-            \\  --audit-log                  Enable per-redaction audit events in log output
-            \\  --enable-email               Redact email addresses (default: disabled)
-            \\  --enable-phone               Redact US phone numbers (default: disabled)
-            \\  --enable-credit-card          Redact credit card numbers with Luhn validation (default: disabled)
-            \\  --enable-ip                  Redact IPv4/IPv6 addresses (default: disabled)
-            \\  --enable-healthcare           Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
-            \\  --schema-file <path>          JSON schema file for field-level redaction (Epic 8)
-            \\  --schema-default <action>     Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
-            \\  --hash-key <hex>              64-char hex HMAC key for HASH-mode pseudonymization
-            \\  --hash-key-file <path>        File containing 64-char hex HMAC key
-            \\  --healthcheck                Probe /healthz on the local listener and exit
-            \\  --help                     Print this help message and exit
-            \\
-        , .{});
+        std.debug.print("{s}", .{help_text});
     }
 
     fn needsBracketedHost(host: []const u8) bool {
@@ -1092,6 +1100,14 @@ test "Config - help flag" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.HelpRequested, res);
+}
+
+test "Config - help text includes optional feature surface" {
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--enable-email") != null);
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--enable-healthcare") != null);
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--schema-file") != null);
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--hash-key-file") != null);
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--unsupported-request-body-behavior") != null);
 }
 
 test "Config - invalid max connections zero" {

@@ -9,6 +9,7 @@
 #
 # NanoMask performs inline redaction for JSON and text payloads.
 # Common binary formats such as PDF, image/*, audio/*, video/*, and octet-stream bodies are bypassed unchanged.
+# It does not perform OCR or parse generic files directly; send OCR-derived text or JSON through the gateway.
 #
 ---
 apiVersion: apps/v1
@@ -56,6 +57,28 @@ spec:
               value: "bypass"
             - name: NANOMASK_LOG_LEVEL
               value: info
+            - name: NANOMASK_AUDIT_LOG
+              value: "true"
+            - name: NANOMASK_ENABLE_EMAIL
+              value: "true"
+            - name: NANOMASK_ENABLE_PHONE
+              value: "true"
+            - name: NANOMASK_ENABLE_CREDIT_CARD
+              value: "true"
+            - name: NANOMASK_ENABLE_IP
+              value: "true"
+            - name: NANOMASK_ENABLE_HEALTHCARE
+              value: "true"
+            - name: NANOMASK_ENTITY_FILE
+              value: /etc/nanomask/entities/entities.txt
+            - name: NANOMASK_WATCH_INTERVAL
+              value: "1000"
+            - name: NANOMASK_SCHEMA_FILE
+              value: /etc/nanomask/schema/schema.json
+            - name: NANOMASK_SCHEMA_DEFAULT
+              value: SCAN
+            - name: NANOMASK_HASH_KEY_FILE
+              value: /etc/nanomask/hash/hash-key.txt
           ports:
             - name: http
               containerPort: 8081
@@ -88,6 +111,67 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          volumeMounts:
+            - name: entities
+              mountPath: /etc/nanomask/entities
+              readOnly: true
+            - name: schema
+              mountPath: /etc/nanomask/schema
+              readOnly: true
+            - name: hash
+              mountPath: /etc/nanomask/hash
+              readOnly: true
+      volumes:
+        - name: entities
+          configMap:
+            name: nanomask-gateway-entities
+        - name: schema
+          configMap:
+            name: nanomask-gateway-schema
+        - name: hash
+          secret:
+            secretName: nanomask-gateway-hash
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nanomask-gateway-entities
+  labels:
+    app.kubernetes.io/name: nanomask
+    app.kubernetes.io/component: gateway
+data:
+  entities.txt: |
+    Jane Smith
+    John Doe
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nanomask-gateway-schema
+  labels:
+    app.kubernetes.io/name: nanomask
+    app.kubernetes.io/component: gateway
+data:
+  schema.json: |
+    {
+      "patient_name": "KEEP",
+      "patient_email": "REDACT",
+      "patient_phone": "REDACT",
+      "patient_id": "HASH",
+      "notes": "SCAN"
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nanomask-gateway-hash
+  labels:
+    app.kubernetes.io/name: nanomask
+    app.kubernetes.io/component: gateway
+type: Opaque
+stringData:
+  hash-key.txt: |
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ---
 apiVersion: v1
 kind: Service
@@ -122,6 +206,11 @@ metadata:
     # Adjust the ingress class for your cluster (nginx, alb, traefik, etc.)
 spec:
   ingressClassName: nginx
+  # Uncomment to terminate TLS at the Ingress (recommended for privacy workloads):
+  # tls:
+  #   - hosts:
+  #       - nanomask.internal.example.com
+  #     secretName: nanomask-gateway-tls
   rules:
     - host: nanomask.internal.example.com
       http:

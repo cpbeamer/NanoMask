@@ -9,3 +9,15 @@ data:
   entities.txt: |
     {{- .Values.entities.data | nindent 4 }}
 {{- end }}
+{{- if .Values.schema.data }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nanomask.fullname" . }}-schema
+  labels:
+    {{- include "nanomask.labels" . | nindent 4 }}
+data:
+  {{ .Values.schema.fileName }}: |
+    {{- .Values.schema.data | nindent 4 }}
+{{- end }}
