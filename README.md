@@ -43,7 +43,10 @@ zig build run -- --entity-file entities.txt
 # Run benchmarks (ReleaseFast, clean output on Windows)
 zig build bench-all 2>$null
 
-# Run all tests (250+ tests)
+# Run the vendor compatibility suite and emit the matrix artifact
+zig build compat-matrix -- compatibility/compatibility-matrix.json
+
+# Run the full repo test suite
 zig build test
 ```
 
@@ -119,6 +122,8 @@ NanoMask now preserves end-to-end response headers by default and only strips ho
 - HASH restore (`unhashJson`) still requires full JSON buffering. When that happens the proxy logs `response_mode="buffered"` with `buffer_reason="json_unhash"` so operators can see why streaming was disabled for that response.
 
 The local mock-upstream compliance suite includes streamed SSE and NDJSON flows with inter-chunk delays and asserts that the first downstream chunk arrives before the full upstream response completes. That gives NanoMask a regression check for first-token latency on loopback without relying on an external vendor.
+**Known limitation**: The compatibility matrix currently reports that Anthropic-style SSE streaming is collapsed into a single client chunk. The proxy forwards the data correctly, but incremental per-chunk flushing is not yet verified as arriving in separate reads for the SSE flow. Improving incremental flush fidelity is tracked as part of the NMV2-003 streaming follow-up.
+
 ## Algorithms
 
 NanoMask runs a **3-stage privacy pipeline** on every request body. Each stage is optimized for a specific class of PII pattern, and they execute in sequence so that later stages only process text not already redacted by earlier ones.

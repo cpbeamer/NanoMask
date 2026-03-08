@@ -174,4 +174,32 @@ pub fn build(b: *std.Build) void {
     const run_bench_all = b.addRunArtifact(bench_exe);
     const bench_all_step = b.step("bench-all", "Run all pipeline benchmarks (standalone, ReleaseFast)");
     bench_all_step.dependOn(&run_bench_all.step);
+
+    // --- Compatibility suite: `zig build compat-test` ---
+    const compat_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compat_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_compat_tests = b.addRunArtifact(compat_tests);
+    const compat_test_step = b.step("compat-test", "Run the compatibility integration suite");
+    compat_test_step.dependOn(&run_compat_tests.step);
+
+    // --- Compatibility matrix artifact: `zig build compat-matrix -- <output>` ---
+    const compat_matrix_exe = b.addExecutable(.{
+        .name = "NanoMask-compat-matrix",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compat_matrix.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_compat_matrix = b.addRunArtifact(compat_matrix_exe);
+    if (b.args) |args| {
+        run_compat_matrix.addArgs(args);
+    }
+    const compat_matrix_step = b.step("compat-matrix", "Generate the compatibility matrix JSON artifact");
+    compat_matrix_step.dependOn(&run_compat_matrix.step);
 }

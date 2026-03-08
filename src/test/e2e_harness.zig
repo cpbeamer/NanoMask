@@ -49,6 +49,10 @@ pub const HarnessConfig = struct {
     entity_names: []const []const u8 = &.{},
     /// Fuzzy matching threshold (0.0-1.0). 0 = disabled.
     fuzzy_threshold: f32 = 0.0,
+    /// HTTP method to send to NanoMask.
+    request_method: http.Method = .POST,
+    /// Request target sent to NanoMask, including any query string.
+    request_target: []const u8 = "/api/data",
     /// Content-Type to send to NanoMask. Null omits the header entirely.
     request_content_type: ?[]const u8 = "application/json",
     /// Optional Content-Encoding to send to NanoMask.
@@ -81,23 +85,64 @@ pub const HarnessConfig = struct {
     request_extra_headers: []const http.Header = &.{},
 };
 
-fn readAvailable(reader: *std.Io.Reader, buffer: []u8) !usize {
-    var targets = [_][]u8{buffer};
-    return reader.readVec(&targets) catch |err| switch (err) {
-        error.EndOfStream => 0,
-        else => |e| return e,
-    };
-}
-
 fn elapsedSince(start_ns: @TypeOf(std.time.nanoTimestamp())) u64 {
     const delta = std.time.nanoTimestamp() - start_ns;
     return if (delta < 0) 0 else @intCast(delta);
 }
 
-/// Send a POST request to `uri` with `payload` using content-length encoding
-/// and return the response status and body.
-fn httpPost(
+const TimingBodyCollector = struct {
+    sink: std.Io.Writer.Allocating,
+    writer: std.Io.Writer,
+    receive_start_ns: @TypeOf(std.time.nanoTimestamp()),
+    chunk_count: usize = 0,
+    first_chunk_latency_ns: ?u64 = null,
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drain,
+        .flush = flush,
+    };
+
+    fn init(allocator: std.mem.Allocator, receive_start_ns: @TypeOf(std.time.nanoTimestamp())) TimingBodyCollector {
+        return .{
+            .sink = .init(allocator),
+            .writer = .{
+                .vtable = &vtable,
+                .buffer = &.{},
+            },
+            .receive_start_ns = receive_start_ns,
+        };
+    }
+
+    fn deinit(self: *TimingBodyCollector) void {
+        self.sink.deinit();
+    }
+
+    fn toOwnedSlice(self: *TimingBodyCollector) ![]u8 {
+        return self.sink.toOwnedSlice();
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *TimingBodyCollector = @alignCast(@fieldParentPtr("writer", writer));
+        self.chunk_count += 1;
+        if (self.first_chunk_latency_ns == null) {
+            self.first_chunk_latency_ns = elapsedSince(self.receive_start_ns);
+        }
+        return self.sink.writer.writeSplat(data, splat) catch return error.WriteFailed;
+    }
+
+    fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        _ = writer;
+    }
+};
+
+/// Send an HTTP request to `uri` and return the response status and body.
+fn httpRequest(
     allocator: std.mem.Allocator,
+    method: http.Method,
     uri: std.Uri,
     payload: []const u8,
     content_type: ?[]const u8,
@@ -118,17 +163,21 @@ fn httpPost(
     else
         .omit;
 
-    var req = try client.request(.POST, uri, .{
+    var req = try client.request(method, uri, .{
         .headers = .{ .content_type = content_type_header },
         .extra_headers = extra_headers,
     });
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = payload.len };
-    var body_buf: [1]u8 = undefined;
-    var body_writer = try req.sendBodyUnflushed(&body_buf);
-    try body_writer.writer.writeAll(payload);
-    try body_writer.end();
+    if (method.requestHasBody()) {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body_buf: [1]u8 = undefined;
+        var body_writer = try req.sendBodyUnflushed(&body_buf);
+        try body_writer.writer.writeAll(payload);
+        try body_writer.end();
+    } else {
+        try req.sendBodilessUnflushed();
+    }
     try req.connection.?.flush();
 
     var redirect_buf: [4096]u8 = undefined;
@@ -140,27 +189,17 @@ fn httpPost(
 
     var transfer_buf: [4096]u8 = undefined;
     const reader = res.reader(&transfer_buf);
-    var resp_body = std.ArrayListUnmanaged(u8).empty;
-    defer resp_body.deinit(allocator);
-    var chunk: [4096]u8 = undefined;
-    var chunk_count: usize = 0;
-    var first_chunk_latency_ns: ?u64 = null;
-    while (true) {
-        const n = try readAvailable(reader, &chunk);
-        if (n == 0) break;
-        chunk_count += 1;
-        if (first_chunk_latency_ns == null) {
-            first_chunk_latency_ns = elapsedSince(receive_start);
-        }
-        try resp_body.appendSlice(allocator, chunk[0..n]);
-    }
+    var collector = TimingBodyCollector.init(allocator, receive_start);
+    defer collector.deinit();
+    _ = try reader.streamRemaining(&collector.writer);
+    const response_body = try collector.toOwnedSlice();
 
     return .{
         .status = status,
-        .body = try allocator.dupe(u8, resp_body.items),
+        .body = response_body,
         .head = head_bytes,
-        .chunk_count = chunk_count,
-        .first_chunk_latency_ns = first_chunk_latency_ns,
+        .chunk_count = collector.chunk_count,
+        .first_chunk_latency_ns = collector.first_chunk_latency_ns,
         .total_response_latency_ns = elapsedSince(receive_start),
     };
 }
@@ -171,6 +210,10 @@ pub fn roundTrip(
     request_body: []const u8,
     config: HarnessConfig,
 ) !RoundTripResult {
+    if (config.request_target.len == 0 or config.request_target[0] != '/') {
+        return error.InvalidRequestTarget;
+    }
+
     // --- 1. Start mock upstream ---
     var mock = try MockUpstream.init(
         allocator,
@@ -255,14 +298,7 @@ pub fn roundTrip(
 
             var stream_reader = connection.stream.reader(&read_buf);
             var stream_writer = connection.stream.writer(&write_buf);
-            // keep alive: prevent compiler from eliding stack-locals before .interface() borrows them
-            _ = &stream_reader;
-            _ = &stream_writer;
-
-            const reader_iface_ptr = stream_reader.interface();
-            var reader_iface: std.Io.Reader = reader_iface_ptr.*;
-            var writer_iface: std.Io.Writer = stream_writer.interface;
-            var http_server = http.Server.init(&reader_iface, &writer_iface);
+            var http_server = http.Server.init(stream_reader.interface(), &stream_writer.interface);
             var request = http_server.receiveHead() catch return;
 
             proxy.handleRequest(&request, ctx) catch {};
@@ -270,6 +306,13 @@ pub fn roundTrip(
     };
 
     const proxy_thread = try std.Thread.spawn(.{}, ProxyThread.run, .{ &proxy_server, proxy_ctx });
+    var proxy_thread_joined = false;
+    defer if (!proxy_thread_joined) {
+        if (std.net.tcpConnectToAddress(proxy_server.listen_address)) |conn| {
+            conn.close();
+        } else |_| {}
+        proxy_thread.join();
+    };
 
     // Build merged request headers: user-provided extra headers + Content-Encoding
     var request_headers = std.ArrayListUnmanaged(http.Header).empty;
@@ -285,12 +328,13 @@ pub fn roundTrip(
         try request_headers.append(allocator, .{ .name = "Content-Encoding", .value = content_encoding });
     }
 
-    var url_buf: [256]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/data", .{proxy_port});
+    var url_buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ proxy_port, config.request_target });
     const uri = try std.Uri.parse(url);
 
-    const result = try httpPost(
+    const result = try httpRequest(
         allocator,
+        config.request_method,
         uri,
         request_body,
         config.request_content_type,
@@ -298,6 +342,7 @@ pub fn roundTrip(
     );
 
     proxy_thread.join();
+    proxy_thread_joined = true;
 
     mock.stop();
     if (mock.thread) |t| {
@@ -343,4 +388,12 @@ test "harness - passthrough round-trip" {
     try std.testing.expectEqualStrings(body, result.upstream_body);
     try std.testing.expectEqualStrings("upstream says hi", result.client_body);
     try std.testing.expectEqual(http.Status.ok, result.status);
+}
+
+test "harness - invalid request target is rejected before network setup" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidRequestTarget, roundTrip(allocator, "{}", .{
+        .request_target = "api/data",
+    }));
 }

@@ -85,8 +85,9 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     var tls_stream_buf: [32 * 1024]u8 = undefined;
     var tls_stream: ?tls_mod.TlsServerStream = null;
     const raw_reader_iface = stream_reader.interface();
+    const raw_writer_iface = &stream_writer.interface;
     if (ctx.tls_context) |tls_ctx| {
-        tls_stream = tls_mod.accept(tls_ctx, raw_reader_iface, &stream_writer.interface, &tls_stream_buf) catch |err| {
+        tls_stream = tls_mod.accept(tls_ctx, raw_reader_iface, raw_writer_iface, &tls_stream_buf) catch |err| {
             ctx.logger.log(.error_, "tls_handshake_failed", session_id, &.{
                 .{ .key = "error", .value = .{ .string = @errorName(err) } },
             });
@@ -95,9 +96,9 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
     }
 
     // Use TLS stream reader/writer if handshake succeeded, otherwise raw stream
-    var final_reader: std.Io.Reader = if (tls_stream) |*ts| ts.reader().* else raw_reader_iface.*;
-    var final_writer: std.Io.Writer = if (tls_stream) |*ts| ts.writer().* else stream_writer.interface;
-    var server = std.http.Server.init(&final_reader, &final_writer);
+    const final_reader = if (tls_stream) |*ts| ts.reader() else raw_reader_iface;
+    const final_writer = if (tls_stream) |*ts| ts.writer() else raw_writer_iface;
+    var server = std.http.Server.init(final_reader, final_writer);
 
     var request = server.receiveHead() catch |err| {
         ctx.logger.log(.error_, "receive_head_failed", session_id, &.{

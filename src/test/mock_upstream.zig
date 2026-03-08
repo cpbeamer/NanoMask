@@ -81,14 +81,7 @@ pub const MockUpstream = struct {
 
         var stream_reader = connection.stream.reader(&read_buf);
         var stream_writer = connection.stream.writer(&write_buf);
-        // keep alive: prevent compiler from eliding stack-locals before .interface() borrows them
-        _ = &stream_reader;
-        _ = &stream_writer;
-
-        const reader_iface_ptr = stream_reader.interface();
-        var reader_iface: std.Io.Reader = reader_iface_ptr.*;
-        var writer_iface: std.Io.Writer = stream_writer.interface;
-        var server = http.Server.init(&reader_iface, &writer_iface);
+        var server = http.Server.init(stream_reader.interface(), &stream_writer.interface);
         var request = try server.receiveHead();
 
         if (self.recorded_head) |old_head| self.allocator.free(old_head);
@@ -98,18 +91,13 @@ pub const MockUpstream = struct {
             request.head.expect = null;
             var body_read_buf: [8192]u8 = undefined;
             const body_reader = request.readerExpectNone(&body_read_buf);
-            var body = std.ArrayListUnmanaged(u8).empty;
-            defer body.deinit(self.allocator);
+            var body_out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer body_out.deinit();
 
-            var chunk_buf: [8192]u8 = undefined;
-            while (true) {
-                const n = body_reader.readSliceShort(&chunk_buf) catch break;
-                if (n == 0) break;
-                try body.appendSlice(self.allocator, chunk_buf[0..n]);
-            }
+            _ = try body_reader.streamRemaining(&body_out.writer);
 
             if (self.recorded_body) |old_body| self.allocator.free(old_body);
-            self.recorded_body = try body.toOwnedSlice(self.allocator);
+            self.recorded_body = try body_out.toOwnedSlice();
         }
 
         var headers = std.ArrayListUnmanaged(http.Header).empty;
@@ -206,16 +194,13 @@ test "MockUpstream - echo round-trip" {
     // Read response body using Content-Length for deterministic reads
     var transfer_buf: [4096]u8 = undefined;
     const reader = res.reader(&transfer_buf);
-    var resp_body = std.ArrayListUnmanaged(u8).empty;
-    defer resp_body.deinit(allocator);
-    var chunk: [1024]u8 = undefined;
-    while (true) {
-        const n = reader.readSliceShort(&chunk) catch break;
-        if (n == 0) break;
-        try resp_body.appendSlice(allocator, chunk[0..n]);
-    }
+    var resp_out: std.Io.Writer.Allocating = .init(allocator);
+    defer resp_out.deinit();
+    _ = try reader.streamRemaining(&resp_out.writer);
+    const resp_body = try resp_out.toOwnedSlice();
+    defer allocator.free(resp_body);
 
-    try std.testing.expectEqualStrings(response_text, resp_body.items);
+    try std.testing.expectEqualStrings(response_text, resp_body);
 
     // Stop the mock before verifying recorded data to ensure clean shutdown
     mock.stop();
