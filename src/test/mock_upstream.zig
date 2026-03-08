@@ -96,7 +96,6 @@ pub const MockUpstream = struct {
                 const n = body_reader.readSliceShort(&chunk_buf) catch break;
                 if (n == 0) break;
                 try body.appendSlice(self.allocator, chunk_buf[0..n]);
-                if (n < chunk_buf.len) break;
             }
 
             if (self.recorded_body) |old_body| self.allocator.free(old_body);
@@ -145,6 +144,9 @@ test "MockUpstream - echo round-trip" {
     defer mock.deinit();
     try mock.start();
 
+    // Give the accept thread a moment to start listening
+    std.time.sleep(10 * std.time.ns_per_ms);
+
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{mock.port});
     const uri = try std.Uri.parse(url);
@@ -167,6 +169,7 @@ test "MockUpstream - echo round-trip" {
     var res = try req.receiveHead(&redirect_buf);
     try std.testing.expectEqual(std.http.Status.ok, res.head.status);
 
+    // Read response body using Content-Length for deterministic reads
     var transfer_buf: [4096]u8 = undefined;
     const reader = res.reader(&transfer_buf);
     var resp_body = std.ArrayListUnmanaged(u8).empty;
@@ -176,11 +179,11 @@ test "MockUpstream - echo round-trip" {
         const n = reader.readSliceShort(&chunk) catch break;
         if (n == 0) break;
         try resp_body.appendSlice(allocator, chunk[0..n]);
-        if (n < chunk.len) break;
     }
 
     try std.testing.expectEqualStrings(response_text, resp_body.items);
 
+    // Stop the mock before verifying recorded data to ensure clean shutdown
     mock.stop();
     if (mock.thread) |t| {
         t.join();
