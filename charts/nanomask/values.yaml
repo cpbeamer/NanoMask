@@ -62,7 +62,17 @@ adminApi:
   # -- Enable the /_admin/entities REST API.
   enabled: false
   # -- Bearer token required for admin endpoints when adminApi.enabled is true.
+  # Anonymous admin mode is not supported.
   token: ""
+  # -- Optional dedicated admin listener address, for example 127.0.0.1:9091.
+  # This listener is not exposed on the main Service unless you add a separate Service yourself.
+  listenAddress: ""
+  # -- Optional comma-separated exact client IP allowlist for admin routes.
+  allowlist: ""
+  # -- Allow GET visibility but reject POST/PUT/DELETE runtime mutations.
+  readOnly: false
+  # -- Maximum entity mutations per minute across admin routes (0 disables).
+  mutationRateLimitPerMinute: 60
 
 # ── Entity list ──────────────────────────────────────────────────────
 entities:

@@ -3,6 +3,8 @@ const versioned_entity_set = @import("versioned_entity_set.zig");
 const VersionedEntitySet = versioned_entity_set.VersionedEntitySet;
 const observability_mod = @import("../infra/observability.zig");
 const Observability = observability_mod.Observability;
+const logger_mod = @import("../infra/logger.zig");
+const Logger = logger_mod.Logger;
 
 // ---------------------------------------------------------------------------
 // File Watcher — poll-based entity file reload trigger
@@ -23,6 +25,7 @@ pub const FileWatcher = struct {
     fuzzy_threshold: f32,
     allocator: std.mem.Allocator,
     observability: ?*Observability,
+    logger: ?*Logger,
     running: std.atomic.Value(bool),
     thread: ?std.Thread = null,
 
@@ -33,6 +36,7 @@ pub const FileWatcher = struct {
         fuzzy_threshold: f32,
         allocator: std.mem.Allocator,
         observability: ?*Observability,
+        logger: ?*Logger,
     ) FileWatcher {
         // Get initial file stat for baseline comparison
         const stat = getFileStat(path);
@@ -46,6 +50,7 @@ pub const FileWatcher = struct {
             .fuzzy_threshold = fuzzy_threshold,
             .allocator = allocator,
             .observability = observability,
+            .logger = logger,
             .running = std.atomic.Value(bool).init(true),
         };
     }
@@ -89,7 +94,12 @@ pub const FileWatcher = struct {
 
     /// Main poll loop — runs on a background thread.
     fn pollLoop(self: *FileWatcher) void {
-        std.debug.print("[WATCH] File watcher started for '{s}' (poll every {}ms)\n", .{ self.path, self.poll_interval_ms });
+        if (self.logger) |log| {
+            log.log(.info, "file_watcher_started", null, &.{
+                .{ .key = "path", .value = .{ .string = self.path } },
+                .{ .key = "poll_interval_ms", .value = .{ .uint = self.poll_interval_ms } },
+            });
+        }
 
         while (self.running.load(.acquire)) {
             std.Thread.sleep(self.poll_interval_ms * std.time.ns_per_ms);
@@ -103,7 +113,9 @@ pub const FileWatcher = struct {
             }
         }
 
-        std.debug.print("[WATCH] File watcher stopped\n", .{});
+        if (self.logger) |log| {
+            log.info("file_watcher_stopped", null);
+        }
     }
 
     /// Rebuild automaton and swap when entity file changes.
@@ -112,10 +124,17 @@ pub const FileWatcher = struct {
         const new_version = self.entity_set.nextVersion();
         const old_version = new_version - 1;
 
-        std.debug.print("[WATCH] Entity reload started (v{} → v{})\n", .{ old_version, new_version });
+        if (self.logger) |log| {
+            log.log(.info, "entity_reload_started", null, &.{
+                .{ .key = "old_version", .value = .{ .uint = old_version } },
+                .{ .key = "new_version", .value = .{ .uint = new_version } },
+            });
+        }
 
         var timer = std.time.Timer.start() catch {
-            std.debug.print("[WATCH] WARNING: Failed to start timer for reload\n", .{});
+            if (self.logger) |log| {
+                log.warn("entity_reload_timer_failed", null);
+            }
             return;
         };
 
@@ -125,9 +144,23 @@ pub const FileWatcher = struct {
             new_version,
             self.allocator,
         ) catch |err| {
-            std.debug.print("[WATCH] WARNING: Entity reload failed: {s} — keeping current automaton (v{})\n", .{ @errorName(err), old_version });
+            if (self.logger) |log| {
+                log.log(.warn, "entity_reload_failed", null, &.{
+                    .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                    .{ .key = "keeping_version", .value = .{ .uint = old_version } },
+                });
+            }
             if (self.observability) |obs| {
                 obs.markEntityReloadFailure();
+            }
+            if (self.logger) |logger| {
+                logger.auditAdmin(null, .{
+                    .action = "entity_reload",
+                    .source = "watcher",
+                    .result = "failed",
+                    .version = new_version,
+                    .detail = @errorName(err),
+                });
             }
             // Update stat anyway to avoid retrying every poll cycle on a
             // persistently broken file. Next real change will trigger retry.
@@ -141,13 +174,24 @@ pub const FileWatcher = struct {
         const elapsed_ns = timer.read();
         const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
 
-        std.debug.print("[WATCH] Entity reload complete (v{}, {} entities, rebuilt in {}ms)\n", .{
-            new_version,
-            new_snapshot.loaded_names.len,
-            elapsed_ms,
-        });
+        if (self.logger) |log| {
+            log.log(.info, "entity_reload_complete", null, &.{
+                .{ .key = "version", .value = .{ .uint = new_version } },
+                .{ .key = "entity_count", .value = .{ .uint = new_snapshot.loaded_names.len } },
+                .{ .key = "rebuild_ms", .value = .{ .uint = elapsed_ms } },
+            });
+        }
         if (self.observability) |obs| {
             obs.markEntityReloadSuccess();
+        }
+        if (self.logger) |logger| {
+            logger.auditAdmin(null, .{
+                .action = "entity_reload",
+                .source = "watcher",
+                .result = "applied",
+                .version = new_version,
+                .entity_count_after = new_snapshot.loaded_names.len,
+            });
         }
 
         self.last_mtime = new_stat.mtime;
@@ -179,7 +223,7 @@ test "FileWatcher - start and join lifecycle" {
     defer set.deinit();
 
     // Use a very short poll interval — the test only needs one cycle
-    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, allocator, null);
+    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, allocator, null, null);
     try watcher.start();
 
     // Let it run briefly, then join — verifies clean thread cleanup

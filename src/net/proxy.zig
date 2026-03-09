@@ -298,6 +298,8 @@ pub const ProxyContext = struct {
     schema: ?*const schema_mod.Schema = null,
     hasher: ?*hasher_mod.Hasher = null,
     shutdown_state: *const shutdown_mod.ShutdownState,
+    client_address: std.net.Address,
+    listener_mode: admin.ListenerMode,
     upstream_timeouts: upstream_client.UpstreamTimeouts,
 
     /// Build scanner flags from the proxy context's enable fields.
@@ -387,6 +389,27 @@ pub fn handleRequest(
         request.head.transfer_compression,
         ctx.unsupported_request_body_behavior,
     );
+    const admin_route = admin.isAdminRoute(uri_str);
+
+    switch (ctx.listener_mode) {
+        .admin_only => {
+            if (!admin_route) {
+                route = .admin;
+                response_status = .not_found;
+                response_body_bytes = try sendTextResponse(request, .not_found, "Not Found\n");
+                return;
+            }
+        },
+        .proxy_only => {
+            if (admin_route) {
+                route = .admin;
+                response_status = .not_found;
+                response_body_bytes = try sendTextResponse(request, .not_found, "Not Found\n");
+                return;
+            }
+        },
+        .combined => {},
+    }
 
     // --- Health check endpoint (before admin and proxying) ---
     if (method == .GET and std.mem.eql(u8, uri_str, "/healthz")) {
@@ -479,7 +502,7 @@ pub fn handleRequest(
     }
 
     // --- Admin API interception (before proxying) ---
-    if (try admin.handleAdminRequest(request, entity_set, admin_config, allocator)) |admin_status| {
+    if (try admin.handleAdminRequest(request, entity_set, admin_config, ctx.client_address, session_id, allocator)) |admin_status| {
         route = .admin;
         response_status = admin_status;
         log.log(.info, "admin_request", session_id, &.{

@@ -1,4 +1,4 @@
-🎉 NanoMask has been deployed!
+ðŸŽ‰ NanoMask has been deployed!
 
 Get the proxy URL:
 {{- if eq .Values.service.type "ClusterIP" }}
@@ -43,7 +43,14 @@ Forwarding traffic to: {{ .Values.proxy.targetHost }}:{{ .Values.proxy.targetPor
 {{- if .Values.adminApi.enabled }}
 
 Admin API is enabled:
-  curl http://localhost:{{ .Values.service.port }}/_admin/entities
+{{- if .Values.adminApi.listenAddress }}
+  Dedicated listener: {{ .Values.adminApi.listenAddress }}
+  The main Service does not expose this listener automatically.
+  Example from a shell inside the pod or a separate port-forward:
+  curl -H "Authorization: Bearer <token>" http://{{ .Values.adminApi.listenAddress }}/_admin/entities
+{{- else }}
+  curl -H "Authorization: Bearer <token>" http://localhost:{{ .Values.service.port }}/_admin/entities
+{{- end }}
 {{- end }}
 
 {{- if .Values.entities.data }}
@@ -51,6 +58,6 @@ Admin API is enabled:
 Entity list loaded from ConfigMap ({{ include "nanomask.fullname" . }}-entities).
 {{- else }}
 
-⚠️  No entity list configured — running in SSN-only redaction mode.
+âš ï¸  No entity list configured â€” running in SSN-only redaction mode.
     Set entities.data in values.yaml to enable entity masking.
 {{- end }}

@@ -42,6 +42,7 @@ pub const ThreadContext = struct {
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     shutdown_state: *shutdown_mod.ShutdownState,
+    listener_mode: admin.ListenerMode,
     upstream_timeouts: upstream_client.UpstreamTimeouts,
 };
 
@@ -226,6 +227,8 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) v
             .schema = ctx.schema,
             .hasher = ctx.hasher,
             .shutdown_state = ctx.shutdown_state,
+            .client_address = connection.address,
+            .listener_mode = ctx.listener_mode,
             .upstream_timeouts = ctx.upstream_timeouts,
         },
     ) catch |err| {

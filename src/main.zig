@@ -113,6 +113,11 @@ pub fn main() !void {
         .{ .key = "listen_address", .value = .{ .string = listen_address } },
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
+        .{ .key = "admin_api", .value = .{ .boolean = cfg.admin_api } },
+        .{ .key = "admin_listen_address", .value = .{ .string = cfg.admin_listen_address orelse "-" } },
+        .{ .key = "admin_allowlist_configured", .value = .{ .boolean = cfg.admin_allowlist != null } },
+        .{ .key = "admin_read_only", .value = .{ .boolean = cfg.admin_read_only } },
+        .{ .key = "admin_mutation_rate_limit_per_minute", .value = .{ .uint = cfg.admin_mutation_rate_limit_per_minute } },
         .{ .key = "upstream_connect_timeout_ms", .value = .{ .uint = cfg.upstream_connect_timeout_ms } },
         .{ .key = "upstream_read_timeout_ms", .value = .{ .uint = cfg.upstream_read_timeout_ms } },
         .{ .key = "upstream_request_timeout_ms", .value = .{ .uint = cfg.upstream_request_timeout_ms } },
@@ -121,6 +126,17 @@ pub fn main() !void {
         .{ .key = "unsupported_request_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_request_body_behavior) } },
         .{ .key = "unsupported_response_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_response_body_behavior) } },
     });
+
+    var admin_state = admin.AdminState{};
+    var admin_allowlist: ?admin.IpAllowlist = null;
+    defer if (admin_allowlist) |*allowlist| allowlist.deinit();
+
+    if (cfg.admin_allowlist) |allowlist_csv| {
+        admin_allowlist = admin.IpAllowlist.initFromCsv(allowlist_csv, allocator) catch |err| {
+            std.debug.print("error: failed to parse admin allowlist: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
 
     // --- Entity Masking Setup (RCU) ---
     // Heap-allocate so the pointer is stable for the FileWatcher's background
@@ -164,6 +180,7 @@ pub fn main() !void {
             cfg.fuzzy_threshold,
             allocator,
             &observability,
+            &log,
         );
         watcher.?.start() catch {
             log.warn("file_watcher_start_failed", null);
@@ -260,6 +277,7 @@ pub fn main() !void {
         .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
         .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
         .{ .key = "listen_address", .value = .{ .string = listen_address } },
+        .{ .key = "admin_listen_address", .value = .{ .string = cfg.admin_listen_address orelse "-" } },
         .{ .key = "upstream_protocol", .value = .{ .string = upstream_protocol } },
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
@@ -288,6 +306,7 @@ pub fn main() !void {
         std.debug.print("error: invalid listen address '{s}'\n", .{cfg.listen_host});
         std.process.exit(1);
     };
+    const dedicated_admin_listener = cfg.admin_api and cfg.admin_listen_address != null;
 
     // Shared HTTP client: the stdlib ConnectionPool is thread-safe (uses Mutex).
     // All handler threads share this client, enabling TCP connection reuse with
@@ -331,6 +350,11 @@ pub fn main() !void {
     const admin_config = admin.AdminConfig{
         .enabled = cfg.admin_api,
         .token = cfg.admin_token,
+        .allowlist = if (admin_allowlist) |*allowlist| allowlist else null,
+        .read_only = cfg.admin_read_only,
+        .mutation_rate_limit_per_minute = cfg.admin_mutation_rate_limit_per_minute,
+        .state = &admin_state,
+        .logger = &log,
         .entity_file_sync = cfg.entity_file_sync,
         .entity_file = cfg.entity_file,
         .fuzzy_threshold = cfg.fuzzy_threshold,
@@ -343,12 +367,36 @@ pub fn main() !void {
     const net_server = try std.net.Address.listen(bind_address, .{
         .reuse_address = true,
     });
+    var admin_net_server: ?std.net.Server = null;
+    if (dedicated_admin_listener) {
+        const admin_bind_address = std.net.Address.parseIpAndPort(cfg.admin_listen_address.?) catch {
+            std.debug.print("error: invalid admin listen address '{s}'\n", .{cfg.admin_listen_address.?});
+            std.process.exit(1);
+        };
+        admin_net_server = std.net.Address.listen(admin_bind_address, .{
+            .reuse_address = true,
+        }) catch |err| {
+            std.debug.print("error: failed to bind admin listener '{s}': {s}\n", .{
+                cfg.admin_listen_address.?,
+                @errorName(err),
+            });
+            std.process.exit(1);
+        };
+    }
 
     log.log(.info, "server_listening", null, &.{
         .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
         .{ .key = "listen_port", .value = .{ .uint = cfg.listen_port } },
         .{ .key = "listen_address", .value = .{ .string = listen_address } },
     });
+    if (dedicated_admin_listener) {
+        log.log(.info, "admin_server_listening", null, &.{
+            .{ .key = "listen_address", .value = .{ .string = cfg.admin_listen_address.? } },
+            .{ .key = "read_only", .value = .{ .boolean = cfg.admin_read_only } },
+            .{ .key = "allowlist_configured", .value = .{ .boolean = cfg.admin_allowlist != null } },
+            .{ .key = "mutation_rate_limit_per_minute", .value = .{ .uint = cfg.admin_mutation_rate_limit_per_minute } },
+        });
+    }
 
     var server = proxy_server_mod.ProxyServer{
         .net_server = net_server,
@@ -377,6 +425,7 @@ pub fn main() !void {
             .schema = if (schema_instance) |*s| s else null,
             .hasher = if (hasher_instance) |*h| h else null,
             .shutdown_state = &shutdown_state,
+            .listener_mode = if (dedicated_admin_listener) .proxy_only else .combined,
             .upstream_timeouts = .{
                 .connect_timeout_ms = cfg.upstream_connect_timeout_ms,
                 .read_timeout_ms = cfg.upstream_read_timeout_ms,
@@ -392,16 +441,71 @@ pub fn main() !void {
     };
     defer server.deinit();
 
+    var admin_server: ?proxy_server_mod.ProxyServer = null;
+    if (admin_net_server) |ns| {
+        admin_server = .{
+            .net_server = ns,
+            .ctx = .{
+                .allocator = allocator,
+                .target_host = cfg.target_host,
+                .target_port = cfg.target_port,
+                .entity_set = entity_set,
+                .http_client = &http_client,
+                .active_connections = &active_connections,
+                .admin_config = admin_config,
+                .tls_context = if (tls_context) |*tc| tc else null,
+                .target_tls = cfg.target_tls,
+                .max_body_size = cfg.max_body_size,
+                .logger = &log,
+                .observability = &observability,
+                .connections_total = &connections_total,
+                .start_time = start_time,
+                .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
+                .unsupported_response_body_behavior = cfg.unsupported_response_body_behavior,
+                .enable_email = cfg.enable_email,
+                .enable_phone = cfg.enable_phone,
+                .enable_credit_card = cfg.enable_credit_card,
+                .enable_ip = cfg.enable_ip,
+                .enable_healthcare = cfg.enable_healthcare,
+                .schema = if (schema_instance) |*s| s else null,
+                .hasher = if (hasher_instance) |*h| h else null,
+                .shutdown_state = &shutdown_state,
+                .listener_mode = .admin_only,
+                .upstream_timeouts = .{
+                    .connect_timeout_ms = cfg.upstream_connect_timeout_ms,
+                    .read_timeout_ms = cfg.upstream_read_timeout_ms,
+                    .request_timeout_ms = cfg.upstream_request_timeout_ms,
+                },
+            },
+            .max_connections = cfg.max_connections,
+            .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
+            .active_connections = &active_connections,
+            .logger = &log,
+            .observability = &observability,
+            .shutdown_state = &shutdown_state,
+        };
+    }
+    defer if (admin_server) |*server_ptr| server_ptr.deinit();
+
     termination_signal_requested.store(false, .release);
     installTerminationSignalHandlers();
 
-    const ShutdownWatcher = struct {
+    const ListenerRunner = struct {
         fn run(ps: *proxy_server_mod.ProxyServer) void {
+            ps.serve();
+        }
+    };
+
+    const ShutdownWatcher = struct {
+        fn run(ps: *proxy_server_mod.ProxyServer, admin_ps: ?*proxy_server_mod.ProxyServer) void {
             if (builtin.os.tag == .windows) return;
 
             while (!ps.shutdown_state.isRequested()) {
                 if (termination_signal_requested.load(.acquire)) {
                     ps.initiateShutdown("signal");
+                    if (admin_ps) |server_ptr| {
+                        server_ptr.initiateShutdown("signal");
+                    }
                     return;
                 }
                 std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -409,10 +513,19 @@ pub fn main() !void {
         }
     };
 
+    const maybe_admin_thread = if (admin_server) |*server_ptr|
+        try std.Thread.spawn(.{}, ListenerRunner.run, .{server_ptr})
+    else
+        null;
+    defer if (maybe_admin_thread) |admin_thread| admin_thread.join();
+
     const maybe_shutdown_watcher = if (builtin.os.tag == .windows)
         null
     else
-        try std.Thread.spawn(.{}, ShutdownWatcher.run, .{&server});
+        try std.Thread.spawn(.{}, ShutdownWatcher.run, .{
+            &server,
+            if (admin_server) |*server_ptr| server_ptr else null,
+        });
     defer if (maybe_shutdown_watcher) |signal_watcher| signal_watcher.join();
 
     server.serve();

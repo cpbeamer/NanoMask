@@ -97,6 +97,8 @@ spec:
             {{- if .Values.adminApi.enabled }}
             - name: NANOMASK_ADMIN_API
               value: "true"
+            - name: NANOMASK_ADMIN_MUTATION_RATE_LIMIT
+              value: {{ .Values.adminApi.mutationRateLimitPerMinute | quote }}
             {{- end }}
             {{- if .Values.adminApi.token }}
             - name: NANOMASK_ADMIN_TOKEN
@@ -104,6 +106,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "nanomask.fullname" . }}-admin
                   key: token
+            {{- end }}
+            {{- if .Values.adminApi.listenAddress }}
+            - name: NANOMASK_ADMIN_LISTEN_ADDRESS
+              value: {{ .Values.adminApi.listenAddress | quote }}
+            {{- end }}
+            {{- if .Values.adminApi.allowlist }}
+            - name: NANOMASK_ADMIN_ALLOWLIST
+              value: {{ .Values.adminApi.allowlist | quote }}
+            {{- end }}
+            {{- if .Values.adminApi.readOnly }}
+            - name: NANOMASK_ADMIN_READ_ONLY
+              value: "true"
             {{- end }}
             {{- if .Values.entities.data }}
             - name: NANOMASK_ENTITY_FILE

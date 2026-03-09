@@ -81,6 +81,9 @@ NANOMASK_TARGET_HOST=api.internal NANOMASK_TARGET_PORT=443 zig build run
 # Tune upstream timeouts and graceful shutdown draining
 zig build run -- --target-host api.openai.com --target-port 443 --target-tls --upstream-connect-timeout-ms 3000 --upstream-read-timeout-ms 45000 --upstream-request-timeout-ms 90000 --shutdown-drain-timeout-ms 45000
 
+# Put the admin API on a dedicated loopback listener with an allowlist and read-only mode
+zig build run -- --admin-api --admin-token supersecret --admin-listen-address 127.0.0.1:9091 --admin-allowlist 127.0.0.1 --admin-read-only
+
 # Enable the optional pattern library plus schema-aware JSON actions
 zig build run -- --target-host api.openai.com --target-port 443 --target-tls --enable-email --enable-phone --enable-credit-card --enable-ip --enable-healthcare --schema-file schema.json --schema-default SCAN --hash-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
@@ -393,7 +396,11 @@ NanoMask supports a strict configuration precedence:
 | Log level | `--log-level` | `NANOMASK_LOG_LEVEL` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
 | Watch interval | `--watch-interval` | `NANOMASK_WATCH_INTERVAL` | `1000` | Entity file poll interval in ms |
 | Admin API | `--admin-api` | `NANOMASK_ADMIN_API` | disabled | Enable `/_admin/entities` REST endpoints |
-| Admin token | `--admin-token` | `NANOMASK_ADMIN_TOKEN` | none | Require Bearer token for admin endpoints |
+| Admin token | `--admin-token` | `NANOMASK_ADMIN_TOKEN` | required when enabled | Require Bearer token for admin endpoints; anonymous admin mode is not supported |
+| Admin listen address | `--admin-listen-address` | `NANOMASK_ADMIN_LISTEN_ADDRESS` | shared listener | Optional dedicated admin listener such as `127.0.0.1:9091`; when set, the public proxy listener returns `404` for `/_admin/*` |
+| Admin allowlist | `--admin-allowlist` | `NANOMASK_ADMIN_ALLOWLIST` | none | Comma-separated exact client IP allowlist for admin routes |
+| Admin read-only | `--admin-read-only` | `NANOMASK_ADMIN_READ_ONLY` | disabled | Allow admin visibility while rejecting runtime entity mutations |
+| Admin mutation rate limit | `--admin-mutation-rate-limit` | `NANOMASK_ADMIN_MUTATION_RATE_LIMIT` | `60` | Maximum entity mutations per minute across admin routes; `0` disables the limit |
 | Entity sync | `--entity-file-sync` | `NANOMASK_ENTITY_FILE_SYNC` | disabled | Write API entity changes back to entity file |
 | TLS certificate | `--tls-cert` | `NANOMASK_TLS_CERT` | none | PEM certificate file for TLS (requires `--tls-key`) |
 | TLS private key | `--tls-key` | `NANOMASK_TLS_KEY` | none | PEM private key file for TLS (requires `--tls-cert`) |
@@ -420,11 +427,20 @@ NanoMask supports a strict configuration precedence:
 
 > **Upstream TLS**: When `--target-tls` is enabled, NanoMask connects to the upstream server over HTTPS. By default the system CA bundle is used for certificate verification. Use `--ca-file` to specify a custom CA bundle (e.g., for internal PKI or GovCloud environments). Use `--tls-no-system-ca` to suppress the system CA bundle and rely solely on `--ca-file` for trust anchors (e.g., self-signed certificates).
 
+### Admin Control Plane
+
+- `--admin-api` always requires `--admin-token` or `NANOMASK_ADMIN_TOKEN`. Anonymous admin mode is not supported.
+- Without `--admin-listen-address`, `/_admin/entities` is served on the main listener. With a dedicated admin listener, the public proxy listener stops serving admin routes and returns `404` for them instead.
+- `--admin-allowlist` restricts admin access to exact client IP matches, `--admin-read-only` blocks POST/PUT/DELETE mutations, and `--admin-mutation-rate-limit` rejects abusive mutation bursts with HTTP `429`.
+- Enabling `--audit-log` adds `event="admin_audit"` entries for entity add, remove, replace, and watcher-driven reload operations. These audit events include versions and counts, but never the entity values themselves.
+
 ### Structured Logging
 
 NanoMask outputs newline-delimited JSON (NDJSON) to stderr by default. Each log line contains `ts`, `level`, `session_id`, and `msg` fields. Request lifecycle events include `request_received`, `upstream_forwarded`, and `response_sent`; payload decision logs also include `body_policy`, `content_type`, and `content_encoding`. `response_sent` now also records `outcome` and `draining`, and timed-out requests include `timeout_phase` so operators can distinguish normal completion from upstream timeout pressure or graceful-drain completions. Response forwarding logs include `response_mode`, `buffer_reason`, and `flush_per_chunk` so operators can distinguish streamed pass-through traffic from intentionally buffered restore flows. Enable file output with `--log-file <path>` and audit events with `--audit-log`.
 
 When `--audit-log` is enabled, NanoMask emits additional `event="redaction_audit"` lines for every SSN match, exact entity mask, fuzzy entity match, pattern-library match, and schema `REDACT`, `HASH`, or `SCAN` action. Audit events include `stage`, `match_type`, `original_length`, `replacement_type`, and either `offset` or `field_path`; fuzzy events also include `confidence`. Original sensitive values are never written to the audit log.
+
+The same audit stream now includes `event="admin_audit"` for entity add, remove, replace, and reload operations, so control-plane changes show up alongside data-plane privacy events.
 
 Example audit event:
 

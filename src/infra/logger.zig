@@ -127,6 +127,17 @@ pub const Logger = struct {
         confidence: ?f64 = null,
     };
 
+    pub const AdminAuditEvent = struct {
+        action: []const u8,
+        source: []const u8,
+        result: []const u8,
+        version: ?u64 = null,
+        entity_count_before: ?u64 = null,
+        entity_count_after: ?u64 = null,
+        delta_count: ?i64 = null,
+        detail: ?[]const u8 = null,
+    };
+
     /// Emit a structured JSON log line. Thread-safe — acquires mutex for the
     /// duration of the write so that lines are never interleaved.
     pub fn log(
@@ -196,6 +207,59 @@ pub const Logger = struct {
         if (audit_event.confidence) |c| {
             w.writeAll(",\"confidence\":") catch return;
             std.fmt.format(w, "{d:.2}", .{c}) catch return;
+        }
+        w.writeAll("}\n") catch return;
+
+        const line = fbs.getWritten();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.writeOutput(line);
+    }
+
+    pub fn auditAdmin(
+        self: *Logger,
+        session_id: ?[]const u8,
+        audit_event: AdminAuditEvent,
+    ) void {
+        if (!self.audit_enabled) return;
+
+        var buf: [8192]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+
+        w.writeAll("{\"ts\":\"") catch return;
+        writeTimestamp(w) catch return;
+        w.writeAll("\",\"level\":\"") catch return;
+        w.writeAll(levelStr(.info)) catch return;
+        w.writeAll("\",\"event\":\"admin_audit\",\"session_id\":\"") catch return;
+        writeJsonEscaped(w, session_id orelse "-") catch return;
+        w.writeAll("\",\"action\":\"") catch return;
+        writeJsonEscaped(w, audit_event.action) catch return;
+        w.writeAll("\",\"source\":\"") catch return;
+        writeJsonEscaped(w, audit_event.source) catch return;
+        w.writeAll("\",\"result\":\"") catch return;
+        writeJsonEscaped(w, audit_event.result) catch return;
+        w.writeAll("\"") catch return;
+        if (audit_event.version) |version| {
+            w.writeAll(",\"version\":") catch return;
+            std.fmt.format(w, "{d}", .{version}) catch return;
+        }
+        if (audit_event.entity_count_before) |before| {
+            w.writeAll(",\"entity_count_before\":") catch return;
+            std.fmt.format(w, "{d}", .{before}) catch return;
+        }
+        if (audit_event.entity_count_after) |after| {
+            w.writeAll(",\"entity_count_after\":") catch return;
+            std.fmt.format(w, "{d}", .{after}) catch return;
+        }
+        if (audit_event.delta_count) |delta| {
+            w.writeAll(",\"delta_count\":") catch return;
+            std.fmt.format(w, "{d}", .{delta}) catch return;
+        }
+        if (audit_event.detail) |detail| {
+            w.writeAll(",\"detail\":\"") catch return;
+            writeJsonEscaped(w, detail) catch return;
+            w.writeAll("\"") catch return;
         }
         w.writeAll("}\n") catch return;
 
@@ -517,6 +581,38 @@ test "Logger - audit disabled produces zero output" {
         .replacement_type = "mask",
     });
     try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+}
+
+test "Logger - admin audit event emitted when enabled" {
+    var output_buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&output_buf);
+
+    var logger = Logger{
+        .mutex = .{},
+        .test_writer = fbs.writer().any(),
+        .min_level = .debug,
+        .audit_enabled = true,
+        .output_file = null,
+        .owns_file = false,
+    };
+
+    logger.auditAdmin("sess1234", .{
+        .action = "entity_add",
+        .source = "api",
+        .result = "applied",
+        .version = 4,
+        .entity_count_before = 2,
+        .entity_count_after = 3,
+        .delta_count = 1,
+    });
+
+    const output = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"event\":\"admin_audit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"action\":\"entity_add\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"source\":\"api\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"result\":\"applied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"version\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"delta_count\":1") != null);
 }
 
 test "generateSessionId - 8 hex characters" {

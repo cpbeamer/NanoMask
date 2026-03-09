@@ -56,6 +56,14 @@ pub const Config = struct {
     admin_api_src: ConfigSource = .default,
     admin_token: ?[]const u8 = null,
     admin_token_src: ConfigSource = .default,
+    admin_listen_address: ?[]const u8 = null,
+    admin_listen_address_src: ConfigSource = .default,
+    admin_allowlist: ?[]const u8 = null,
+    admin_allowlist_src: ConfigSource = .default,
+    admin_read_only: bool = false,
+    admin_read_only_src: ConfigSource = .default,
+    admin_mutation_rate_limit_per_minute: u32 = 60,
+    admin_mutation_rate_limit_per_minute_src: ConfigSource = .default,
     entity_file_sync: bool = false,
     entity_file_sync_src: ConfigSource = .default,
     tls_cert: ?[]const u8 = null,
@@ -125,6 +133,9 @@ pub const Config = struct {
         InvalidWatchInterval,
         EntityFileNotFound,
         InvalidAdminFlag,
+        InvalidAdminListenAddress,
+        InvalidAdminAllowlist,
+        InvalidAdminRateLimit,
         MissingTlsPair,
         TlsCertNotFound,
         TlsKeyNotFound,
@@ -157,6 +168,12 @@ pub const Config = struct {
         }
         if (self.admin_token != null and self.admin_token_src == .env_var) {
             self.allocator.free(self.admin_token.?);
+        }
+        if (self.admin_listen_address != null and self.admin_listen_address_src == .env_var) {
+            self.allocator.free(self.admin_listen_address.?);
+        }
+        if (self.admin_allowlist != null and self.admin_allowlist_src == .env_var) {
+            self.allocator.free(self.admin_allowlist.?);
         }
         if (self.tls_cert != null and self.tls_cert_src == .env_var) {
             self.allocator.free(self.tls_cert.?);
@@ -216,7 +233,11 @@ pub const Config = struct {
         \\
         \\Admin and utilities:
         \\  --admin-api                         Enable /_admin/entities REST endpoints (default: disabled)
-        \\  --admin-token <secret>              Require Bearer token for admin endpoints
+        \\  --admin-token <secret>              Require Bearer token for admin endpoints (mandatory with --admin-api)
+        \\  --admin-listen-address <ip:port>    Bind admin routes on a dedicated listener instead of the public proxy listener
+        \\  --admin-allowlist <csv>             Comma-separated client IP allowlist for admin routes (exact IPs only)
+        \\  --admin-read-only                   Allow admin visibility but reject runtime entity mutations
+        \\  --admin-mutation-rate-limit <n>     Maximum entity mutations per minute (0 disables, default: 60)
         \\  --entity-file-sync                  Write API entity changes back to entity file
         \\  --healthcheck                       Probe /healthz on the local listener and exit
         \\  --help                              Print this help message and exit
@@ -248,6 +269,31 @@ pub const Config = struct {
             std.debug.print("error: {s} must be a valid IPv4 or IPv6 address, got '{s}'\n", .{ label, value });
             return error.InvalidListenHost;
         };
+    }
+
+    fn validateAdminListenAddressValue(value: []const u8, label: []const u8) ParseError!void {
+        _ = std.net.Address.parseIpAndPort(value) catch {
+            std.debug.print("error: {s} must be a valid IP:port or [IPv6]:port address, got '{s}'\n", .{ label, value });
+            return error.InvalidAdminListenAddress;
+        };
+    }
+
+    fn validateAdminAllowlistValue(value: []const u8, label: []const u8) ParseError!void {
+        var it = std.mem.splitScalar(u8, value, ',');
+        var saw_entry = false;
+        while (it.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len == 0) continue;
+            saw_entry = true;
+            _ = std.net.Address.parseIp(trimmed, 0) catch {
+                std.debug.print("error: {s} must contain comma-separated IPv4 or IPv6 addresses, got '{s}'\n", .{ label, trimmed });
+                return error.InvalidAdminAllowlist;
+            };
+        }
+        if (!saw_entry) {
+            std.debug.print("error: {s} must contain at least one IP address\n", .{label});
+            return error.InvalidAdminAllowlist;
+        }
     }
 
     pub fn healthcheckHost(self: Config) []const u8 {
@@ -338,6 +384,26 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_TOKEN")) {
             config.admin_token = try allocator.dupe(u8, value);
             config.admin_token_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_LISTEN_ADDRESS")) {
+            try validateAdminListenAddressValue(value, "NANOMASK_ADMIN_LISTEN_ADDRESS");
+            config.admin_listen_address = try allocator.dupe(u8, value);
+            config.admin_listen_address_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_ALLOWLIST")) {
+            try validateAdminAllowlistValue(value, "NANOMASK_ADMIN_ALLOWLIST");
+            config.admin_allowlist = try allocator.dupe(u8, value);
+            config.admin_allowlist_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_READ_ONLY")) {
+            config.admin_read_only = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_ADMIN_READ_ONLY must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidAdminFlag;
+            };
+            config.admin_read_only_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_MUTATION_RATE_LIMIT")) {
+            config.admin_mutation_rate_limit_per_minute = std.fmt.parseInt(u32, value, 10) catch {
+                std.debug.print("error: NANOMASK_ADMIN_MUTATION_RATE_LIMIT must be a non-negative integer, got '{s}'\n", .{value});
+                return error.InvalidAdminRateLimit;
+            };
+            config.admin_mutation_rate_limit_per_minute_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FILE_SYNC")) {
             config.entity_file_sync = parseBoolEnv(value) orelse {
                 std.debug.print("error: NANOMASK_ENTITY_FILE_SYNC must be true/false or 1/0, got '{s}'\n", .{value});
@@ -521,6 +587,10 @@ pub const Config = struct {
             "NANOMASK_WATCH_INTERVAL",
             "NANOMASK_ADMIN_API",
             "NANOMASK_ADMIN_TOKEN",
+            "NANOMASK_ADMIN_LISTEN_ADDRESS",
+            "NANOMASK_ADMIN_ALLOWLIST",
+            "NANOMASK_ADMIN_READ_ONLY",
+            "NANOMASK_ADMIN_MUTATION_RATE_LIMIT",
             "NANOMASK_ENTITY_FILE_SYNC",
             "NANOMASK_TLS_CERT",
             "NANOMASK_TLS_KEY",
@@ -697,6 +767,44 @@ pub const Config = struct {
                 }
                 config.admin_token = args[i];
                 config.admin_token_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-listen-address")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --admin-listen-address\n", .{});
+                    return error.MissingValue;
+                }
+                try validateAdminListenAddressValue(args[i], "--admin-listen-address");
+                if (config.admin_listen_address != null and config.admin_listen_address_src == .env_var) {
+                    allocator.free(config.admin_listen_address.?);
+                }
+                config.admin_listen_address = args[i];
+                config.admin_listen_address_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-allowlist")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --admin-allowlist\n", .{});
+                    return error.MissingValue;
+                }
+                try validateAdminAllowlistValue(args[i], "--admin-allowlist");
+                if (config.admin_allowlist != null and config.admin_allowlist_src == .env_var) {
+                    allocator.free(config.admin_allowlist.?);
+                }
+                config.admin_allowlist = args[i];
+                config.admin_allowlist_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-read-only")) {
+                config.admin_read_only = true;
+                config.admin_read_only_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-mutation-rate-limit")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --admin-mutation-rate-limit\n", .{});
+                    return error.MissingValue;
+                }
+                config.admin_mutation_rate_limit_per_minute = std.fmt.parseInt(u32, args[i], 10) catch {
+                    std.debug.print("error: --admin-mutation-rate-limit must be a non-negative integer, got '{s}'\n", .{args[i]});
+                    return error.InvalidAdminRateLimit;
+                };
+                config.admin_mutation_rate_limit_per_minute_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--entity-file-sync")) {
                 config.entity_file_sync = true;
                 config.entity_file_sync_src = .cli_flag;
@@ -964,6 +1072,30 @@ pub const Config = struct {
             return error.MissingAdminToken;
         }
 
+        if (config.admin_api) {
+            if (config.admin_listen_address) |admin_listen_address| {
+                const admin_addr = std.net.Address.parseIpAndPort(admin_listen_address) catch unreachable;
+                const proxy_addr = std.net.Address.parseIp(config.listen_host, config.listen_port) catch unreachable;
+                if (std.net.Address.eql(admin_addr, proxy_addr)) {
+                    std.debug.print("error: --admin-listen-address must differ from the public proxy listener address\n", .{});
+                    return error.InvalidAdminListenAddress;
+                }
+            }
+        }
+
+        if (!config.admin_api and config.admin_listen_address != null) {
+            std.debug.print("WARNING: --admin-listen-address has no effect without --admin-api\n", .{});
+        }
+        if (!config.admin_api and config.admin_allowlist != null) {
+            std.debug.print("WARNING: --admin-allowlist has no effect without --admin-api\n", .{});
+        }
+        if (!config.admin_api and config.admin_read_only) {
+            std.debug.print("WARNING: --admin-read-only has no effect without --admin-api\n", .{});
+        }
+        if (!config.admin_api and config.admin_mutation_rate_limit_per_minute_src != .default) {
+            std.debug.print("WARNING: --admin-mutation-rate-limit has no effect without --admin-api\n", .{});
+        }
+
         return config;
     }
 };
@@ -1180,6 +1312,62 @@ test "Config - admin-api without token fails" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.MissingAdminToken, res);
+}
+
+test "Config - dedicated admin listener and allowlist flags" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--admin-api",
+        "--admin-token",
+        "test-secret",
+        "--admin-listen-address",
+        "127.0.0.1:9091",
+        "--admin-allowlist",
+        "127.0.0.1,::1",
+        "--admin-read-only",
+        "--admin-mutation-rate-limit",
+        "12",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqualStrings("127.0.0.1:9091", cfg.admin_listen_address.?);
+    try testing.expectEqualStrings("127.0.0.1,::1", cfg.admin_allowlist.?);
+    try testing.expect(cfg.admin_read_only);
+    try testing.expectEqual(@as(u32, 12), cfg.admin_mutation_rate_limit_per_minute);
+}
+
+test "Config - admin listen address must differ from proxy listener" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--listen-host",
+        "127.0.0.1",
+        "--listen-port",
+        "8081",
+        "--admin-api",
+        "--admin-token",
+        "test-secret",
+        "--admin-listen-address",
+        "127.0.0.1:8081",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidAdminListenAddress, res);
+}
+
+test "Config - admin allowlist rejects invalid IPs" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--admin-api",
+        "--admin-token",
+        "test-secret",
+        "--admin-allowlist",
+        "127.0.0.1,not-an-ip",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidAdminAllowlist, res);
 }
 
 test "Config - admin-token flag" {

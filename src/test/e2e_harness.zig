@@ -305,6 +305,8 @@ pub fn roundTrip(
         .schema = config.schema,
         .hasher = config.hasher,
         .shutdown_state = &shutdown_state,
+        .client_address = try std.net.Address.parseIp("127.0.0.1", 0),
+        .listener_mode = .combined,
         .upstream_timeouts = .{
             .connect_timeout_ms = config.upstream_connect_timeout_ms,
             .read_timeout_ms = config.upstream_read_timeout_ms,
