@@ -35,6 +35,7 @@ pub const e2e_harness = if (@import("builtin").is_test) @import("test/e2e_harnes
 pub const compliance_suite = if (@import("builtin").is_test) @import("test/compliance_suite.zig") else @compileError("test-only");
 pub const compatibility_matrix = if (@import("builtin").is_test) @import("test/compatibility_matrix.zig") else @compileError("test-only");
 const healthcare_starter_pack = if (@import("builtin").is_test) @import("test/healthcare_starter_pack.zig") else @compileError("test-only");
+const integration_kits = if (@import("builtin").is_test) @import("test/integration_kits.zig") else @compileError("test-only");
 const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig") else @compileError("test-only");
 
 test {
@@ -72,5 +73,6 @@ test {
     _ = compliance_suite;
     _ = compatibility_matrix;
     _ = healthcare_starter_pack;
+    _ = integration_kits;
     _ = proof_harness;
 }

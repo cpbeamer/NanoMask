@@ -1,0 +1,61 @@
+replicaCount: 2
+
+image:
+  repository: nanomask
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+proxy:
+  listenHost: 0.0.0.0
+  listenPort: 8081
+  targetHost: httpbin.org
+  targetPort: 443
+  targetTls: true
+  logLevel: info
+  auditLog: true
+  unsupportedRequestBodyBehavior: reject
+  unsupportedResponseBodyBehavior: bypass
+  upstreamConnectTimeoutMs: 3000
+  upstreamReadTimeoutMs: 45000
+  upstreamRequestTimeoutMs: 90000
+  shutdownDrainTimeoutMs: 45000
+
+features:
+  email: true
+  phone: true
+  creditCard: true
+  ipAddress: true
+  healthcarePatterns: true
+
+entities:
+  data: |
+    Jane Smith
+    John Doe
+
+schema:
+  fileName: gateway-recipe.nmschema
+  defaultAction: KEEP
+  data: |
+    schema.name = gateway_recipe
+    schema.version = 2026-03-09
+    schema.default = KEEP
+    patient_name = KEEP
+    patient_email = REDACT
+    patient_phone = REDACT
+    patient_id = HASH
+    notes = SCAN
+
+hashing:
+  fileName: hash-key.txt
+  fileData: |
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+metrics:
+  enabled: true
+  path: /metrics
+
+service:
+  type: ClusterIP
+  port: 8081
+
+terminationGracePeriodSeconds: 60

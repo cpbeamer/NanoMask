@@ -1,0 +1,37 @@
+services:
+  nanomask:
+    image: nanomask:0.1.0
+    environment:
+      NANOMASK_LISTEN_HOST: 0.0.0.0
+      NANOMASK_LISTEN_PORT: "8081"
+      NANOMASK_TARGET_HOST: api.openai.com
+      NANOMASK_TARGET_PORT: "443"
+      NANOMASK_TARGET_TLS: "true"
+      NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR: reject
+      NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR: bypass
+      NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS: "3000"
+      NANOMASK_UPSTREAM_READ_TIMEOUT_MS: "45000"
+      NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS: "90000"
+      NANOMASK_AUDIT_LOG: "true"
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "/nanomask", "--healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    depends_on:
+      nanomask:
+        condition: service_started
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-litellm}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "4000:4000"

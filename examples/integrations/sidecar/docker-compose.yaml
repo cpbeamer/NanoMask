@@ -1,0 +1,35 @@
+services:
+  app:
+    image: curlimages/curl:8.12.1
+    command: ["sh", "-c", "sleep infinity"]
+
+  nanomask:
+    image: nanomask:0.1.0
+    depends_on:
+      app:
+        condition: service_started
+      httpbin:
+        condition: service_started
+    network_mode: "service:app"
+    environment:
+      NANOMASK_LISTEN_HOST: 127.0.0.1
+      NANOMASK_LISTEN_PORT: "8081"
+      NANOMASK_TARGET_HOST: httpbin
+      NANOMASK_TARGET_PORT: "8080"
+      NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR: reject
+      NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR: bypass
+      NANOMASK_ENABLE_EMAIL: "true"
+      NANOMASK_ENABLE_PHONE: "true"
+      NANOMASK_ENABLE_CREDIT_CARD: "true"
+      NANOMASK_ENABLE_IP: "true"
+      NANOMASK_ENABLE_HEALTHCARE: "true"
+      NANOMASK_AUDIT_LOG: "true"
+    healthcheck:
+      test: ["CMD", "/nanomask", "--healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  httpbin:
+    image: mccutchen/go-httpbin:v2.15.0

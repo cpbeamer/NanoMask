@@ -15,7 +15,13 @@ WORKDIR /app
 
 # Copy only build inputs — .dockerignore excludes .git, caches, docs, etc.
 COPY build.zig build.zig.zon ./
+COPY README.md ./
 COPY src/ src/
+COPY charts/ charts/
+COPY examples/ examples/
+# Checked-in assets required by file-backed tests.
+COPY proof/ proof/
+COPY starters/ starters/
 # Test fixtures required by unit tests (file_watcher, entity loading).
 COPY entities.txt ./
 

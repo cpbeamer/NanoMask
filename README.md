@@ -131,6 +131,17 @@ Use the starter assets as templates:
 
 See `starters/healthcare/README.md` for the full pack, the matching env presets, and the commands to create ConfigMaps and Secrets for the sample deployments.
 
+### Integration Kits
+
+NanoMask now includes packaged integration recipes under `examples/integrations/` for the deployment shapes buyers usually evaluate first:
+
+- `examples/integrations/sidecar/README.md`: sidecar app-container recipe with a local Docker Compose demo and the existing Kubernetes pod manifest.
+- `examples/integrations/gateway/README.md`: centralized Kubernetes gateway recipe with Helm values and the standalone deployment manifest.
+- `examples/integrations/litellm/README.md`: LiteLLM in front of NanoMask in front of vendor APIs, including a compose stack and config file.
+- `examples/integrations/openai-compatible/README.md`: generic OpenAI-compatible client wiring with curl, Python, and Node examples that point `base_url` at NanoMask.
+
+The sidecar, gateway, and LiteLLM recipes each include smoke-test commands plus operator notes for auth, TLS, streaming, and health checks. The OpenAI-compatible kit includes reusable client environment settings and streaming client samples.
+
 ### Supported Features
 
 Core redaction and restore surface:
