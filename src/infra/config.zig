@@ -248,7 +248,7 @@ pub const Config = struct {
         \\  --enable-credit-card                Redact credit card numbers with Luhn validation (default: disabled)
         \\  --enable-ip                         Redact IPv4/IPv6 addresses (default: disabled)
         \\  --enable-healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
-        \\  --schema-file <path>                JSON schema file for field-level redaction
+        \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
         \\  --hash-key-file <path>              File containing the 64-char hex HMAC key

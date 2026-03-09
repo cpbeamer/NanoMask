@@ -1,0 +1,10 @@
+# Claims-like gateway payloads that hash routing IDs but scan supporting text.
+schema.name = claims_processing
+schema.version = 2026-03-09
+schema.default = KEEP
+claim.claim_id = HASH
+claim.member_name = REDACT
+claim.member_id = HASH
+claim.date_of_birth = REDACT
+claim.payer.policy_number = HASH
+claim.service_note = SCAN

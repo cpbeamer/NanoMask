@@ -1,0 +1,12 @@
+{
+  "encounter_id": "ENC-20260309-1001",
+  "patient": {
+    "display_name": "John Doe",
+    "date_of_birth": "1975-09-19",
+    "internal_id": "PT-99001"
+  },
+  "note": {
+    "summary": "John Doe reported dizziness. Dr. Emily Carter documented MRN: 7654321, diagnosis E11.65, call back at 202-555-0110 or john.doe@hospital.org for follow-up."
+  },
+  "department": "cardiology"
+}

@@ -6,6 +6,7 @@
 #
 # Usage:
 #   kubectl apply -f examples/sidecar-pod.yaml
+# For healthcare-focused starter assets, see starters/healthcare/deployments/.
 #
 # NanoMask performs inline redaction for JSON and text payloads.
 # Common binary formats such as PDF, image/*, audio/*, video/*, and octet-stream bodies are bypassed unchanged.
@@ -78,9 +79,9 @@ spec:
         - name: NANOMASK_ENABLE_HEALTHCARE
           value: "true"
         - name: NANOMASK_SCHEMA_FILE
-          value: /etc/nanomask/schema/schema.json
+          value: /etc/nanomask/schema/schema.nmschema
         - name: NANOMASK_SCHEMA_DEFAULT
-          value: SCAN
+          value: KEEP
         # ⚠️ EXAMPLE ONLY — never use this key in production.
         # In production, prefer a mounted Secret or external secret manager.
         - name: NANOMASK_HASH_KEY
@@ -130,11 +131,12 @@ kind: ConfigMap
 metadata:
   name: nanomask-sidecar-schema
 data:
-  schema.json: |
-    {
-      "patient": "KEEP",
-      "patient_email": "REDACT",
-      "patient_phone": "REDACT",
-      "patient_id": "HASH",
-      "notes": "SCAN"
-    }
+  schema.nmschema: |
+    schema.name = sidecar_example
+    schema.version = 2026-03-09
+    schema.default = KEEP
+    patient = KEEP
+    patient_email = REDACT
+    patient_phone = REDACT
+    patient_id = HASH
+    notes = SCAN

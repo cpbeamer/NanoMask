@@ -440,7 +440,7 @@ Keep schema mode usable for large healthcare and claims payloads without bufferi
 
 Healthcare and claims payloads are often large. If the advanced mode only works by buffering everything, it becomes much less deployable.
 
-### NMV2-013 - Ship a Healthcare Starter Pack
+### NMV2-013 - Ship a Healthcare Starter Pack ✅ COMPLETED
 
 **Priority:** P2  
 **Estimate:** 4 days  

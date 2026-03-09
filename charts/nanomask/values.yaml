@@ -98,11 +98,11 @@ features:
 # -- Optional schema-aware JSON redaction.
 schema:
   # -- Filename to write inside the schema ConfigMap volume.
-  fileName: schema.json
-  # -- Inline JSON schema document. Leave empty to disable schema mode.
+  fileName: schema.nmschema
+  # -- Inline NanoMask schema document using line-based `field.path = ACTION` rules. Leave empty to disable schema mode.
   data: ""
   # -- Default action for keys not listed in the schema: REDACT, KEEP, or SCAN.
-  defaultAction: SCAN
+  defaultAction: KEEP
 
 # -- Optional HASH-mode key configuration.
 hashing:

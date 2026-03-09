@@ -85,7 +85,7 @@ zig build run -- --target-host api.openai.com --target-port 443 --target-tls --u
 zig build run -- --admin-api --admin-token supersecret --admin-listen-address 127.0.0.1:9091 --admin-allowlist 127.0.0.1 --admin-read-only
 
 # Enable the optional pattern library plus schema-aware JSON actions
-zig build run -- --target-host api.openai.com --target-port 443 --target-tls --enable-email --enable-phone --enable-credit-card --enable-ip --enable-healthcare --schema-file schema.json --schema-default SCAN --hash-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+zig build run -- --target-host api.openai.com --target-port 443 --target-tls --enable-email --enable-phone --enable-credit-card --enable-ip --enable-healthcare --schema-file starters/healthcare/schemas/encounter-notes.nmschema --schema-default KEEP --hash-key-file starters/healthcare/hash-key.example.txt
 ```
 
 Or pass entity names per-request via HTTP header:
@@ -104,6 +104,32 @@ The proxy transforms the outbound request to:
 ```
 
 And transparently restores `Entity_A` → `John Doe` in the upstream response.
+
+### Healthcare Starter Pack
+
+NanoMask now includes a checked-in healthcare starter pack under `starters/healthcare/` with versioned schemas, entity files, representative payloads, environment presets, and Kubernetes deployment examples for:
+
+- patient demographics and intake JSON
+- encounter-note and triage-summary JSON
+- claims-like gateway traffic
+
+Quick smoke test:
+
+```bash
+zig build run -- --listen-host 127.0.0.1 --target-host httpbin.org --target-port 80 --entity-file starters/healthcare/entities/patient-demographics.txt --schema-file starters/healthcare/schemas/patient-demographics.nmschema --schema-default KEEP --hash-key-file starters/healthcare/hash-key.example.txt --enable-email --enable-phone --enable-healthcare
+
+curl -X POST http://localhost:8081/post \
+  -H "Content-Type: application/json" \
+  --data-binary @starters/healthcare/payloads/patient-demographics.json
+```
+
+Use the starter assets as templates:
+
+- `patient-demographics.nmschema`: registration, intake, and eligibility payloads with a small free-text notes field.
+- `encounter-notes.nmschema`: note-heavy clinical payloads where the summary text should still run through the full PHI scan pipeline.
+- `claims-processing.nmschema`: payer and clearinghouse-style JSON where claim, member, and policy identifiers should be pseudonymized instead of dropped.
+
+See `starters/healthcare/README.md` for the full pack, the matching env presets, and the commands to create ConfigMaps and Secrets for the sample deployments.
 
 ### Supported Features
 
@@ -419,7 +445,7 @@ NanoMask supports a strict configuration precedence:
 | Credit card redaction | `--enable-credit-card` | `NANOMASK_ENABLE_CREDIT_CARD` | disabled | Enable built-in credit card redaction with Luhn validation |
 | IP address redaction | `--enable-ip` | `NANOMASK_ENABLE_IP` | disabled | Enable built-in IPv4 and IPv6 redaction |
 | Healthcare pattern redaction | `--enable-healthcare` | `NANOMASK_ENABLE_HEALTHCARE` | disabled | Enable built-in healthcare identifier redaction |
-| Schema file | `--schema-file` | `NANOMASK_SCHEMA_FILE` | none | Load JSON field-level redaction rules from a file |
+| Schema file | `--schema-file` | `NANOMASK_SCHEMA_FILE` | none | Load NanoMask line-based `field.path = ACTION` rules from a file |
 | Schema default action | `--schema-default` | `NANOMASK_SCHEMA_DEFAULT` | `SCAN` | Default schema action for unlisted JSON keys: `REDACT`, `KEEP`, or `SCAN` |
 | HASH key | `--hash-key` | `NANOMASK_HASH_KEY` | none | Inline 64-character hex HMAC key for schema `HASH` actions |
 | HASH key file | `--hash-key-file` | `NANOMASK_HASH_KEY_FILE` | none | File containing the 64-character hex HMAC key for schema `HASH` actions |
