@@ -1,0 +1,40 @@
+{
+  "suite": "ip",
+  "label": "IP Address Redaction",
+  "description": "Representative IPv4 and IPv6 samples plus nearby clean text to estimate redaction precision and recall.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "ipv4_basic",
+      "label": "Basic IPv4 address",
+      "kind": "positive",
+      "input": "Server 192.168.1.42 processed the request.",
+      "expected": "Server [IPV4_REDACTED] processed the request."
+    },
+    {
+      "id": "ipv6_loopback",
+      "label": "IPv6 loopback address",
+      "kind": "positive",
+      "input": "Loopback ::1 was observed in diagnostics.",
+      "expected": "Loopback [IPV6_REDACTED] was observed in diagnostics."
+    },
+    {
+      "id": "cidr_suffix",
+      "label": "CIDR suffix is preserved",
+      "kind": "positive",
+      "input": "Subnet 10.0.0.0/24 remains routable.",
+      "expected": "Subnet [IPV4_REDACTED]/24 remains routable."
+    },
+    {
+      "id": "numeric_version",
+      "label": "Version-like dotted value is ignored",
+      "kind": "negative",
+      "input": "Release 10.0.1 remains visible in the changelog.",
+      "expected": "Release 10.0.1 remains visible in the changelog."
+    }
+  ]
+}

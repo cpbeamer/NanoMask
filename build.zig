@@ -202,4 +202,20 @@ pub fn build(b: *std.Build) void {
     }
     const compat_matrix_step = b.step("compat-matrix", "Generate the compatibility matrix JSON artifact");
     compat_matrix_step.dependOn(&run_compat_matrix.step);
+
+    // --- Accuracy + benchmark proof artifact: `zig build proof-report -- <json> <markdown>` ---
+    const proof_report_exe = b.addExecutable(.{
+        .name = "NanoMask-proof-report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/proof_report.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_proof_report = b.addRunArtifact(proof_report_exe);
+    if (b.args) |args| {
+        run_proof_report.addArgs(args);
+    }
+    const proof_report_step = b.step("proof-report", "Generate accuracy and benchmark proof artifacts");
+    proof_report_step.dependOn(&run_proof_report.step);
 }

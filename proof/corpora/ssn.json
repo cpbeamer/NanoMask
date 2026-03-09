@@ -1,0 +1,40 @@
+{
+  "suite": "ssn",
+  "label": "SSN Redaction",
+  "description": "Anonymized text snippets covering canonical SSN masking and clean passthrough behavior.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "inline_single",
+      "label": "Single inline SSN",
+      "kind": "positive",
+      "input": "Patient SSN 123-45-6789 needs follow up.",
+      "expected": "Patient SSN ***-**-**** needs follow up."
+    },
+    {
+      "id": "multiple_ssns",
+      "label": "Two SSNs in one sentence",
+      "kind": "positive",
+      "input": "Archive 123-45-6789 and 987-65-4321 before export.",
+      "expected": "Archive ***-**-**** and ***-**-**** before export."
+    },
+    {
+      "id": "incomplete_sequence",
+      "label": "Incomplete numeric sequence stays visible",
+      "kind": "negative",
+      "input": "Claim key 123-45-678 is incomplete and should remain.",
+      "expected": "Claim key 123-45-678 is incomplete and should remain."
+    },
+    {
+      "id": "date_string",
+      "label": "Date-like string is not redacted",
+      "kind": "negative",
+      "input": "Visit date 2026-03-08 remains visible in the note.",
+      "expected": "Visit date 2026-03-08 remains visible in the note."
+    }
+  ]
+}

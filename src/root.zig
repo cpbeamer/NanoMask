@@ -34,6 +34,7 @@ pub const mock_upstream = if (@import("builtin").is_test) @import("test/mock_ups
 pub const e2e_harness = if (@import("builtin").is_test) @import("test/e2e_harness.zig") else @compileError("test-only");
 pub const compliance_suite = if (@import("builtin").is_test) @import("test/compliance_suite.zig") else @compileError("test-only");
 pub const compatibility_matrix = if (@import("builtin").is_test) @import("test/compatibility_matrix.zig") else @compileError("test-only");
+const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig") else @compileError("test-only");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -69,4 +70,5 @@ test {
     _ = e2e_harness;
     _ = compliance_suite;
     _ = compatibility_matrix;
+    _ = proof_harness;
 }

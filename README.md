@@ -51,6 +51,9 @@ zig build bench-all 2>$null
 # Run the vendor compatibility suite and emit the matrix artifact
 zig build compat-matrix -- compatibility/compatibility-matrix.json
 
+# Generate the accuracy + benchmark proof artifacts
+zig build proof-report -- zig-out/proof/proof-report.json zig-out/proof/proof-report.md
+
 # Run the full repo test suite
 zig build test
 ```
@@ -273,6 +276,15 @@ Stage 3 | Myers' Fuzzy Match  |    212 MB/s |  10 iter × 256 KB
 | v2 (+trigram filter) | 9.0 MB/s | 128-bit bloom filter rejects 95% of windows |
 | v3 (+stack normalize + Ukkonen) | 193 MB/s | Zero-alloc normalization + early-exit distance |
 
+## Proof Harness
+
+NanoMask includes a checked-in proof harness for repeatable accuracy and latency evidence.
+
+- Curated anonymized corpora live under `proof/corpora/` and cover SSNs, exact entities, fuzzy OCR-style names, email, phone, credit card, IP addresses, healthcare identifiers, and schema-driven JSON payloads.
+- `zig build proof-report -- zig-out/proof/proof-report.json zig-out/proof/proof-report.md` generates JSON and Markdown artifacts with per-suite precision, recall, false-positive rate, and benchmark summaries.
+- The manual GitHub Actions workflow `Proof Harness` uploads the same report on demand for buyer-facing or regression-review evidence.
+- On Windows, the report still runs direct accuracy and stage-throughput checks locally; the end-to-end latency rows are marked `not_run`, and the Linux workflow fills those in.
+
 ## Architecture
 
 ```
@@ -302,6 +314,7 @@ src/
 ├── main.zig                          # Entry point, server setup, thread management
 ├── root.zig                          # Module root for test discovery
 ├── bench.zig                         # Standalone benchmark runner
+├── proof_report.zig                  # Standalone proof report CLI
 ├── net/
 │   ├── proxy.zig                     # HTTP proxy handler, pipeline orchestration
 │   ├── body_policy.zig               # Content-type classification and body handling policy
@@ -331,6 +344,8 @@ src/
 │   └── admin.zig                     # REST API for entity management (/_admin/entities)
 ├── crypto/
 │   └── tls.zig                       # TLS 1.3 server handshake, record layer, encrypted I/O
+├── proof/
+│   └── harness.zig                   # Accuracy + benchmark proof framework
 └── test/
     ├── compliance_suite.zig          # E2E compliance tests (SSN, entity, pattern, schema)
     ├── e2e_harness.zig               # E2E test harness (proxy round-trip helper)
@@ -345,6 +360,9 @@ zig build test
 
 # Run benchmarks (ReleaseFast, clean output on Windows)
 zig build bench-all 2>$null
+
+# Generate the proof harness artifacts
+zig build proof-report -- zig-out/proof/proof-report.json zig-out/proof/proof-report.md
 
 # Run only fuzzy match tests
 zig test src/fuzzy_match.zig

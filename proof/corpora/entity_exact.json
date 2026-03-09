@@ -1,0 +1,44 @@
+{
+  "suite": "entity_exact",
+  "label": "Exact Entity Masking",
+  "description": "Safe placeholder names used to verify deterministic name-to-alias replacement without false positives.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "single_name",
+      "label": "Single configured person name",
+      "kind": "positive",
+      "entities": ["Jane Smith"],
+      "input": "Jane Smith approved the discharge summary.",
+      "expected": "Entity_A approved the discharge summary."
+    },
+    {
+      "id": "two_names",
+      "label": "Two configured names with stable alias order",
+      "kind": "positive",
+      "entities": ["Jane Smith", "Robert Brown"],
+      "input": "Robert Brown reviewed the chart with Jane Smith.",
+      "expected": "Entity_B reviewed the chart with Entity_A."
+    },
+    {
+      "id": "embedded_name",
+      "label": "Embedded partial match does not trigger",
+      "kind": "negative",
+      "entities": ["Jane Smith"],
+      "input": "Janet Smithson approved the discharge summary.",
+      "expected": "Janet Smithson approved the discharge summary."
+    },
+    {
+      "id": "unrelated_doctor",
+      "label": "Unrelated surname remains visible",
+      "kind": "negative",
+      "entities": ["Jane Smith"],
+      "input": "Dr. Smythe reviewed the chart at noon.",
+      "expected": "Dr. Smythe reviewed the chart at noon."
+    }
+  ]
+}
