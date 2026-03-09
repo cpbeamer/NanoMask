@@ -113,11 +113,13 @@ Core redaction and restore surface:
 - Fuzzy matching targets OCR-style name drift in text that has already been extracted into the HTTP payload.
 - Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, and healthcare identifiers.
 - Optional schema-aware JSON mode exposes `KEEP`, `REDACT`, `SCAN`, and `HASH` actions through `--schema-file`, `--schema-default`, `--hash-key`, and `--hash-key-file`.
+- Schema-aware request redaction now streams JSON bodies with bounded parser memory instead of buffering the full request body first.
 
 Current limits:
 - NanoMask operates on HTTP request and response bodies. It does not ingest PDFs, Office files, images, audio, video, or other generic files for inline redaction.
 - PDF, image, audio, video, and octet-stream payloads are bypassed or rejected according to the configured body policy; they are not transformed inline.
-- Schema mode currently applies to JSON request bodies, and HASH restore still buffers JSON responses before unhashing.
+- Schema mode applies to JSON request bodies, but `HASH` restore still buffers JSON responses before unhashing.
+- Request-side schema streaming memory grows with nesting depth and the current field/token being processed, not the full document; extremely large individual string values can still require per-field buffering for `SCAN` or `HASH`.
 
 ### Payload Policy
 
@@ -285,6 +287,7 @@ NanoMask includes a checked-in proof harness for repeatable accuracy and latency
 
 - Curated anonymized corpora live under `proof/corpora/` and cover SSNs, exact entities, fuzzy OCR-style names, email, phone, credit card, IP addresses, healthcare identifiers, and schema-driven JSON payloads.
 - `zig build proof-report -- zig-out/proof/proof-report.json zig-out/proof/proof-report.md` generates JSON and Markdown artifacts with per-suite precision, recall, false-positive rate, and benchmark summaries.
+- The proof report now includes schema-streaming request latency and peak working-set measurements for a healthcare-style JSON payload around 512 KB.
 - The manual GitHub Actions workflow `Proof Harness` uploads the same report on demand for buyer-facing or regression-review evidence.
 - On Windows, the report still runs direct accuracy and stage-throughput checks locally; the end-to-end latency rows are marked `not_run`, and the Linux workflow fills those in.
 

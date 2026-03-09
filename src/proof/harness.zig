@@ -93,6 +93,8 @@ pub const BenchmarkResult = struct {
     first_chunk_p50_ms: ?f64 = null,
     first_chunk_p95_ms: ?f64 = null,
     max_first_chunk_p95_ms: ?f64 = null,
+    observed_bytes: ?usize = null,
+    max_bytes: ?usize = null,
     note: ?[]const u8 = null,
 };
 
@@ -497,6 +499,25 @@ fn buildSchemaPayload(allocator: std.mem.Allocator, approx_bytes: usize) ![]u8 {
     return try buffer.toOwnedSlice(allocator);
 }
 
+fn buildSchemaStreamingPayload(allocator: std.mem.Allocator, approx_bytes: usize) ![]u8 {
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, "{\"records\":[");
+
+    var index: usize = 0;
+    while (buffer.items.len + 192 < approx_bytes) : (index += 1) {
+        if (index != 0) try buffer.append(allocator, ',');
+        try buffer.writer(allocator).print(
+            "{{\"patient_name\":\"Patient {d}\",\"notes\":\"Patient SSN 123-45-6789 with MRN: 7654321 and diagnosis E11.65 requires follow up.\",\"details\":{{\"zip\":\"62704\",\"state\":\"IL\"}}}}",
+            .{index},
+        );
+    }
+
+    try buffer.appendSlice(allocator, "]}");
+    return try buffer.toOwnedSlice(allocator);
+}
+
 fn sortAndSummarize(latencies_ns: []u64) struct { p50_ms: f64, p95_ms: f64 } {
     std.sort.block(u64, latencies_ns, {}, std.sort.asc(u64));
     return .{
@@ -861,6 +882,105 @@ fn benchmarkSseFirstChunk() !BenchmarkResult {
     };
 }
 
+const SchemaStreamingMetrics = struct {
+    payload_bytes: usize,
+    p50_ms: f64,
+    p95_ms: f64,
+    peak_working_set_bytes: usize,
+};
+
+fn collectSchemaStreamingMetrics() !SchemaStreamingMetrics {
+    const allocator = std.heap.page_allocator;
+    const payload = try buildSchemaStreamingPayload(allocator, 512 * 1024);
+    defer allocator.free(payload);
+
+    const schema_text =
+        \\schema.default = KEEP
+        \\patient_name = REDACT
+        \\notes = SCAN
+        \\details.zip = REDACT
+        \\details.state = KEEP
+    ;
+
+    var schema = try schema_mod.Schema.parseContent(schema_text, allocator);
+    defer schema.deinit();
+
+    var scan_runtime = SchemaScanRuntime{
+        .flags = .{
+            .healthcare = true,
+        },
+    };
+
+    const scan_ctx = json_redactor.ScanContext{
+        .scan_fn = &SchemaScanRuntime.scan,
+        .ctx_ptr = @ptrCast(&scan_runtime),
+    };
+
+    const iterations: usize = 5;
+    const samples = try allocator.alloc(u64, iterations);
+    defer allocator.free(samples);
+
+    var peak_working_set_bytes: usize = 0;
+    for (0..iterations) |index| {
+        var timer = try std.time.Timer.start();
+        const result = try json_redactor.redactJsonStreaming(
+            payload,
+            4096,
+            &schema,
+            null,
+            scan_ctx,
+            null,
+            allocator,
+        );
+        samples[index] = timer.read();
+        if (result.stats.peak_working_set_bytes > peak_working_set_bytes) {
+            peak_working_set_bytes = result.stats.peak_working_set_bytes;
+        }
+        allocator.free(result.output);
+    }
+
+    const stats = sortAndSummarize(samples);
+    return .{
+        .payload_bytes = payload.len,
+        .p50_ms = stats.p50_ms,
+        .p95_ms = stats.p95_ms,
+        .peak_working_set_bytes = peak_working_set_bytes,
+    };
+}
+
+fn benchmarkSchemaStreamingLatency() !BenchmarkResult {
+    const metrics = try collectSchemaStreamingMetrics();
+    const max_p95 = 250.0;
+
+    return .{
+        .id = "schema_streaming_latency",
+        .label = "Schema streaming latency",
+        .mode = "latency_ms",
+        .status = if (metrics.p95_ms <= max_p95) .pass else .fail,
+        .iterations = 5,
+        .payload_bytes = metrics.payload_bytes,
+        .p50_ms = metrics.p50_ms,
+        .p95_ms = metrics.p95_ms,
+        .max_p95_ms = max_p95,
+    };
+}
+
+fn benchmarkSchemaStreamingMemory() !BenchmarkResult {
+    const metrics = try collectSchemaStreamingMetrics();
+    const max_peak_bytes: usize = 64 * 1024;
+
+    return .{
+        .id = "schema_streaming_peak_memory",
+        .label = "Schema streaming peak memory",
+        .mode = "peak_working_set_bytes",
+        .status = if (metrics.peak_working_set_bytes <= max_peak_bytes) .pass else .fail,
+        .iterations = 1,
+        .payload_bytes = metrics.payload_bytes,
+        .observed_bytes = metrics.peak_working_set_bytes,
+        .max_bytes = max_peak_bytes,
+    };
+}
+
 fn benchmarkFailure(id: []const u8, label: []const u8, mode: []const u8, note: []const u8) BenchmarkResult {
     return .{
         .id = id,
@@ -912,6 +1032,22 @@ pub fn runBenchmarks(allocator: std.mem.Allocator) ![]const BenchmarkResult {
         @errorName(err),
     );
     try results.append(allocator, schema_hash);
+
+    const schema_streaming_latency = benchmarkSchemaStreamingLatency() catch |err| benchmarkFailure(
+        "schema_streaming_latency",
+        "Schema streaming latency",
+        "latency_ms",
+        @errorName(err),
+    );
+    try results.append(allocator, schema_streaming_latency);
+
+    const schema_streaming_memory = benchmarkSchemaStreamingMemory() catch |err| benchmarkFailure(
+        "schema_streaming_peak_memory",
+        "Schema streaming peak memory",
+        "peak_working_set_bytes",
+        @errorName(err),
+    );
+    try results.append(allocator, schema_streaming_memory);
 
     const sse = benchmarkSseFirstChunk() catch |err| benchmarkFailure(
         "e2e_sse_first_chunk",
@@ -1007,6 +1143,19 @@ fn writeBenchmarkTableRow(writer: anytype, result: BenchmarkResult) !void {
                 statusString(result.status),
                 throughput,
                 result.min_throughput_mb_per_sec.?,
+            },
+        );
+        return;
+    }
+
+    if (result.observed_bytes) |observed_bytes| {
+        try writer.print(
+            "| {s} | {s} | {d} bytes | <= {d} bytes |\n",
+            .{
+                result.label,
+                statusString(result.status),
+                observed_bytes,
+                result.max_bytes.?,
             },
         );
         return;

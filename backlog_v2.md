@@ -413,7 +413,7 @@ Security buyers will inspect the admin plane immediately. If it looks weak, the 
 
 ## Phase 3: Differentiate for Regulated Workloads
 
-### NMV2-012 - Add Streaming Schema-Aware Redaction for Large JSON Bodies
+### NMV2-012 - Add Streaming Schema-Aware Redaction for Large JSON Bodies ✅ COMPLETED
 
 **Priority:** P2  
 **Estimate:** 5 days  

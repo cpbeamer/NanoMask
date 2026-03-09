@@ -254,6 +254,55 @@ test "e2e compliance - schema HASH round-trip" {
     try std.testing.expect(std.mem.indexOf(u8, result.proxy_logs, "\"buffer_reason\":\"json_unhash\"") != null);
 }
 
+test "e2e compliance - large schema payload streams without full request buffering" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    defer payload.deinit(allocator);
+
+    try payload.appendSlice(allocator, "{\"records\":[");
+    for (0..768) |idx| {
+        if (idx != 0) try payload.append(allocator, ',');
+        try payload.writer(allocator).print(
+            "{{\"patient_name\":\"Patient {d}\",\"internal_id\":\"PT-{d:0>5}\",\"notes\":\"Patient SSN 123-45-6789 requires follow up.\",\"details\":{{\"zip\":\"62704\",\"state\":\"IL\"}}}}",
+            .{ idx, idx },
+        );
+    }
+    try payload.appendSlice(allocator, "]}");
+
+    const schema_content =
+        \\schema.default = KEEP
+        \\patient_name = REDACT
+        \\internal_id = HASH
+        \\notes = SCAN
+        \\details.zip = REDACT
+    ;
+    var schema_instance = try schema_mod.Schema.parseContent(schema_content, allocator);
+    defer schema_instance.deinit();
+
+    const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var hasher_instance = try hasher_mod.Hasher.init(key_hex, allocator);
+    defer hasher_instance.deinit();
+
+    var result = try harness.roundTrip(allocator, payload.items, .{
+        .schema = &schema_instance,
+        .hasher = &hasher_instance,
+        .upstream_response = "{\"status\":\"accepted\"}",
+        .upstream_content_type = "application/json",
+    });
+    defer result.deinit();
+
+    try std.testing.expect(payload.items.len > 128 * 1024);
+    try std.testing.expectEqual(http.Status.ok, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "\"patient_name\":\"[REDACTED]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "PSEUDO_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "***-**-****") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "Patient 0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "PT-00000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "123-45-6789") == null);
+}
+
 test "e2e compliance - audit log emits SSN events" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;

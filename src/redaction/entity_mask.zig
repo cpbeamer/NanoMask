@@ -26,6 +26,11 @@ pub const AuditMatch = struct {
     replacement: []const u8,
 };
 
+pub const BoundedAuditMatches = struct {
+    matches: []AuditMatch,
+    consumed: usize,
+};
+
 // ---------------------------------------------------------------------------
 // Word-boundary helpers
 // ---------------------------------------------------------------------------
@@ -608,6 +613,84 @@ pub const EntityMap = struct {
         return try audit_matches.toOwnedSlice(allocator);
     }
 
+    /// Collect selected mask spans whose start position is before `safe_end`.
+    /// Any chosen match that crosses `safe_end` extends `consumed` so callers
+    /// can advance their raw-input offset in lockstep with `maskChunked()`.
+    pub fn collectMaskMatchesBounded(
+        self: *const EntityMap,
+        input: []const u8,
+        safe_end: usize,
+        allocator: std.mem.Allocator,
+    ) !BoundedAuditMatches {
+        const bounded_end = @min(safe_end, input.len);
+        const raw_matches = try self.forward_ac.search(input, allocator);
+        defer allocator.free(raw_matches);
+
+        if (raw_matches.len == 0) {
+            return .{
+                .matches = try allocator.alloc(AuditMatch, 0),
+                .consumed = bounded_end,
+            };
+        }
+
+        var valid: std.ArrayListUnmanaged(Match) = .empty;
+        defer valid.deinit(allocator);
+        try valid.ensureTotalCapacity(allocator, raw_matches.len);
+
+        for (raw_matches) |m| {
+            if (m.start >= bounded_end) continue;
+            if (isWordBoundaryBefore(input, m.start) and isWordBoundaryAfter(input, m.end)) {
+                valid.appendAssumeCapacity(m);
+            }
+        }
+
+        if (valid.items.len == 0) {
+            return .{
+                .matches = try allocator.alloc(AuditMatch, 0),
+                .consumed = bounded_end,
+            };
+        }
+
+        std.sort.block(Match, valid.items, {}, struct {
+            fn lessThan(_: void, a: Match, b: Match) bool {
+                if (a.start != b.start) return a.start < b.start;
+                return (a.end - a.start) > (b.end - b.start);
+            }
+        }.lessThan);
+
+        var selected: std.ArrayListUnmanaged(Match) = .empty;
+        defer selected.deinit(allocator);
+        try selected.ensureTotalCapacity(allocator, valid.items.len);
+
+        var last_end: usize = 0;
+        for (valid.items) |m| {
+            if (m.start >= last_end) {
+                selected.appendAssumeCapacity(m);
+                last_end = m.end;
+            }
+        }
+
+        var audit_matches: std.ArrayListUnmanaged(AuditMatch) = .empty;
+        errdefer audit_matches.deinit(allocator);
+        try audit_matches.ensureTotalCapacity(allocator, selected.items.len);
+
+        var consumed = bounded_end;
+        for (selected.items) |m| {
+            if (m.end > consumed) consumed = m.end;
+            audit_matches.appendAssumeCapacity(.{
+                .start = m.start,
+                .end = m.end,
+                .pattern_idx = m.pattern_idx,
+                .replacement = self.alias_const_slices[m.pattern_idx],
+            });
+        }
+
+        return .{
+            .matches = try audit_matches.toOwnedSlice(allocator),
+            .consumed = consumed,
+        };
+    }
+
     /// Replace aliases back to real names.
     pub fn unmask(self: *const EntityMap, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         return replaceAll(&self.reverse_ac, input, self.name_const_slices, allocator);
@@ -908,6 +991,21 @@ test "maskChunked - boundary-spanning name" {
     const chunked = try runChunkedMask(&em, input, 8, allocator);
     defer allocator.free(chunked);
     try std.testing.expectEqualStrings(reference, chunked);
+}
+
+test "EntityMap - collectMaskMatchesBounded extends consumed for boundary match" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{"John Doe"});
+    defer em.deinit();
+
+    const input = "xxxx John Doe yyyy";
+    const result = try em.collectMaskMatchesBounded(input, 10, allocator);
+    defer allocator.free(result.matches);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expectEqual(@as(usize, 5), result.matches[0].start);
+    try std.testing.expectEqual(@as(usize, 13), result.matches[0].end);
+    try std.testing.expectEqual(@as(usize, 13), result.consumed);
 }
 
 test "maskChunked - empty and small chunks" {

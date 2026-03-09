@@ -646,150 +646,189 @@ pub fn handleRequest(
             else
                 null;
 
-            // Schema-aware mode: buffer full body, apply entity masking, then JSON redactor.
+            // Schema-aware mode: stream entity masking into the bounded-memory
+            // JSON redactor so large request bodies do not require full buffering.
             if (active_schema_for_request) |active_schema| {
                 var req_body_transfer_buf: [8192]u8 = undefined;
                 var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
 
-                var body_read_buf: [8192]u8 = undefined;
-                if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
-                    // Buffer entire body for JSON parsing
-                    var full_body = std.ArrayListUnmanaged(u8).empty;
-                    defer full_body.deinit(allocator);
+                // Build hasher interface if a hasher is present.
+                const hasher_iface: ?json_redactor.HasherInterface = if (ctx.hasher) |h| .{
+                    .hash_fn = &struct {
+                        fn call(orig: []const u8, ctx_ptr: *anyopaque) anyerror![]const u8 {
+                            const hh: *hasher_mod.Hasher = @ptrCast(@alignCast(ctx_ptr));
+                            return hh.hash(orig);
+                        }
+                    }.call,
+                    .ctx_ptr = @ptrCast(@alignCast(h)),
+                } else null;
 
+                // Emit audit events inline during the streaming schema pass.
+                var emitter = redaction_audit.AuditEmitter.init(log, session_id, ctx.observability);
+                defer emitter.finish();
+
+                const ScanAuditState = struct {
+                    const Self = @This();
+
+                    proxy_ctx: *const ProxyContext,
+                    emitter: *redaction_audit.AuditEmitter,
+
+                    fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+                        const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+
+                        return redaction_audit.runTextStages(
+                            input_val,
+                            field_path,
+                            .{
+                                .ssn = true,
+                                .patterns = true,
+                                .fuzzy = true,
+                            },
+                            self.proxy_ctx.session_entity_map,
+                            self.proxy_ctx.session_fuzzy_matcher,
+                            self.proxy_ctx.patternFlags(),
+                            self.emitter,
+                            alloc,
+                        );
+                    }
+
+                    fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
+                        const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+                        self.emitter.emit(.{
+                            .stage = "schema",
+                            .match_type = switch (event.action) {
+                                .redact => "schema_redact",
+                                .hash => "schema_hash",
+                                .scan => "schema_scan",
+                                .keep => "schema_keep",
+                            },
+                            .field_path = event.field_path,
+                            .original_length = event.original_length,
+                            .replacement_type = event.replacement_type,
+                        });
+                    }
+                };
+
+                var scan_audit_state = ScanAuditState{
+                    .proxy_ctx = &ctx,
+                    .emitter = &emitter,
+                };
+
+                const scan_ctx_iface: ?json_redactor.ScanContext = .{
+                    .scan_fn = &ScanAuditState.doScan,
+                    .ctx_ptr = @ptrCast(&scan_audit_state),
+                };
+
+                const audit_ctx: ?json_redactor.AuditContext = .{
+                    .audit_fn = &ScanAuditState.onSchemaAction,
+                    .ctx_ptr = @ptrCast(&scan_audit_state),
+                };
+
+                var schema_redactor = json_redactor.ChunkedRedactor.init(
+                    active_schema,
+                    hasher_iface,
+                    scan_ctx_iface,
+                    audit_ctx,
+                    &req_body.writer,
+                    allocator,
+                );
+                defer schema_redactor.deinit();
+
+                var ac_state: ?entity_mask.AcChunkState = null;
+                if (active_entity_map) |em| ac_state = em.initChunkState();
+                defer if (ac_state) |*s| s.deinit(allocator);
+
+                var body_read_buf: [8192]u8 = undefined;
+                var raw_body_bytes: usize = 0;
+                var entity_audit_offset: usize = 0;
+                if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
                     var chunk_buf: [8192]u8 = undefined;
                     while (true) {
                         const bytes_read = try body_reader.readSliceShort(&chunk_buf);
                         if (bytes_read == 0) break;
 
-                        if (full_body.items.len + bytes_read > max_body_size) {
+                        raw_body_bytes += bytes_read;
+                        if (raw_body_bytes > max_body_size) {
                             log.log(.warn, "body_too_large", session_id, &.{
                                 .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
                             });
                             return error.PayloadTooLarge;
                         }
-                        try full_body.appendSlice(allocator, chunk_buf[0..bytes_read]);
+
+                        const raw_chunk = chunk_buf[0..bytes_read];
+                        if (active_entity_map) |em| {
+                            const total = ac_state.?.len + raw_chunk.len;
+                            if (total > ac_state.?.overlap) {
+                                try ac_state.?.combined_buf.resize(allocator, total);
+                                const combined = ac_state.?.combined_buf.items;
+                                if (ac_state.?.len > 0) {
+                                    @memcpy(combined[0..ac_state.?.len], ac_state.?.pending[0..ac_state.?.len]);
+                                }
+                                @memcpy(combined[ac_state.?.len..], raw_chunk);
+
+                                const safe_end = total - @min(ac_state.?.overlap, total);
+                                const audit_matches = try em.collectMaskMatchesBounded(combined, safe_end, allocator);
+                                defer allocator.free(audit_matches.matches);
+
+                                for (audit_matches.matches) |match| {
+                                    emitter.emit(.{
+                                        .stage = "entity_mask",
+                                        .match_type = "entity",
+                                        .offset = @intCast(entity_audit_offset + match.start),
+                                        .original_length = match.end - match.start,
+                                        .replacement_type = "entity_alias",
+                                    });
+                                }
+                                entity_audit_offset += audit_matches.consumed;
+                            }
+
+                            const masked_chunk = try em.maskChunked(raw_chunk, &ac_state.?, allocator);
+                            defer allocator.free(masked_chunk);
+                            if (masked_chunk.len > 0) {
+                                try schema_redactor.writeChunk(masked_chunk);
+                            }
+                        } else {
+                            try schema_redactor.writeChunk(raw_chunk);
+                        }
 
                         if (bytes_read < chunk_buf.len) break;
                     }
-                    request_body_bytes = full_body.items.len;
-
-                    // Stage 0: Entity masking on the full body (same as chunked path).
-                    // Runs Aho-Corasick replacement so named entities are masked before
-                    // the JSON redactor sees them.
-                    var masked_body: []u8 = undefined;
-                    var masked_allocated = false;
-                    if (active_entity_map) |em| {
-                        masked_body = try em.mask(full_body.items, allocator);
-                        masked_allocated = true;
-                    } else {
-                        masked_body = try allocator.dupe(u8, full_body.items);
-                        masked_allocated = true;
-                    }
-                    defer if (masked_allocated) allocator.free(masked_body);
-
-                    // Build hasher interface if a hasher is present
-                    const hasher_iface: ?json_redactor.HasherInterface = if (ctx.hasher) |h| .{
-                        .hash_fn = &struct {
-                            fn call(orig: []const u8, ctx_ptr: *anyopaque) anyerror![]const u8 {
-                                const hh: *hasher_mod.Hasher = @ptrCast(@alignCast(ctx_ptr));
-                                return hh.hash(orig);
-                            }
-                        }.call,
-                        .ctx_ptr = @ptrCast(@alignCast(h)),
-                    } else null;
-
-                    // --- Inline audit: emit events during the primary redaction pass
-                    //     instead of re-running the pipeline afterwards (see observation #1).
-                    var emitter = redaction_audit.AuditEmitter.init(log, session_id, ctx.observability);
-                    defer emitter.finish();
-
-                    // Emit entity-mask audit events before schema processing
-                    if (active_entity_map) |em| {
-                        try redaction_audit.emitEntityMaskAuditEvents(
-                            em,
-                            full_body.items,
-                            &emitter,
-                            allocator,
-                        );
-                    }
-
-                    // Build ScanContext to run SCAN-action values through the
-                    // full SSN + pattern + fuzzy redaction pipeline with inline
-                    // audit event emission.
-                    const ScanAuditState = struct {
-                        const Self = @This();
-
-                        proxy_ctx: *const ProxyContext,
-                        emitter: *redaction_audit.AuditEmitter,
-
-                        fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
-                            const self: *Self = @ptrCast(@alignCast(ctx_ptr));
-
-                            return redaction_audit.runTextStages(
-                                input_val,
-                                field_path,
-                                .{
-                                    .ssn = true,
-                                    .patterns = true,
-                                    .fuzzy = true,
-                                },
-                                self.proxy_ctx.session_entity_map,
-                                self.proxy_ctx.session_fuzzy_matcher,
-                                self.proxy_ctx.patternFlags(),
-                                self.emitter,
-                                alloc,
-                            );
-                        }
-
-                        fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
-                            const self: *Self = @ptrCast(@alignCast(ctx_ptr));
-                            self.emitter.emit(.{
-                                .stage = "schema",
-                                .match_type = switch (event.action) {
-                                    .redact => "schema_redact",
-                                    .hash => "schema_hash",
-                                    .scan => "schema_scan",
-                                    .keep => "schema_keep",
-                                },
-                                .field_path = event.field_path,
-                                .original_length = event.original_length,
-                                .replacement_type = event.replacement_type,
-                            });
-                        }
-                    };
-
-                    var scan_audit_state = ScanAuditState{
-                        .proxy_ctx = &ctx,
-                        .emitter = &emitter,
-                    };
-
-                    const scan_ctx_iface: ?json_redactor.ScanContext = .{
-                        .scan_fn = &ScanAuditState.doScan,
-                        .ctx_ptr = @ptrCast(&scan_audit_state),
-                    };
-
-                    const audit_ctx: ?json_redactor.AuditContext = .{
-                        .audit_fn = &ScanAuditState.onSchemaAction,
-                        .ctx_ptr = @ptrCast(&scan_audit_state),
-                    };
-
-                    const redacted = try json_redactor.redactJsonWithAudit(
-                        masked_body,
-                        active_schema,
-                        hasher_iface,
-                        scan_ctx_iface,
-                        audit_ctx,
-                        allocator,
-                    );
-                    defer allocator.free(redacted);
-
-                    try req_body.writer.writeAll(redacted);
                 } else |err| {
                     log.log(.warn, "body_read_failed", session_id, &.{
                         .{ .key = "error", .value = .{ .string = @errorName(err) } },
                     });
                 }
+
+                if (active_entity_map) |em| {
+                    const pending_len = ac_state.?.len;
+                    if (pending_len > 0) {
+                        const final_matches = try em.collectMaskMatches(ac_state.?.pending[0..pending_len], allocator);
+                        defer allocator.free(final_matches);
+                        for (final_matches) |match| {
+                            emitter.emit(.{
+                                .stage = "entity_mask",
+                                .match_type = "entity",
+                                .offset = @intCast(entity_audit_offset + match.start),
+                                .original_length = match.end - match.start,
+                                .replacement_type = "entity_alias",
+                            });
+                        }
+                    }
+
+                    const flushed = try ac_state.?.flush(em, allocator);
+                    defer allocator.free(flushed);
+                    if (flushed.len > 0) {
+                        try schema_redactor.writeChunk(flushed);
+                    }
+                }
+
+                request_body_bytes = raw_body_bytes;
+                const schema_stats = try schema_redactor.finish();
+                log.log(.debug, "schema_request_streamed", session_id, &.{
+                    .{ .key = "peak_buffered_input_bytes", .value = .{ .uint = schema_stats.peak_buffered_input_bytes } },
+                    .{ .key = "peak_working_set_bytes", .value = .{ .uint = schema_stats.peak_working_set_bytes } },
+                    .{ .key = "max_nesting_depth", .value = .{ .uint = schema_stats.max_nesting_depth } },
+                });
 
                 try req_body.end();
                 if (client_req.connection) |conn| {

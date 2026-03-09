@@ -13,6 +13,19 @@ pub const RedactError = error{
     HashFailed,
 };
 
+pub const StreamingError = RedactError || std.Io.Writer.Error;
+
+pub const StreamingStats = struct {
+    peak_buffered_input_bytes: usize = 0,
+    peak_key_stack_bytes: usize = 0,
+    peak_pending_key_bytes: usize = 0,
+    peak_working_set_bytes: usize = 0,
+    bytes_written: usize = 0,
+    max_nesting_depth: usize = 0,
+};
+
+const NeedMoreInput = error{NeedMoreInput};
+
 /// Context for SCAN-action fields that need the existing 3-stage pipeline.
 /// When null, SCAN fields are treated as KEEP (passed through untouched).
 ///
@@ -509,9 +522,749 @@ fn parseArray(
     return error.InvalidJson;
 }
 
+const ObjectState = enum {
+    expect_key_or_end,
+    expect_colon,
+    expect_value,
+    expect_comma_or_end,
+};
+
+const ArrayState = enum {
+    expect_value_or_end,
+    expect_comma_or_end,
+};
+
+const Frame = union(enum) {
+    object: struct {
+        state: ObjectState = .expect_key_or_end,
+        pending_key: ?[]u8 = null,
+        stack_key_owned: ?[]u8 = null,
+    },
+    array: struct {
+        state: ArrayState = .expect_value_or_end,
+    },
+};
+
+/// Incremental schema-aware JSON redactor used by the proxy request path.
+/// It only retains unread parser input, nesting metadata, and the current key,
+/// instead of buffering the full JSON document before applying schema actions.
+pub const ChunkedRedactor = struct {
+    schema: *const Schema,
+    hasher: ?HasherInterface,
+    scan_ctx: ?ScanContext,
+    audit_ctx: ?AuditContext,
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    input_buf: std.ArrayListUnmanaged(u8) = .empty,
+    input_cursor: usize = 0,
+    frames: std.ArrayListUnmanaged(Frame) = .empty,
+    key_stack: std.ArrayListUnmanaged([]u8) = .empty,
+    root_started: bool = false,
+    root_complete: bool = false,
+    finished_input: bool = false,
+    stats: StreamingStats = .{},
+
+    pub fn init(
+        schema: *const Schema,
+        hasher: ?HasherInterface,
+        scan_ctx: ?ScanContext,
+        audit_ctx: ?AuditContext,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) ChunkedRedactor {
+        var self = ChunkedRedactor{
+            .schema = schema,
+            .hasher = hasher,
+            .scan_ctx = scan_ctx,
+            .audit_ctx = audit_ctx,
+            .writer = writer,
+            .allocator = allocator,
+        };
+        self.noteState();
+        return self;
+    }
+
+    pub fn deinit(self: *ChunkedRedactor) void {
+        for (self.frames.items) |frame| {
+            switch (frame) {
+                .object => |obj| if (obj.pending_key) |key| self.allocator.free(key),
+                .array => {},
+            }
+        }
+        self.frames.deinit(self.allocator);
+
+        for (self.key_stack.items) |key| self.allocator.free(key);
+        self.key_stack.deinit(self.allocator);
+
+        self.input_buf.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn writeChunk(self: *ChunkedRedactor, chunk: []const u8) StreamingError!void {
+        if (self.finished_input) return error.InvalidJson;
+        if (chunk.len == 0) return;
+
+        try self.input_buf.appendSlice(self.allocator, chunk);
+        self.noteState();
+        try self.processAvailable(false);
+        self.compactInputBuffer();
+        self.noteState();
+    }
+
+    pub fn finish(self: *ChunkedRedactor) StreamingError!StreamingStats {
+        self.finished_input = true;
+        try self.processAvailable(true);
+        if (!self.root_started) {
+            self.skipWhitespace();
+            if (self.input_cursor != self.input_buf.items.len) return error.InvalidJson;
+            self.compactInputBuffer();
+            self.noteState();
+            return self.stats;
+        }
+        self.skipWhitespace();
+        if (!self.root_started or !self.root_complete or self.frames.items.len != 0) {
+            return error.InvalidJson;
+        }
+        if (self.input_cursor != self.input_buf.items.len) {
+            return error.InvalidJson;
+        }
+        self.compactInputBuffer();
+        self.noteState();
+        return self.stats;
+    }
+
+    fn processAvailable(self: *ChunkedRedactor, allow_eof: bool) StreamingError!void {
+        while (true) {
+            const progressed = self.step(allow_eof) catch |err| switch (err) {
+                error.NeedMoreInput => break,
+                else => |other| return other,
+            };
+            if (!progressed) break;
+            self.compactInputBuffer();
+        }
+    }
+
+    fn step(self: *ChunkedRedactor, allow_eof: bool) (StreamingError || NeedMoreInput)!bool {
+        self.skipWhitespace();
+
+        if (self.root_complete) {
+            return self.input_cursor < self.input_buf.items.len;
+        }
+
+        if (!self.root_started) {
+            if (self.input_cursor >= self.input_buf.items.len) {
+                if (allow_eof) return false;
+                return error.NeedMoreInput;
+            }
+            self.root_started = true;
+            try self.parseFreeValue(allow_eof);
+            return true;
+        }
+
+        if (self.frames.items.len == 0) {
+            self.root_complete = true;
+            return false;
+        }
+
+        const frame_idx = self.frames.items.len - 1;
+        switch (self.frames.items[frame_idx]) {
+            .object => |*obj| switch (obj.state) {
+                .expect_key_or_end => {
+                    if (self.input_cursor >= self.input_buf.items.len) {
+                        if (allow_eof) return error.InvalidJson;
+                        return error.NeedMoreInput;
+                    }
+
+                    if (self.input_buf.items[self.input_cursor] == '}') {
+                        self.input_cursor += 1;
+                        try self.writeByte('}');
+                        self.popFrame(frame_idx);
+                        return true;
+                    }
+
+                    const key = try self.readRawString(allow_eof);
+                    self.input_cursor = key.end;
+                    try self.writeBytes(key.raw);
+                    obj.pending_key = try self.allocator.dupe(u8, key.inner);
+                    obj.state = .expect_colon;
+                    self.noteState();
+                    return true;
+                },
+                .expect_colon => {
+                    self.skipWhitespace();
+                    if (self.input_cursor >= self.input_buf.items.len) {
+                        if (allow_eof) return error.InvalidJson;
+                        return error.NeedMoreInput;
+                    }
+                    if (self.input_buf.items[self.input_cursor] != ':') return error.InvalidJson;
+                    self.input_cursor += 1;
+                    try self.writeByte(':');
+                    obj.state = .expect_value;
+                    return true;
+                },
+                .expect_value => {
+                    self.skipWhitespace();
+                    if (self.input_cursor >= self.input_buf.items.len) {
+                        if (allow_eof) return error.InvalidJson;
+                        return error.NeedMoreInput;
+                    }
+
+                    const key_owned = obj.pending_key orelse return error.InvalidJson;
+                    const next = self.input_buf.items[self.input_cursor];
+                    if (next == '{') {
+                        obj.pending_key = null;
+                        obj.state = .expect_comma_or_end;
+                        errdefer self.allocator.free(key_owned);
+                        self.input_cursor += 1;
+                        try self.writeByte('{');
+                        try self.pushObjectFrame(key_owned);
+                        return true;
+                    }
+                    if (next == '[') {
+                        obj.pending_key = null;
+                        obj.state = .expect_comma_or_end;
+                        defer self.allocator.free(key_owned);
+                        self.input_cursor += 1;
+                        try self.writeByte('[');
+                        try self.pushArrayFrame();
+                        return true;
+                    }
+
+                    const value = try self.readRawValue(allow_eof);
+                    obj.pending_key = null;
+                    obj.state = .expect_comma_or_end;
+                    defer self.allocator.free(key_owned);
+                    self.input_cursor = value.end;
+                    try self.applyPrimitiveAction(key_owned, value.raw);
+                    return true;
+                },
+                .expect_comma_or_end => {
+                    self.skipWhitespace();
+                    if (self.input_cursor >= self.input_buf.items.len) {
+                        if (allow_eof) return error.InvalidJson;
+                        return error.NeedMoreInput;
+                    }
+
+                    switch (self.input_buf.items[self.input_cursor]) {
+                        ',' => {
+                            self.input_cursor += 1;
+                            try self.writeByte(',');
+                            obj.state = .expect_key_or_end;
+                            return true;
+                        },
+                        '}' => {
+                            self.input_cursor += 1;
+                            try self.writeByte('}');
+                            self.popFrame(frame_idx);
+                            return true;
+                        },
+                        else => return error.InvalidJson,
+                    }
+                },
+            },
+            .array => |*arr| switch (arr.state) {
+                .expect_value_or_end => {
+                    if (self.input_cursor >= self.input_buf.items.len) {
+                        if (allow_eof) return error.InvalidJson;
+                        return error.NeedMoreInput;
+                    }
+                    if (self.input_buf.items[self.input_cursor] == ']') {
+                        self.input_cursor += 1;
+                        try self.writeByte(']');
+                        self.popFrame(frame_idx);
+                        return true;
+                    }
+                    arr.state = .expect_comma_or_end;
+                    try self.parseFreeValue(allow_eof);
+                    return true;
+                },
+                .expect_comma_or_end => {
+                    self.skipWhitespace();
+                    if (self.input_cursor >= self.input_buf.items.len) {
+                        if (allow_eof) return error.InvalidJson;
+                        return error.NeedMoreInput;
+                    }
+
+                    switch (self.input_buf.items[self.input_cursor]) {
+                        ',' => {
+                            self.input_cursor += 1;
+                            try self.writeByte(',');
+                            arr.state = .expect_value_or_end;
+                            return true;
+                        },
+                        ']' => {
+                            self.input_cursor += 1;
+                            try self.writeByte(']');
+                            self.popFrame(frame_idx);
+                            return true;
+                        },
+                        else => return error.InvalidJson,
+                    }
+                },
+            },
+        }
+    }
+
+    fn parseFreeValue(self: *ChunkedRedactor, allow_eof: bool) (StreamingError || NeedMoreInput)!void {
+        if (self.input_cursor >= self.input_buf.items.len) {
+            if (allow_eof) return error.InvalidJson;
+            return error.NeedMoreInput;
+        }
+
+        switch (self.input_buf.items[self.input_cursor]) {
+            '{' => {
+                self.input_cursor += 1;
+                try self.writeByte('{');
+                try self.pushObjectFrame(null);
+            },
+            '[' => {
+                self.input_cursor += 1;
+                try self.writeByte('[');
+                try self.pushArrayFrame();
+            },
+            else => {
+                const value = try self.readRawValue(allow_eof);
+                self.input_cursor = value.end;
+                try self.writeBytes(value.raw);
+                if (self.frames.items.len == 0) self.root_complete = true;
+            },
+        }
+    }
+
+    fn pushObjectFrame(self: *ChunkedRedactor, stack_key_owned: ?[]u8) !void {
+        if (stack_key_owned) |key| {
+            try self.key_stack.append(self.allocator, key);
+        }
+        try self.frames.append(self.allocator, .{
+            .object = .{
+                .stack_key_owned = stack_key_owned,
+            },
+        });
+        self.noteState();
+    }
+
+    fn pushArrayFrame(self: *ChunkedRedactor) !void {
+        try self.frames.append(self.allocator, .{
+            .array = .{},
+        });
+        self.noteState();
+    }
+
+    fn popFrame(self: *ChunkedRedactor, frame_idx: usize) void {
+        const frame = self.frames.items[frame_idx];
+        self.frames.items.len = frame_idx;
+
+        switch (frame) {
+            .object => |obj| {
+                if (obj.pending_key) |key| self.allocator.free(key);
+                if (obj.stack_key_owned) |owned| {
+                    const last_idx = self.key_stack.items.len - 1;
+                    self.key_stack.items.len = last_idx;
+                    self.allocator.free(owned);
+                }
+            },
+            .array => {},
+        }
+
+        if (self.frames.items.len == 0) self.root_complete = true;
+        self.noteState();
+    }
+
+    fn applyPrimitiveAction(self: *ChunkedRedactor, key_owned: []const u8, raw_value: []const u8) StreamingError!void {
+        const full_path = try buildKeyPath(&self.key_stack, key_owned, self.allocator);
+        defer self.allocator.free(full_path);
+
+        const action = self.schema.findAction(full_path);
+        switch (action) {
+            .keep => {
+                try self.writeBytes(raw_value);
+            },
+            .redact => {
+                if (self.audit_ctx) |audit| {
+                    audit.audit_fn(.{
+                        .field_path = full_path,
+                        .action = .redact,
+                        .original_length = auditValueLength(raw_value),
+                        .replacement_type = if (isStringValue(raw_value)) "redacted" else "null",
+                    }, audit.ctx_ptr) catch return error.ScanFailed;
+                }
+                if (isStringValue(raw_value)) {
+                    try self.writeBytes("\"[REDACTED]\"");
+                } else {
+                    try self.writeBytes("null");
+                }
+            },
+            .scan => {
+                if (self.audit_ctx) |audit| {
+                    audit.audit_fn(.{
+                        .field_path = full_path,
+                        .action = .scan,
+                        .original_length = auditValueLength(raw_value),
+                        .replacement_type = if (isStringValue(raw_value)) "scan_pipeline" else "pass_through",
+                    }, audit.ctx_ptr) catch return error.ScanFailed;
+                }
+                if (isStringValue(raw_value) and self.scan_ctx != null) {
+                    const inner = innerStringContent(raw_value);
+                    const scanned = self.scan_ctx.?.scan_fn(inner, full_path, self.scan_ctx.?.ctx_ptr, self.allocator) catch return error.ScanFailed;
+                    defer self.allocator.free(scanned);
+                    try self.writeByte('"');
+                    try self.writeBytes(scanned);
+                    try self.writeByte('"');
+                } else {
+                    try self.writeBytes(raw_value);
+                }
+            },
+            .hash => {
+                if (self.audit_ctx) |audit| {
+                    audit.audit_fn(.{
+                        .field_path = full_path,
+                        .action = .hash,
+                        .original_length = auditValueLength(raw_value),
+                        .replacement_type = if (isStringValue(raw_value) and self.hasher != null) "pseudonymized" else if (isStringValue(raw_value)) "redacted" else "null",
+                    }, audit.ctx_ptr) catch return error.HashFailed;
+                }
+                if (isStringValue(raw_value) and self.hasher != null) {
+                    const inner = innerStringContent(raw_value);
+                    const hashed = self.hasher.?.hash_fn(inner, self.hasher.?.ctx_ptr) catch return error.HashFailed;
+                    defer self.allocator.free(@constCast(hashed));
+                    try self.writeByte('"');
+                    try self.writeBytes(hashed);
+                    try self.writeByte('"');
+                } else if (isStringValue(raw_value)) {
+                    try self.writeBytes("\"[REDACTED]\"");
+                } else {
+                    try self.writeBytes("null");
+                }
+            },
+        }
+    }
+
+    fn readRawValue(self: *ChunkedRedactor, allow_eof: bool) (RedactError || NeedMoreInput)!struct { raw: []const u8, end: usize } {
+        if (self.input_cursor >= self.input_buf.items.len) {
+            if (allow_eof) return error.InvalidJson;
+            return error.NeedMoreInput;
+        }
+
+        return switch (self.input_buf.items[self.input_cursor]) {
+            '"' => blk: {
+                const string_value = try self.readRawString(allow_eof);
+                break :blk .{
+                    .raw = string_value.raw,
+                    .end = string_value.end,
+                };
+            },
+            else => blk: {
+                const primitive = try self.readRawPrimitive(allow_eof);
+                break :blk .{
+                    .raw = primitive.raw,
+                    .end = primitive.end,
+                };
+            },
+        };
+    }
+
+    fn readRawString(self: *ChunkedRedactor, allow_eof: bool) (RedactError || NeedMoreInput)!struct { raw: []const u8, inner: []const u8, end: usize } {
+        if (self.input_cursor >= self.input_buf.items.len or self.input_buf.items[self.input_cursor] != '"') {
+            return error.InvalidJson;
+        }
+
+        var i = self.input_cursor + 1;
+        while (i < self.input_buf.items.len) : (i += 1) {
+            if (self.input_buf.items[i] == '\\') {
+                i += 1;
+                if (i >= self.input_buf.items.len) {
+                    if (allow_eof) return error.InvalidJson;
+                    return error.NeedMoreInput;
+                }
+                continue;
+            }
+            if (self.input_buf.items[i] == '"') {
+                return .{
+                    .raw = self.input_buf.items[self.input_cursor .. i + 1],
+                    .inner = self.input_buf.items[self.input_cursor + 1 .. i],
+                    .end = i + 1,
+                };
+            }
+        }
+
+        if (allow_eof) return error.InvalidJson;
+        return error.NeedMoreInput;
+    }
+
+    fn readRawPrimitive(self: *ChunkedRedactor, allow_eof: bool) (RedactError || NeedMoreInput)!struct { raw: []const u8, end: usize } {
+        var i = self.input_cursor;
+        while (i < self.input_buf.items.len) : (i += 1) {
+            switch (self.input_buf.items[i]) {
+                ',', '}', ']', ' ', '\t', '\n', '\r' => break,
+                else => {},
+            }
+        }
+
+        if (i == self.input_cursor) return error.InvalidJson;
+        if (i == self.input_buf.items.len and !allow_eof) return error.NeedMoreInput;
+
+        return .{
+            .raw = self.input_buf.items[self.input_cursor..i],
+            .end = i,
+        };
+    }
+
+    fn skipWhitespace(self: *ChunkedRedactor) void {
+        while (self.input_cursor < self.input_buf.items.len) {
+            switch (self.input_buf.items[self.input_cursor]) {
+                ' ', '\t', '\n', '\r' => self.input_cursor += 1,
+                else => return,
+            }
+        }
+    }
+
+    fn compactInputBuffer(self: *ChunkedRedactor) void {
+        if (self.input_cursor == 0) return;
+        if (self.input_cursor >= self.input_buf.items.len) {
+            self.input_buf.items.len = 0;
+            self.input_cursor = 0;
+            return;
+        }
+        const remaining = self.input_buf.items.len - self.input_cursor;
+        std.mem.copyForwards(u8, self.input_buf.items[0..remaining], self.input_buf.items[self.input_cursor..]);
+        self.input_buf.items.len = remaining;
+        self.input_cursor = 0;
+    }
+
+    fn writeByte(self: *ChunkedRedactor, byte: u8) StreamingError!void {
+        try self.writer.writeByte(byte);
+        self.stats.bytes_written += 1;
+    }
+
+    fn writeBytes(self: *ChunkedRedactor, bytes: []const u8) StreamingError!void {
+        if (bytes.len == 0) return;
+        try self.writer.writeAll(bytes);
+        self.stats.bytes_written += bytes.len;
+    }
+
+    fn noteState(self: *ChunkedRedactor) void {
+        const buffered_input = self.input_buf.items.len - self.input_cursor;
+        const key_stack_bytes = totalKeyBytes(&self.key_stack);
+        const pending_key_bytes = self.pendingKeyBytes();
+        const working_set_bytes =
+            self.input_buf.capacity +
+            self.frames.capacity * @sizeOf(Frame) +
+            self.key_stack.capacity * @sizeOf([]u8) +
+            key_stack_bytes +
+            pending_key_bytes;
+
+        if (buffered_input > self.stats.peak_buffered_input_bytes) {
+            self.stats.peak_buffered_input_bytes = buffered_input;
+        }
+        if (key_stack_bytes > self.stats.peak_key_stack_bytes) {
+            self.stats.peak_key_stack_bytes = key_stack_bytes;
+        }
+        if (pending_key_bytes > self.stats.peak_pending_key_bytes) {
+            self.stats.peak_pending_key_bytes = pending_key_bytes;
+        }
+        if (working_set_bytes > self.stats.peak_working_set_bytes) {
+            self.stats.peak_working_set_bytes = working_set_bytes;
+        }
+        if (self.frames.items.len > self.stats.max_nesting_depth) {
+            self.stats.max_nesting_depth = self.frames.items.len;
+        }
+    }
+
+    fn pendingKeyBytes(self: *const ChunkedRedactor) usize {
+        var total: usize = 0;
+        for (self.frames.items) |frame| {
+            switch (frame) {
+                .object => |obj| {
+                    if (obj.pending_key) |key| total += key.len;
+                },
+                .array => {},
+            }
+        }
+        return total;
+    }
+};
+
+fn totalKeyBytes(key_stack: *const std.ArrayListUnmanaged([]u8)) usize {
+    var total: usize = 0;
+    for (key_stack.items) |key| total += key.len;
+    return total;
+}
+
+pub fn redactJsonStreaming(
+    input: []const u8,
+    chunk_size: usize,
+    schema: *const Schema,
+    hasher: ?HasherInterface,
+    scan_ctx: ?ScanContext,
+    audit_ctx: ?AuditContext,
+    allocator: std.mem.Allocator,
+) StreamingError!struct { output: []u8, stats: StreamingStats } {
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+
+    var redactor = ChunkedRedactor.init(schema, hasher, scan_ctx, audit_ctx, &sink.writer, allocator);
+    defer redactor.deinit();
+
+    const effective_chunk_size = if (chunk_size == 0) input.len else chunk_size;
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const end = @min(offset + effective_chunk_size, input.len);
+        try redactor.writeChunk(input[offset..end]);
+        offset = end;
+    }
+    const stats = try redactor.finish();
+    return .{
+        .output = try sink.toOwnedSlice(),
+        .stats = stats,
+    };
+}
+
 // ===========================================================================
 // Unit Tests
 // ===========================================================================
+
+test "json_redactor - streaming matches buffered output across chunk sizes" {
+    const ScanMaskCtx = struct {
+        fn doScan(input_val: []const u8, _: []const u8, _: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            if (std.mem.indexOf(u8, input_val, "123-45-6789")) |pos| {
+                const replacement = "***-**-****";
+                var out = try alloc.alloc(u8, input_val.len - 11 + replacement.len);
+                @memcpy(out[0..pos], input_val[0..pos]);
+                @memcpy(out[pos .. pos + replacement.len], replacement);
+                @memcpy(out[pos + replacement.len ..], input_val[pos + 11 ..]);
+                return out;
+            }
+            return try alloc.dupe(u8, input_val);
+        }
+    };
+
+    const schema_content =
+        \\schema.default = KEEP
+        \\patient_name = REDACT
+        \\internal_id = HASH
+        \\notes = SCAN
+        \\details.zip = REDACT
+        \\details.state = KEEP
+    ;
+
+    var schema = try Schema.parseContent(schema_content, std.testing.allocator);
+    defer schema.deinit();
+
+    const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var buffered_hasher = try @import("hasher.zig").Hasher.init(key_hex, std.testing.allocator);
+    defer buffered_hasher.deinit();
+    var streaming_hasher = try @import("hasher.zig").Hasher.init(key_hex, std.testing.allocator);
+    defer streaming_hasher.deinit();
+
+    var dummy: u8 = 0;
+    const scan_ctx = ScanContext{
+        .scan_fn = &ScanMaskCtx.doScan,
+        .ctx_ptr = @ptrCast(&dummy),
+    };
+
+    const buffered_hash = HasherInterface{
+        .hash_fn = &struct {
+            fn call(original: []const u8, ctx_ptr: *anyopaque) ![]const u8 {
+                const hasher: *@import("hasher.zig").Hasher = @ptrCast(@alignCast(ctx_ptr));
+                return hasher.hash(original);
+            }
+        }.call,
+        .ctx_ptr = @ptrCast(&buffered_hasher),
+    };
+    const streaming_hash = HasherInterface{
+        .hash_fn = &struct {
+            fn call(original: []const u8, ctx_ptr: *anyopaque) ![]const u8 {
+                const hasher: *@import("hasher.zig").Hasher = @ptrCast(@alignCast(ctx_ptr));
+                return hasher.hash(original);
+            }
+        }.call,
+        .ctx_ptr = @ptrCast(&streaming_hasher),
+    };
+
+    const input =
+        \\{"records":[{"patient_name":"Jane Smith","internal_id":"PT-99001","notes":"SSN 123-45-6789 appears here","details":{"zip":"62704","state":"IL"}},{"patient_name":"John Doe","internal_id":"PT-99002","notes":"clean","details":{"zip":"01010","state":"MA"}}]}
+    ;
+
+    const buffered = try redactJson(input, &schema, buffered_hash, scan_ctx, std.testing.allocator);
+    defer std.testing.allocator.free(buffered);
+
+    for ([_]usize{ 1, 2, 5, 17, 64 }) |chunk_size| {
+        const streamed = try redactJsonStreaming(input, chunk_size, &schema, streaming_hash, scan_ctx, null, std.testing.allocator);
+        defer std.testing.allocator.free(streamed.output);
+
+        try std.testing.expectEqualStrings(buffered, streamed.output);
+        try std.testing.expect(streamed.stats.peak_buffered_input_bytes < input.len);
+    }
+}
+
+test "json_redactor - streaming keeps bounded working set on large payload" {
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    defer payload.deinit(std.testing.allocator);
+
+    try payload.appendSlice(std.testing.allocator, "{\"records\":[");
+    for (0..1024) |idx| {
+        if (idx != 0) try payload.append(std.testing.allocator, ',');
+        try payload.writer(std.testing.allocator).print(
+            "{{\"patient_name\":\"Patient {d}\",\"internal_id\":\"PT-{d:0>5}\",\"notes\":\"Patient SSN 123-45-6789 requires follow up.\",\"details\":{{\"zip\":\"62704\",\"state\":\"IL\"}}}}",
+            .{ idx, idx },
+        );
+    }
+    try payload.appendSlice(std.testing.allocator, "]}");
+
+    const schema_content =
+        \\schema.default = KEEP
+        \\patient_name = REDACT
+        \\internal_id = HASH
+        \\notes = SCAN
+        \\details.zip = REDACT
+    ;
+
+    var schema = try Schema.parseContent(schema_content, std.testing.allocator);
+    defer schema.deinit();
+
+    const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var hasher = try @import("hasher.zig").Hasher.init(key_hex, std.testing.allocator);
+    defer hasher.deinit();
+
+    var dummy: u8 = 0;
+    const scan_ctx = ScanContext{
+        .scan_fn = &struct {
+            fn doScan(input_val: []const u8, _: []const u8, _: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+                if (std.mem.indexOf(u8, input_val, "123-45-6789")) |pos| {
+                    const replacement = "***-**-****";
+                    var out = try alloc.alloc(u8, input_val.len - 11 + replacement.len);
+                    @memcpy(out[0..pos], input_val[0..pos]);
+                    @memcpy(out[pos .. pos + replacement.len], replacement);
+                    @memcpy(out[pos + replacement.len ..], input_val[pos + 11 ..]);
+                    return out;
+                }
+                return try alloc.dupe(u8, input_val);
+            }
+        }.doScan,
+        .ctx_ptr = @ptrCast(&dummy),
+    };
+
+    const hasher_iface = HasherInterface{
+        .hash_fn = &struct {
+            fn call(original: []const u8, ctx_ptr: *anyopaque) ![]const u8 {
+                const active_hasher: *@import("hasher.zig").Hasher = @ptrCast(@alignCast(ctx_ptr));
+                return active_hasher.hash(original);
+            }
+        }.call,
+        .ctx_ptr = @ptrCast(&hasher),
+    };
+
+    const reference = try redactJson(payload.items, &schema, hasher_iface, scan_ctx, std.testing.allocator);
+    defer std.testing.allocator.free(reference);
+
+    const streamed = try redactJsonStreaming(payload.items, 4096, &schema, hasher_iface, scan_ctx, null, std.testing.allocator);
+    defer std.testing.allocator.free(streamed.output);
+
+    try std.testing.expectEqualStrings(reference, streamed.output);
+    try std.testing.expect(payload.items.len > 128 * 1024);
+    try std.testing.expect(streamed.stats.peak_working_set_bytes < 64 * 1024);
+    try std.testing.expect(streamed.stats.peak_buffered_input_bytes < 16 * 1024);
+}
 
 test "json_redactor - flat REDACT and KEEP" {
     const schema_content =
