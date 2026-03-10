@@ -28,18 +28,4 @@ jobs:
       # - name: Test
       #   run: zig build test
 
-      # - name: Generate Compatibility Matrix
-      #   id: compat_matrix
-      #   continue-on-error: true
-      #   run: zig build compat-matrix -- compatibility/compatibility-matrix.json
-
-      # - name: Upload Compatibility Matrix
-      #   if: always()
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: compatibility-matrix
-      #     path: compatibility/compatibility-matrix.json
-
-      # - name: Fail On Compatibility Regressions
-      #   if: steps.compat_matrix.outcome == 'failure'
-      #   run: exit 1
+      # Compatibility matrix runs in dedicated workflow: compatibility.yml

@@ -2,6 +2,10 @@
   <h1 align="center">🛡️ NanoMask</h1>
   <p align="center"><strong>Wire-speed PII/PHI redaction proxy — pure Zig, zero dependencies</strong></p>
   <p align="center">
+    <a href="https://github.com/cpbeamer/NanoMask/actions/workflows/zig-ci.yml"><img src="https://github.com/cpbeamer/NanoMask/actions/workflows/zig-ci.yml/badge.svg" alt="Zig CI"></a>
+    <a href="https://github.com/cpbeamer/NanoMask/actions/workflows/compatibility.yml"><img src="https://github.com/cpbeamer/NanoMask/actions/workflows/compatibility.yml/badge.svg" alt="Compatibility"></a>
+  </p>
+  <p align="center">
     <a href="#benchmarks">16+ GB/s SSN redaction</a> · <a href="#algorithms">3-stage privacy pipeline</a> · <a href="#quick-start">Single binary deploy</a>
   </p>
 </p>
