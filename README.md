@@ -191,8 +191,9 @@ NanoMask now preserves end-to-end response headers by default and only strips ho
 - Response unmasking for alias restoration stays incremental when the payload is inline-transformable and identity-encoded.
 - HASH restore (`unhashJson`) still requires full JSON buffering. When that happens the proxy logs `response_mode="buffered"` with `buffer_reason="json_unhash"` so operators can see why streaming was disabled for that response.
 
-The local mock-upstream compliance suite includes streamed SSE and NDJSON flows with inter-chunk delays and asserts that the first downstream chunk arrives before the full upstream response completes. That gives NanoMask a regression check for first-token latency on loopback without relying on an external vendor.
-**Known limitation**: The compatibility matrix currently reports that Anthropic-style SSE streaming is collapsed into a single client chunk. The proxy forwards the data correctly, but incremental per-chunk flushing is not yet verified as arriving in separate reads for the SSE flow. Improving incremental flush fidelity is tracked as part of the NMV2-003 streaming follow-up.
+The compatibility matrix includes OpenAI-style and Anthropic-style SSE streaming flows that validate per-event structure fidelity, incremental chunk delivery, and first-token latency. NDJSON streaming is separately verified. First-token latency is measured and included in the compatibility matrix JSON artifact.
+
+For a full reference of forwarding modes, flushing behavior, operator log fields, and HASH-mode buffering impact, see [`docs/streaming_behavior.md`](docs/streaming_behavior.md).
 
 ### Graceful Shutdown and Upstream Timeouts
 
