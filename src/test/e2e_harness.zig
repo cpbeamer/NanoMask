@@ -469,7 +469,7 @@ test "harness - graceful shutdown drains active request" {
                 .tls_context = null,
                 .target_tls = false,
                 .max_body_size = 1024 * 1024,
-                .log = &log,
+                .logger = &log,
                 .observability = &observability,
                 .connections_total = &connections_total,
                 .start_time = start_time,
