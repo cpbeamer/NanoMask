@@ -14,11 +14,17 @@ pub const MockUpstream = struct {
     response_delay_ms: u64,
     response_content_type: []const u8,
     response_extra_headers: []const http.Header,
+    record_requests: bool,
+    max_requests: usize,
     recorded_body: ?[]u8,
     recorded_head: ?[]u8,
     thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
     request_started: std.atomic.Value(bool),
+    handled_requests: std.atomic.Value(usize),
+    record_mutex: std.Thread.Mutex = .{},
+    connection_threads: std.ArrayListUnmanaged(std.Thread),
+    connection_threads_mutex: std.Thread.Mutex = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -41,11 +47,15 @@ pub const MockUpstream = struct {
             .response_delay_ms = 0,
             .response_content_type = response_content_type,
             .response_extra_headers = response_extra_headers,
+            .record_requests = true,
+            .max_requests = 1,
             .recorded_body = null,
             .recorded_head = null,
             .thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
             .request_started = std.atomic.Value(bool).init(false),
+            .handled_requests = std.atomic.Value(usize).init(0),
+            .connection_threads = .empty,
         };
     }
 
@@ -77,8 +87,31 @@ pub const MockUpstream = struct {
                 connection.stream.close();
                 return;
             }
-            self.handleOne(connection) catch {};
-            return;
+            const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ self, connection }) catch {
+                self.handleOne(connection) catch {};
+                self.markRequestHandled();
+                continue;
+            };
+
+            self.connection_threads_mutex.lock();
+            self.connection_threads.append(self.allocator, thread) catch {
+                self.connection_threads_mutex.unlock();
+                thread.detach();
+                continue;
+            };
+            self.connection_threads_mutex.unlock();
+        }
+    }
+
+    fn handleConnectionThread(self: *MockUpstream, connection: std.net.Server.Connection) void {
+        self.handleOne(connection) catch {};
+        self.markRequestHandled();
+    }
+
+    fn markRequestHandled(self: *MockUpstream) void {
+        const handled = self.handled_requests.fetchAdd(1, .acq_rel) + 1;
+        if (handled >= self.max_requests) {
+            self.stop();
         }
     }
 
@@ -94,20 +127,37 @@ pub const MockUpstream = struct {
         var request = try server.receiveHead();
         self.request_started.store(true, .release);
 
-        if (self.recorded_head) |old_head| self.allocator.free(old_head);
-        self.recorded_head = try self.allocator.dupe(u8, request.head_buffer);
+        if (self.record_requests) {
+            const recorded_head = try self.allocator.dupe(u8, request.head_buffer);
+            self.record_mutex.lock();
+            defer self.record_mutex.unlock();
+            if (self.recorded_head) |old_head| self.allocator.free(old_head);
+            self.recorded_head = recorded_head;
+        }
 
         if (request.head.method.requestHasBody()) {
             request.head.expect = null;
             var body_read_buf: [8192]u8 = undefined;
-            const body_reader = request.readerExpectNone(&body_read_buf);
-            var body_out: std.Io.Writer.Allocating = .init(self.allocator);
-            defer body_out.deinit();
+            var body_reader = request.readerExpectNone(&body_read_buf);
 
-            _ = try body_reader.streamRemaining(&body_out.writer);
+            if (self.record_requests) {
+                var body_out: std.Io.Writer.Allocating = .init(self.allocator);
+                defer body_out.deinit();
 
-            if (self.recorded_body) |old_body| self.allocator.free(old_body);
-            self.recorded_body = try body_out.toOwnedSlice();
+                _ = try body_reader.streamRemaining(&body_out.writer);
+
+                const recorded_body = try body_out.toOwnedSlice();
+                self.record_mutex.lock();
+                defer self.record_mutex.unlock();
+                if (self.recorded_body) |old_body| self.allocator.free(old_body);
+                self.recorded_body = recorded_body;
+            } else {
+                var discard_buf: [4096]u8 = undefined;
+                while (true) {
+                    const bytes_read = try body_reader.readSliceShort(&discard_buf);
+                    if (bytes_read == 0 or bytes_read < discard_buf.len) break;
+                }
+            }
         }
 
         var headers = std.ArrayListUnmanaged(http.Header).empty;
@@ -163,10 +213,25 @@ pub const MockUpstream = struct {
 
     pub fn deinit(self: *MockUpstream) void {
         self.stop();
-        if (self.thread) |t| t.join();
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        self.joinConnectionThreads();
         self.net_server.deinit();
         if (self.recorded_body) |b| self.allocator.free(b);
         if (self.recorded_head) |h| self.allocator.free(h);
+    }
+
+    fn joinConnectionThreads(self: *MockUpstream) void {
+        self.connection_threads_mutex.lock();
+        defer self.connection_threads_mutex.unlock();
+
+        for (self.connection_threads.items) |thread| {
+            thread.join();
+        }
+        self.connection_threads.deinit(self.allocator);
+        self.connection_threads = .empty;
     }
 };
 

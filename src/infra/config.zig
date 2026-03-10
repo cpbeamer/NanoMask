@@ -1,6 +1,8 @@
 const std = @import("std");
 const body_policy = @import("../net/body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
+const runtime_model = @import("../net/runtime_model.zig");
+const RuntimeModel = runtime_model.RuntimeModel;
 
 pub const LogLevel = enum {
     debug,
@@ -48,6 +50,10 @@ pub const Config = struct {
     fuzzy_threshold_src: ConfigSource = .default,
     max_connections: u32 = 128,
     max_connections_src: ConfigSource = .default,
+    runtime_model: RuntimeModel = .thread_per_connection,
+    runtime_model_src: ConfigSource = .default,
+    runtime_worker_threads: usize = 0,
+    runtime_worker_threads_src: ConfigSource = .default,
     log_level: LogLevel = .info,
     log_level_src: ConfigSource = .default,
     watch_interval_ms: u64 = 1000,
@@ -130,6 +136,8 @@ pub const Config = struct {
         InvalidThreshold,
         InvalidLogLevel,
         InvalidMaxConnections,
+        InvalidRuntimeModel,
+        InvalidRuntimeWorkerThreads,
         InvalidWatchInterval,
         EntityFileNotFound,
         InvalidAdminFlag,
@@ -211,6 +219,8 @@ pub const Config = struct {
         \\  --target-port <u16>                 Upstream target port (default: 80)
         \\  --target-tls                        Enable TLS for upstream connections (default: disabled)
         \\  --max-connections <u32>             Maximum concurrent connections (default: 128)
+        \\  --runtime-model <mode>              Connection scheduler: thread-per-connection or worker-pool (default: thread-per-connection)
+        \\  --runtime-worker-threads <n>        Worker threads for worker-pool mode (0 = auto, default: 0)
         \\  --max-body-size <bytes>             Maximum request body size in bytes (default: 10485760)
         \\  --entity-file <path>                Path to file containing entity aliases (default: none)
         \\  --watch-interval <ms>               Entity file poll interval in ms (default: 1000)
@@ -362,6 +372,12 @@ pub const Config = struct {
             };
             if (config.max_connections == 0) return error.InvalidMaxConnections;
             config.max_connections_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_RUNTIME_MODEL")) {
+            config.runtime_model = try parseRuntimeModelValue(value, "NANOMASK_RUNTIME_MODEL");
+            config.runtime_model_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_RUNTIME_WORKER_THREADS")) {
+            config.runtime_worker_threads = try parseRuntimeWorkerThreadsValue(value, "NANOMASK_RUNTIME_WORKER_THREADS");
+            config.runtime_worker_threads_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_LOG_LEVEL")) {
             config.log_level = LogLevel.parse(value) catch {
                 std.debug.print("error: NANOMASK_LOG_LEVEL must be debug, info, warn, error, got '{s}'\n", .{value});
@@ -561,6 +577,29 @@ pub const Config = struct {
         };
     }
 
+    fn parseRuntimeModelValue(
+        value: []const u8,
+        label: []const u8,
+    ) ParseError!RuntimeModel {
+        return RuntimeModel.parse(value) catch {
+            std.debug.print(
+                "error: {s} must be 'thread-per-connection' or 'worker-pool', got '{s}'\n",
+                .{ label, value },
+            );
+            return error.InvalidRuntimeModel;
+        };
+    }
+
+    fn parseRuntimeWorkerThreadsValue(
+        value: []const u8,
+        label: []const u8,
+    ) ParseError!usize {
+        return std.fmt.parseInt(usize, value, 10) catch {
+            std.debug.print("error: {s} must be a non-negative integer, got '{s}'\n", .{ label, value });
+            return error.InvalidRuntimeWorkerThreads;
+        };
+    }
+
     fn parseTimeoutValue(value: []const u8, label: []const u8) ParseError!u64 {
         return std.fmt.parseInt(u64, value, 10) catch {
             std.debug.print("error: {s} must be a non-negative integer in milliseconds, got '{s}'\n", .{ label, value });
@@ -583,6 +622,8 @@ pub const Config = struct {
             "NANOMASK_ENTITY_FILE",
             "NANOMASK_FUZZY_THRESHOLD",
             "NANOMASK_MAX_CONNECTIONS",
+            "NANOMASK_RUNTIME_MODEL",
+            "NANOMASK_RUNTIME_WORKER_THREADS",
             "NANOMASK_LOG_LEVEL",
             "NANOMASK_WATCH_INTERVAL",
             "NANOMASK_ADMIN_API",
@@ -727,6 +768,22 @@ pub const Config = struct {
                     return error.InvalidMaxConnections;
                 }
                 config.max_connections_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--runtime-model")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --runtime-model\n", .{});
+                    return error.MissingValue;
+                }
+                config.runtime_model = try parseRuntimeModelValue(args[i], "--runtime-model");
+                config.runtime_model_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--runtime-worker-threads")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --runtime-worker-threads\n", .{});
+                    return error.MissingValue;
+                }
+                config.runtime_worker_threads = try parseRuntimeWorkerThreadsValue(args[i], "--runtime-worker-threads");
+                config.runtime_worker_threads_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--log-level")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1056,6 +1113,9 @@ pub const Config = struct {
         if (!config.target_tls and config.tls_no_system_ca) {
             std.debug.print("WARNING: --tls-no-system-ca has no effect without --target-tls\n", .{});
         }
+        if (config.runtime_model == .thread_per_connection and config.runtime_worker_threads != 0) {
+            std.debug.print("WARNING: --runtime-worker-threads has no effect unless --runtime-model worker-pool is selected\n", .{});
+        }
 
         // When --tls-no-system-ca is set without --ca-file, no CAs will be
         // trusted at all — every upstream HTTPS handshake will fail. Warn
@@ -1131,6 +1191,8 @@ test "Config - parse valid arguments" {
     try testing.expectEqual(@as(u16, 443), config.target_port);
     try testing.expectEqual(@as(f32, 0.9), config.fuzzy_threshold);
     try testing.expectEqual(@as(u32, 1000), config.max_connections);
+    try testing.expectEqual(RuntimeModel.thread_per_connection, config.runtime_model);
+    try testing.expectEqual(@as(usize, 0), config.runtime_worker_threads);
     try testing.expectEqual(LogLevel.debug, config.log_level);
     try testing.expectEqual(@as(?[]const u8, null), config.entity_file);
 }
@@ -1240,6 +1302,8 @@ test "Config - help text includes optional feature surface" {
     try testing.expect(std.mem.indexOf(u8, Config.help_text, "--schema-file") != null);
     try testing.expect(std.mem.indexOf(u8, Config.help_text, "--hash-key-file") != null);
     try testing.expect(std.mem.indexOf(u8, Config.help_text, "--unsupported-request-body-behavior") != null);
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--runtime-model") != null);
+    try testing.expect(std.mem.indexOf(u8, Config.help_text, "--runtime-worker-threads") != null);
 }
 
 test "Config - invalid max connections zero" {
@@ -1251,6 +1315,59 @@ test "Config - invalid max connections zero" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidMaxConnections, res);
+}
+
+test "Config - runtime worker pool flags" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--runtime-model",
+        "worker-pool",
+        "--runtime-worker-threads",
+        "12",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(RuntimeModel.worker_pool, cfg.runtime_model);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.runtime_model_src);
+    try testing.expectEqual(@as(usize, 12), cfg.runtime_worker_threads);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.runtime_worker_threads_src);
+}
+
+test "Config - runtime model env vars" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_RUNTIME_MODEL", "worker-pool", std.testing.allocator);
+    try Config.applyEnvVar(&cfg, "NANOMASK_RUNTIME_WORKER_THREADS", "6", std.testing.allocator);
+
+    try testing.expectEqual(RuntimeModel.worker_pool, cfg.runtime_model);
+    try testing.expectEqual(ConfigSource.env_var, cfg.runtime_model_src);
+    try testing.expectEqual(@as(usize, 6), cfg.runtime_worker_threads);
+    try testing.expectEqual(ConfigSource.env_var, cfg.runtime_worker_threads_src);
+}
+
+test "Config - invalid runtime model" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--runtime-model",
+        "event-loop",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidRuntimeModel, res);
+}
+
+test "Config - invalid runtime worker threads" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--runtime-worker-threads",
+        "many",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidRuntimeWorkerThreads, res);
 }
 
 test "Config - valid watch interval" {

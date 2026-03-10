@@ -8,6 +8,8 @@ const schema_mod = @import("../schema/schema.zig");
 const json_redactor = @import("../schema/json_redactor.zig");
 const hasher_mod = @import("../schema/hasher.zig");
 const e2e_harness = @import("../test/e2e_harness.zig");
+const bench_util = @import("../test/bench_util.zig");
+const runtime_bench_harness = @import("../test/runtime_bench_harness.zig");
 
 pub const Status = enum {
     pass,
@@ -217,13 +219,11 @@ fn ratio(numerator: usize, denominator: usize) f64 {
 }
 
 fn nsToMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+    return bench_util.nsToMs(ns);
 }
 
 fn percentileIndex(len: usize, numerator: usize, denominator: usize) usize {
-    if (len == 0) return 0;
-    const rank = (len * numerator + denominator - 1) / denominator;
-    return if (rank == 0) 0 else @min(len - 1, rank - 1);
+    return bench_util.percentileIndex(len, numerator, denominator);
 }
 
 fn previewText(allocator: std.mem.Allocator, text: []const u8, max_len: usize) ![]const u8 {
@@ -519,11 +519,7 @@ fn buildSchemaStreamingPayload(allocator: std.mem.Allocator, approx_bytes: usize
 }
 
 fn sortAndSummarize(latencies_ns: []u64) struct { p50_ms: f64, p95_ms: f64 } {
-    std.sort.block(u64, latencies_ns, {}, std.sort.asc(u64));
-    return .{
-        .p50_ms = nsToMs(latencies_ns[percentileIndex(latencies_ns.len, 50, 100)]),
-        .p95_ms = nsToMs(latencies_ns[percentileIndex(latencies_ns.len, 95, 100)]),
-    };
+    return bench_util.sortAndSummarize(latencies_ns);
 }
 
 fn benchmarkSsnThroughput() !BenchmarkResult {
@@ -882,6 +878,119 @@ fn benchmarkSseFirstChunk() !BenchmarkResult {
     };
 }
 
+fn gatewayBenchmarkWorkerThreads(concurrent_clients: usize) usize {
+    return @max(@as(usize, 1), concurrent_clients);
+}
+
+fn benchmarkGatewayRuntimeLatency(allocator: std.mem.Allocator) !BenchmarkResult {
+    const concurrent_clients: usize = 64;
+    const iterations: usize = 3;
+
+    const baseline = try runtime_bench_harness.runProxyBurst(allocator, .{
+        .runtime_model = .thread_per_connection,
+        .concurrent_clients = concurrent_clients,
+        .iterations = iterations,
+        .payload_bytes = 4096,
+        .upstream_delay_ms = 2,
+        .max_connections = concurrent_clients,
+    });
+    const worker_threads = gatewayBenchmarkWorkerThreads(concurrent_clients);
+    const candidate = try runtime_bench_harness.runProxyBurst(allocator, .{
+        .runtime_model = .worker_pool,
+        .runtime_worker_threads = worker_threads,
+        .concurrent_clients = concurrent_clients,
+        .iterations = iterations,
+        .payload_bytes = 4096,
+        .upstream_delay_ms = 2,
+        .max_connections = concurrent_clients,
+    });
+
+    const max_p95 = @max(baseline.p95_ms * 4.0, baseline.p95_ms + 20.0);
+    const note = try std.fmt.allocPrint(
+        allocator,
+        "baseline(tpc): {d}/{d} ok, p95 {d:.1} ms, ~{d} threads | candidate(pool): {d}/{d} ok, p95 {d:.1} ms, {d} workers | max_p95 {d:.1} ms",
+        .{
+            baseline.successful_requests,
+            baseline.total_requests,
+            baseline.p95_ms,
+            baseline.estimated_handler_threads,
+            candidate.successful_requests,
+            candidate.total_requests,
+            candidate.p95_ms,
+            candidate.runtime_worker_threads,
+            max_p95,
+        },
+    );
+
+    return .{
+        .id = "gateway_runtime_worker_pool_latency",
+        .label = "Gateway worker-pool latency",
+        .mode = "latency_ms",
+        .status = if (candidate.successful_requests == candidate.total_requests and
+            baseline.successful_requests == baseline.total_requests and
+            candidate.p95_ms <= max_p95)
+            .pass
+        else
+            .fail,
+        .iterations = candidate.total_requests,
+        .payload_bytes = candidate.payload_bytes,
+        .p50_ms = candidate.p50_ms,
+        .p95_ms = candidate.p95_ms,
+        .max_p95_ms = max_p95,
+        .note = note,
+    };
+}
+
+fn benchmarkGatewayRuntimeStackReservation(allocator: std.mem.Allocator) !BenchmarkResult {
+    const concurrent_clients: usize = 64;
+    const baseline = try runtime_bench_harness.runProxyBurst(allocator, .{
+        .runtime_model = .thread_per_connection,
+        .concurrent_clients = concurrent_clients,
+        .iterations = 1,
+        .payload_bytes = 2048,
+        .upstream_delay_ms = 1,
+        .max_connections = concurrent_clients,
+    });
+    const candidate = try runtime_bench_harness.runProxyBurst(allocator, .{
+        .runtime_model = .worker_pool,
+        .runtime_worker_threads = gatewayBenchmarkWorkerThreads(concurrent_clients),
+        .concurrent_clients = concurrent_clients,
+        .iterations = 1,
+        .payload_bytes = 2048,
+        .upstream_delay_ms = 1,
+        .max_connections = concurrent_clients,
+    });
+
+    const max_bytes = @max(@as(usize, 1), baseline.estimated_reserved_stack_bytes / 2);
+    const note = try std.fmt.allocPrint(
+        allocator,
+        "baseline(tpc): ~{d} MiB for {d} threads | candidate(pool): ~{d} MiB for {d} workers | max {d} MiB",
+        .{
+            baseline.estimated_reserved_stack_bytes / (1024 * 1024),
+            baseline.estimated_handler_threads,
+            candidate.estimated_reserved_stack_bytes / (1024 * 1024),
+            candidate.runtime_worker_threads,
+            max_bytes / (1024 * 1024),
+        },
+    );
+
+    return .{
+        .id = "gateway_runtime_worker_pool_stack",
+        .label = "Gateway worker-pool stack reservation",
+        .mode = "peak_working_set_bytes",
+        .status = if (candidate.estimated_reserved_stack_bytes <= max_bytes and
+            candidate.successful_requests == candidate.total_requests)
+            .pass
+        else
+            .fail,
+        .iterations = candidate.total_requests,
+        .payload_bytes = candidate.payload_bytes,
+        .observed_bytes = candidate.estimated_reserved_stack_bytes,
+        .max_bytes = max_bytes,
+        .note = note,
+    };
+}
+
 const SchemaStreamingMetrics = struct {
     payload_bytes: usize,
     p50_ms: f64,
@@ -998,22 +1107,34 @@ pub fn runBenchmarks(allocator: std.mem.Allocator) ![]const BenchmarkResult {
     errdefer results.deinit(allocator);
 
     const ssn = benchmarkSsnThroughput() catch |err| benchmarkFailure(
-        "stage_ssn_throughput", "Stage 1 SSN throughput", "throughput_mb_per_sec", @errorName(err),
+        "stage_ssn_throughput",
+        "Stage 1 SSN throughput",
+        "throughput_mb_per_sec",
+        @errorName(err),
     );
     try results.append(allocator, ssn);
 
     const entity = benchmarkEntityThroughput() catch |err| benchmarkFailure(
-        "stage_entity_throughput", "Stage 2 entity masking throughput", "throughput_mb_per_sec", @errorName(err),
+        "stage_entity_throughput",
+        "Stage 2 entity masking throughput",
+        "throughput_mb_per_sec",
+        @errorName(err),
     );
     try results.append(allocator, entity);
 
     const fuzzy = benchmarkFuzzyThroughput() catch |err| benchmarkFailure(
-        "stage_fuzzy_throughput", "Stage 3 fuzzy matching throughput", "throughput_mb_per_sec", @errorName(err),
+        "stage_fuzzy_throughput",
+        "Stage 3 fuzzy matching throughput",
+        "throughput_mb_per_sec",
+        @errorName(err),
     );
     try results.append(allocator, fuzzy);
 
     const pattern = benchmarkPatternThroughput() catch |err| benchmarkFailure(
-        "stage_pattern_throughput", "Pattern scanner throughput", "throughput_mb_per_sec", @errorName(err),
+        "stage_pattern_throughput",
+        "Pattern scanner throughput",
+        "throughput_mb_per_sec",
+        @errorName(err),
     );
     try results.append(allocator, pattern);
 
@@ -1032,6 +1153,22 @@ pub fn runBenchmarks(allocator: std.mem.Allocator) ![]const BenchmarkResult {
         @errorName(err),
     );
     try results.append(allocator, schema_hash);
+
+    const gateway_runtime_latency = benchmarkGatewayRuntimeLatency(allocator) catch |err| benchmarkFailure(
+        "gateway_runtime_worker_pool_latency",
+        "Gateway worker-pool latency",
+        "latency_ms",
+        @errorName(err),
+    );
+    try results.append(allocator, gateway_runtime_latency);
+
+    const gateway_runtime_stack = benchmarkGatewayRuntimeStackReservation(allocator) catch |err| benchmarkFailure(
+        "gateway_runtime_worker_pool_stack",
+        "Gateway worker-pool stack reservation",
+        "peak_working_set_bytes",
+        @errorName(err),
+    );
+    try results.append(allocator, gateway_runtime_stack);
 
     const schema_streaming_latency = benchmarkSchemaStreamingLatency() catch |err| benchmarkFailure(
         "schema_streaming_latency",
@@ -1136,56 +1273,110 @@ fn writeAccuracyTableRow(writer: anytype, result: AccuracyResult) !void {
 
 fn writeBenchmarkTableRow(writer: anytype, result: BenchmarkResult) !void {
     if (result.throughput_mb_per_sec) |throughput| {
-        try writer.print(
-            "| {s} | {s} | {d:.1} MB/s | >= {d:.1} MB/s |\n",
-            .{
-                result.label,
-                statusString(result.status),
-                throughput,
-                result.min_throughput_mb_per_sec.?,
-            },
-        );
+        if (result.note) |note| {
+            try writer.print(
+                "| {s} | {s} | {d:.1} MB/s ({s}) | >= {d:.1} MB/s |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    throughput,
+                    note,
+                    result.min_throughput_mb_per_sec.?,
+                },
+            );
+        } else {
+            try writer.print(
+                "| {s} | {s} | {d:.1} MB/s | >= {d:.1} MB/s |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    throughput,
+                    result.min_throughput_mb_per_sec.?,
+                },
+            );
+        }
         return;
     }
 
     if (result.observed_bytes) |observed_bytes| {
-        try writer.print(
-            "| {s} | {s} | {d} bytes | <= {d} bytes |\n",
-            .{
-                result.label,
-                statusString(result.status),
-                observed_bytes,
-                result.max_bytes.?,
-            },
-        );
+        if (result.note) |note| {
+            try writer.print(
+                "| {s} | {s} | {d} bytes ({s}) | <= {d} bytes |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    observed_bytes,
+                    note,
+                    result.max_bytes.?,
+                },
+            );
+        } else {
+            try writer.print(
+                "| {s} | {s} | {d} bytes | <= {d} bytes |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    observed_bytes,
+                    result.max_bytes.?,
+                },
+            );
+        }
         return;
     }
 
     if (result.first_chunk_p95_ms) |first_chunk_p95| {
-        try writer.print(
-            "| {s} | {s} | first chunk p95 {d:.1} ms, total p95 {d:.1} ms | <= {d:.1} ms |\n",
-            .{
-                result.label,
-                statusString(result.status),
-                first_chunk_p95,
-                result.p95_ms.?,
-                result.max_first_chunk_p95_ms.?,
-            },
-        );
+        if (result.note) |note| {
+            try writer.print(
+                "| {s} | {s} | first chunk p95 {d:.1} ms, total p95 {d:.1} ms ({s}) | <= {d:.1} ms |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    first_chunk_p95,
+                    result.p95_ms.?,
+                    note,
+                    result.max_first_chunk_p95_ms.?,
+                },
+            );
+        } else {
+            try writer.print(
+                "| {s} | {s} | first chunk p95 {d:.1} ms, total p95 {d:.1} ms | <= {d:.1} ms |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    first_chunk_p95,
+                    result.p95_ms.?,
+                    result.max_first_chunk_p95_ms.?,
+                },
+            );
+        }
         return;
     }
 
     if (result.p95_ms) |p95| {
-        try writer.print(
-            "| {s} | {s} | p50 {d:.1} ms, p95 {d:.1} ms | <= {d:.1} ms |\n",
-            .{
-                result.label,
-                statusString(result.status),
-                result.p50_ms.?,
-                p95,
-                result.max_p95_ms.?,
-            },
-        );
+        if (result.note) |note| {
+            try writer.print(
+                "| {s} | {s} | p50 {d:.1} ms, p95 {d:.1} ms ({s}) | <= {d:.1} ms |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    result.p50_ms.?,
+                    p95,
+                    note,
+                    result.max_p95_ms.?,
+                },
+            );
+        } else {
+            try writer.print(
+                "| {s} | {s} | p50 {d:.1} ms, p95 {d:.1} ms | <= {d:.1} ms |\n",
+                .{
+                    result.label,
+                    statusString(result.status),
+                    result.p50_ms.?,
+                    p95,
+                    result.max_p95_ms.?,
+                },
+            );
+        }
         return;
     }
 

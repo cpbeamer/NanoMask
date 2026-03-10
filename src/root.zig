@@ -13,6 +13,7 @@ pub const observability = @import("infra/observability.zig");
 pub const shutdown = @import("infra/shutdown.zig");
 pub const redaction_audit = @import("infra/redaction_audit.zig");
 pub const body_policy = @import("net/body_policy.zig");
+pub const runtime_model = @import("net/runtime_model.zig");
 pub const upstream_client = @import("net/upstream_client.zig");
 pub const proxy_server = @import("net/proxy_server.zig");
 
@@ -37,6 +38,8 @@ pub const compatibility_matrix = if (@import("builtin").is_test) @import("test/c
 const healthcare_starter_pack = if (@import("builtin").is_test) @import("test/healthcare_starter_pack.zig") else @compileError("test-only");
 const integration_kits = if (@import("builtin").is_test) @import("test/integration_kits.zig") else @compileError("test-only");
 const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig") else @compileError("test-only");
+const runtime_bench_harness = if (@import("builtin").is_test) @import("test/runtime_bench_harness.zig") else @compileError("test-only");
+const bench_util = if (@import("builtin").is_test) @import("test/bench_util.zig") else @compileError("test-only");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -52,6 +55,7 @@ test {
     _ = observability;
     _ = shutdown;
     _ = body_policy;
+    _ = runtime_model;
     _ = redaction_audit;
     _ = upstream_client;
     _ = proxy_server;
@@ -75,4 +79,6 @@ test {
     _ = healthcare_starter_pack;
     _ = integration_kits;
     _ = proof_harness;
+    _ = runtime_bench_harness;
+    _ = bench_util;
 }

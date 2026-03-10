@@ -13,6 +13,7 @@ const observability_mod = @import("../infra/observability.zig");
 const shutdown_mod = @import("../infra/shutdown.zig");
 const schema_mod = @import("../schema/schema.zig");
 const hasher_mod = @import("../schema/hasher.zig");
+const bench_util = @import("bench_util.zig");
 
 /// Result of an E2E round-trip through the proxy.
 pub const RoundTripResult = struct {
@@ -99,8 +100,7 @@ pub const HarnessConfig = struct {
 };
 
 fn elapsedSince(start_ns: @TypeOf(std.time.nanoTimestamp())) u64 {
-    const delta = std.time.nanoTimestamp() - start_ns;
-    return if (delta < 0) 0 else @intCast(delta);
+    return bench_util.elapsedSince(start_ns);
 }
 
 const TimingBodyCollector = struct {
@@ -457,32 +457,35 @@ test "harness - graceful shutdown drains active request" {
 
     var proxy_server = proxy_server_mod.ProxyServer{
         .net_server = proxy_listener,
-        .ctx = .{
-            .allocator = allocator,
-            .target_host = "127.0.0.1",
-            .target_port = mock.port,
-            .entity_set = null,
-            .http_client = &upstream_client_instance,
-            .active_connections = &active_connections,
-            .admin_config = .{ .enabled = false, .token = null, .entity_file_sync = false, .entity_file = null, .fuzzy_threshold = 0.0 },
-            .tls_context = null,
-            .target_tls = false,
-            .max_body_size = 1024 * 1024,
-            .log = &log,
-            .observability = &observability,
-            .connections_total = &connections_total,
-            .start_time = start_time,
-            .unsupported_request_body_behavior = .reject,
-            .unsupported_response_body_behavior = .bypass,
-            .enable_email = false,
-            .enable_phone = false,
-            .enable_credit_card = false,
-            .enable_ip = false,
-            .enable_healthcare = false,
-            .schema = null,
-            .hasher = null,
-            .shutdown_state = &shutdown_state,
-            .upstream_timeouts = .{},
+        .handler = .{
+            .ctx = .{
+                .allocator = allocator,
+                .target_host = "127.0.0.1",
+                .target_port = mock.port,
+                .entity_set = null,
+                .http_client = &upstream_client_instance,
+                .active_connections = &active_connections,
+                .admin_config = .{ .enabled = false, .token = null, .entity_file_sync = false, .entity_file = null, .fuzzy_threshold = 0.0 },
+                .tls_context = null,
+                .target_tls = false,
+                .max_body_size = 1024 * 1024,
+                .log = &log,
+                .observability = &observability,
+                .connections_total = &connections_total,
+                .start_time = start_time,
+                .unsupported_request_body_behavior = .reject,
+                .unsupported_response_body_behavior = .bypass,
+                .enable_email = false,
+                .enable_phone = false,
+                .enable_credit_card = false,
+                .enable_ip = false,
+                .enable_healthcare = false,
+                .schema = null,
+                .hasher = null,
+                .shutdown_state = &shutdown_state,
+                .listener_mode = .combined,
+                .upstream_timeouts = .{},
+            },
         },
         .max_connections = 16,
         .drain_timeout_ms = 1_000,
@@ -519,7 +522,7 @@ test "harness - graceful shutdown drains active request" {
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/shutdown", .{proxy_server.net_server.listen_address.getPort()});
     const uri = try std.Uri.parse(url);
 
-    const response = try httpRequest(allocator, .POST, uri, "hello", "text/plain", &.{}); 
+    const response = try httpRequest(allocator, .POST, uri, "hello", "text/plain", &.{});
     defer allocator.free(response.body);
     defer allocator.free(response.head);
 

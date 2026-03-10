@@ -16,8 +16,11 @@ const hasher_mod = @import("../schema/hasher.zig");
 const body_policy = @import("body_policy.zig");
 const shutdown_mod = @import("../infra/shutdown.zig");
 const upstream_client = @import("upstream_client.zig");
+const runtime_model_mod = @import("runtime_model.zig");
 
-pub const ThreadContext = struct {
+pub const RuntimeModel = runtime_model_mod.RuntimeModel;
+
+pub const ConnectionContext = struct {
     allocator: std.mem.Allocator,
     target_host: []const u8,
     target_port: u16,
@@ -46,19 +49,40 @@ pub const ThreadContext = struct {
     upstream_timeouts: upstream_client.UpstreamTimeouts,
 };
 
+pub const ConnectionHandler = struct {
+    ctx: ConnectionContext,
+
+    pub fn handle(self: *const ConnectionHandler, connection: std.net.Server.Connection) void {
+        handleConnection(connection, self.ctx);
+    }
+};
+
 pub const ProxyServer = struct {
     net_server: std.net.Server,
-    ctx: ThreadContext,
+    handler: ConnectionHandler,
     max_connections: u32,
     drain_timeout_ms: u64,
     active_connections: *std.atomic.Value(u32),
     logger: *Logger,
     observability: *Observability,
     shutdown_state: *shutdown_mod.ShutdownState,
+    runtime_model: RuntimeModel = .thread_per_connection,
+    runtime_worker_threads: usize = 0,
+    worker_pool: std.Thread.Pool = undefined,
+    worker_pool_ready: bool = false,
     listener_mutex: std.Thread.Mutex = .{},
     listener_closed: bool = false,
 
     pub fn serve(self: *ProxyServer) void {
+        self.initRuntime() catch |err| {
+            self.logger.log(.error_, "runtime_init_failed", null, &.{
+                .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                .{ .key = "runtime_model", .value = .{ .string = self.runtime_model.label() } },
+            });
+            return;
+        };
+        defer self.deinitRuntime();
+
         while (true) {
             const connection = self.net_server.accept() catch |err| {
                 if (self.shutdown_state.isRequested() or self.shutdown_state.isDraining()) {
@@ -78,7 +102,7 @@ pub const ProxyServer = struct {
                 return;
             }
 
-            _ = self.ctx.connections_total.fetchAdd(1, .monotonic);
+            _ = self.handler.ctx.connections_total.fetchAdd(1, .monotonic);
 
             const current = self.active_connections.fetchAdd(1, .acquire);
             if (current >= self.max_connections) {
@@ -88,15 +112,15 @@ pub const ProxyServer = struct {
                 continue;
             }
 
-            const thread = std.Thread.spawn(.{}, handleConnection, .{ connection, self.ctx }) catch |err| {
-                self.logger.log(.error_, "thread_spawn_failed", null, &.{
+            self.dispatchConnection(connection) catch |err| {
+                self.logger.log(.error_, "connection_dispatch_failed", null, &.{
                     .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                    .{ .key = "runtime_model", .value = .{ .string = self.runtime_model.label() } },
                 });
                 _ = self.active_connections.fetchSub(1, .release);
                 connection.stream.close();
                 continue;
             };
-            thread.detach();
         }
     }
 
@@ -118,6 +142,27 @@ pub const ProxyServer = struct {
 
     pub fn deinit(self: *ProxyServer) void {
         self.closeListener();
+    }
+
+    fn initRuntime(self: *ProxyServer) !void {
+        if (self.runtime_model != .worker_pool) return;
+
+        // Worker thread count must be resolved by the caller before starting.
+        // A zero value here indicates a configuration bug — fail explicitly.
+        if (self.runtime_worker_threads == 0) return error.RuntimeNotReady;
+
+        try self.worker_pool.init(.{
+            .allocator = self.handler.ctx.allocator,
+            .n_jobs = self.runtime_worker_threads,
+            .stack_size = runtime_model_mod.worker_pool_stack_size_bytes,
+        });
+        self.worker_pool_ready = true;
+    }
+
+    fn deinitRuntime(self: *ProxyServer) void {
+        if (!self.worker_pool_ready) return;
+        self.worker_pool.deinit();
+        self.worker_pool_ready = false;
     }
 
     fn finishShutdown(self: *ProxyServer) void {
@@ -149,9 +194,32 @@ pub const ProxyServer = struct {
         self.net_server.deinit();
         self.listener_closed = true;
     }
+
+    fn dispatchConnection(self: *ProxyServer, connection: std.net.Server.Connection) !void {
+        switch (self.runtime_model) {
+            .thread_per_connection => {
+                const thread = try std.Thread.spawn(.{}, dispatchOwnedConnection, .{
+                    &self.handler,
+                    connection,
+                });
+                thread.detach();
+            },
+            .worker_pool => {
+                if (!self.worker_pool_ready) return error.RuntimeNotReady;
+                try self.worker_pool.spawn(dispatchOwnedConnection, .{
+                    &self.handler,
+                    connection,
+                });
+            },
+        }
+    }
 };
 
-fn handleConnection(connection: std.net.Server.Connection, ctx: ThreadContext) void {
+fn dispatchOwnedConnection(handler: *const ConnectionHandler, connection: std.net.Server.Connection) void {
+    handler.handle(connection);
+}
+
+fn handleConnection(connection: std.net.Server.Connection, ctx: ConnectionContext) void {
     defer {
         connection.stream.close();
         _ = ctx.active_connections.fetchSub(1, .release);

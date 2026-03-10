@@ -21,6 +21,7 @@ const hasher_mod = @import("schema/hasher.zig");
 const body_policy = @import("net/body_policy.zig");
 const shutdown_mod = @import("infra/shutdown.zig");
 const proxy_server_mod = @import("net/proxy_server.zig");
+const runtime_model_mod = @import("net/runtime_model.zig");
 const upstream_client = @import("net/upstream_client.zig");
 
 var termination_signal_requested = std.atomic.Value(bool).init(false);
@@ -41,7 +42,6 @@ fn installTerminationSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
 }
-
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -106,6 +106,11 @@ pub fn main() !void {
         std.debug.print("error: failed to format listen address\n", .{});
         std.process.exit(1);
     };
+    const proxy_runtime_worker_threads = runtime_model_mod.resolveWorkerThreads(
+        cfg.runtime_model,
+        cfg.runtime_worker_threads,
+        cfg.max_connections,
+    );
 
     log.log(.info, "config_resolved", null, &.{
         .{ .key = "listen_host", .value = .{ .string = cfg.listen_host } },
@@ -122,6 +127,8 @@ pub fn main() !void {
         .{ .key = "upstream_read_timeout_ms", .value = .{ .uint = cfg.upstream_read_timeout_ms } },
         .{ .key = "upstream_request_timeout_ms", .value = .{ .uint = cfg.upstream_request_timeout_ms } },
         .{ .key = "shutdown_drain_timeout_ms", .value = .{ .uint = cfg.shutdown_drain_timeout_ms } },
+        .{ .key = "runtime_model", .value = .{ .string = cfg.runtime_model.label() } },
+        .{ .key = "runtime_worker_threads", .value = .{ .uint = proxy_runtime_worker_threads } },
         .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
         .{ .key = "unsupported_request_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_request_body_behavior) } },
         .{ .key = "unsupported_response_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_response_body_behavior) } },
@@ -282,6 +289,8 @@ pub fn main() !void {
         .{ .key = "target_host", .value = .{ .string = cfg.target_host } },
         .{ .key = "target_port", .value = .{ .uint = cfg.target_port } },
         .{ .key = "max_connections", .value = .{ .uint = cfg.max_connections } },
+        .{ .key = "runtime_model", .value = .{ .string = cfg.runtime_model.label() } },
+        .{ .key = "runtime_worker_threads", .value = .{ .uint = proxy_runtime_worker_threads } },
         .{ .key = "shutdown_drain_timeout_ms", .value = .{ .uint = cfg.shutdown_drain_timeout_ms } },
         .{ .key = "tls_enabled", .value = .{ .boolean = tls_enabled } },
     });
@@ -307,6 +316,10 @@ pub fn main() !void {
         std.process.exit(1);
     };
     const dedicated_admin_listener = cfg.admin_api and cfg.admin_listen_address != null;
+    const admin_runtime_model = if (dedicated_admin_listener)
+        proxy_server_mod.RuntimeModel.thread_per_connection
+    else
+        cfg.runtime_model;
 
     // Shared HTTP client: the stdlib ConnectionPool is thread-safe (uses Mutex).
     // All handler threads share this client, enabling TCP connection reuse with
@@ -400,51 +413,7 @@ pub fn main() !void {
 
     var server = proxy_server_mod.ProxyServer{
         .net_server = net_server,
-        .ctx = .{
-            .allocator = allocator,
-            .target_host = cfg.target_host,
-            .target_port = cfg.target_port,
-            .entity_set = entity_set,
-            .http_client = &http_client,
-            .active_connections = &active_connections,
-            .admin_config = admin_config,
-            .tls_context = if (tls_context) |*tc| tc else null,
-            .target_tls = cfg.target_tls,
-            .max_body_size = cfg.max_body_size,
-            .logger = &log,
-            .observability = &observability,
-            .connections_total = &connections_total,
-            .start_time = start_time,
-            .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
-            .unsupported_response_body_behavior = cfg.unsupported_response_body_behavior,
-            .enable_email = cfg.enable_email,
-            .enable_phone = cfg.enable_phone,
-            .enable_credit_card = cfg.enable_credit_card,
-            .enable_ip = cfg.enable_ip,
-            .enable_healthcare = cfg.enable_healthcare,
-            .schema = if (schema_instance) |*s| s else null,
-            .hasher = if (hasher_instance) |*h| h else null,
-            .shutdown_state = &shutdown_state,
-            .listener_mode = if (dedicated_admin_listener) .proxy_only else .combined,
-            .upstream_timeouts = .{
-                .connect_timeout_ms = cfg.upstream_connect_timeout_ms,
-                .read_timeout_ms = cfg.upstream_read_timeout_ms,
-                .request_timeout_ms = cfg.upstream_request_timeout_ms,
-            },
-        },
-        .max_connections = cfg.max_connections,
-        .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
-        .active_connections = &active_connections,
-        .logger = &log,
-        .observability = &observability,
-        .shutdown_state = &shutdown_state,
-    };
-    defer server.deinit();
-
-    var admin_server: ?proxy_server_mod.ProxyServer = null;
-    if (admin_net_server) |ns| {
-        admin_server = .{
-            .net_server = ns,
+        .handler = .{
             .ctx = .{
                 .allocator = allocator,
                 .target_host = cfg.target_host,
@@ -470,11 +439,61 @@ pub fn main() !void {
                 .schema = if (schema_instance) |*s| s else null,
                 .hasher = if (hasher_instance) |*h| h else null,
                 .shutdown_state = &shutdown_state,
-                .listener_mode = .admin_only,
+                .listener_mode = if (dedicated_admin_listener) .proxy_only else .combined,
                 .upstream_timeouts = .{
                     .connect_timeout_ms = cfg.upstream_connect_timeout_ms,
                     .read_timeout_ms = cfg.upstream_read_timeout_ms,
                     .request_timeout_ms = cfg.upstream_request_timeout_ms,
+                },
+            },
+        },
+        .max_connections = cfg.max_connections,
+        .drain_timeout_ms = cfg.shutdown_drain_timeout_ms,
+        .active_connections = &active_connections,
+        .logger = &log,
+        .observability = &observability,
+        .shutdown_state = &shutdown_state,
+        .runtime_model = cfg.runtime_model,
+        .runtime_worker_threads = proxy_runtime_worker_threads,
+    };
+    defer server.deinit();
+
+    var admin_server: ?proxy_server_mod.ProxyServer = null;
+    if (admin_net_server) |ns| {
+        admin_server = .{
+            .net_server = ns,
+            .handler = .{
+                .ctx = .{
+                    .allocator = allocator,
+                    .target_host = cfg.target_host,
+                    .target_port = cfg.target_port,
+                    .entity_set = entity_set,
+                    .http_client = &http_client,
+                    .active_connections = &active_connections,
+                    .admin_config = admin_config,
+                    .tls_context = if (tls_context) |*tc| tc else null,
+                    .target_tls = cfg.target_tls,
+                    .max_body_size = cfg.max_body_size,
+                    .logger = &log,
+                    .observability = &observability,
+                    .connections_total = &connections_total,
+                    .start_time = start_time,
+                    .unsupported_request_body_behavior = cfg.unsupported_request_body_behavior,
+                    .unsupported_response_body_behavior = cfg.unsupported_response_body_behavior,
+                    .enable_email = cfg.enable_email,
+                    .enable_phone = cfg.enable_phone,
+                    .enable_credit_card = cfg.enable_credit_card,
+                    .enable_ip = cfg.enable_ip,
+                    .enable_healthcare = cfg.enable_healthcare,
+                    .schema = if (schema_instance) |*s| s else null,
+                    .hasher = if (hasher_instance) |*h| h else null,
+                    .shutdown_state = &shutdown_state,
+                    .listener_mode = .admin_only,
+                    .upstream_timeouts = .{
+                        .connect_timeout_ms = cfg.upstream_connect_timeout_ms,
+                        .read_timeout_ms = cfg.upstream_read_timeout_ms,
+                        .request_timeout_ms = cfg.upstream_request_timeout_ms,
+                    },
                 },
             },
             .max_connections = cfg.max_connections,
@@ -483,6 +502,7 @@ pub fn main() !void {
             .logger = &log,
             .observability = &observability,
             .shutdown_state = &shutdown_state,
+            .runtime_model = admin_runtime_model,
         };
     }
     defer if (admin_server) |*server_ptr| server_ptr.deinit();
