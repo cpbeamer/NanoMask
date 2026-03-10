@@ -4,3 +4,7 @@ zig-out/
 *.obj
 *.exe
 *.pdb
+
+# Internal planning docs — not shipped with the product
+backlog*.md
+phase1_backlog.md
