@@ -110,17 +110,16 @@ fn setReceiveTimeout(
         return;
     }
 
-    var timeout = posix.timeval{
-        .tv_sec = @intCast(@divTrunc(timeout_ms, 1_000)),
-        .tv_usec = @intCast((timeout_ms % 1_000) * 1_000),
-    };
+    const secs: isize = @intCast(@divTrunc(timeout_ms, 1_000));
+    const usecs: isize = @intCast((timeout_ms % 1_000) * 1_000);
+    var timeout: posix.timeval = .{ .sec = secs, .usec = usecs };
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 }
 
 fn setSocketBlocking(
     socket: net.Stream.Handle,
     blocking: bool,
-) !void {
+) error{UnexpectedConnectFailure}!void {
     if (builtin.os.tag == .windows) {
         const ws2_32 = std.os.windows.ws2_32;
         var mode: u32 = if (blocking) 0 else 1;
@@ -130,13 +129,13 @@ fn setSocketBlocking(
         return;
     }
 
-    const flags = try posix.fcntl(socket, posix.F.GETFL, 0);
+    const flags = posix.fcntl(socket, posix.F.GETFL, 0) catch return error.UnexpectedConnectFailure;
     const nonblock_bit = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
     const next_flags = if (blocking)
         flags & ~nonblock_bit
     else
         flags | nonblock_bit;
-    _ = try posix.fcntl(socket, posix.F.SETFL, next_flags);
+    _ = posix.fcntl(socket, posix.F.SETFL, next_flags) catch return error.UnexpectedConnectFailure;
 }
 
 fn connectAddressWithTimeout(

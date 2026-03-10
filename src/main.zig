@@ -539,7 +539,7 @@ pub fn main() !void {
         null;
     defer if (maybe_admin_thread) |admin_thread| admin_thread.join();
 
-    const maybe_shutdown_watcher = if (builtin.os.tag == .windows)
+    const maybe_shutdown_watcher: ?std.Thread = if (builtin.os.tag == .windows)
         null
     else
         try std.Thread.spawn(.{}, ShutdownWatcher.run, .{
