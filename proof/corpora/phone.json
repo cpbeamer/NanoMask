@@ -1,0 +1,40 @@
+{
+  "suite": "phone",
+  "label": "Phone Redaction",
+  "description": "US-format phone samples and non-phone numeric phrases for recall and false-positive scoring.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "paren_format",
+      "label": "Parenthesized US phone",
+      "kind": "positive",
+      "input": "Call (555) 234-5678 for appointments.",
+      "expected": "Call [PHONE_REDACTED] for appointments."
+    },
+    {
+      "id": "dashed_format",
+      "label": "Dashed US phone",
+      "kind": "positive",
+      "input": "Reach triage at 555-234-5678 after hours.",
+      "expected": "Reach triage at [PHONE_REDACTED] after hours."
+    },
+    {
+      "id": "policy_number",
+      "label": "Policy number does not look like phone",
+      "kind": "negative",
+      "input": "Policy number 555-23-4567 should remain visible.",
+      "expected": "Policy number 555-23-4567 should remain visible."
+    },
+    {
+      "id": "short_extension",
+      "label": "Short extension is ignored",
+      "kind": "negative",
+      "input": "Dial extension 5555 at the front desk.",
+      "expected": "Dial extension 5555 at the front desk."
+    }
+  ]
+}

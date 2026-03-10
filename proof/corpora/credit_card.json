@@ -1,0 +1,40 @@
+{
+  "suite": "credit_card",
+  "label": "Credit Card Redaction",
+  "description": "Synthetic payment card strings used to verify Luhn-backed card redaction and clean numeric passthrough.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "plain_visa",
+      "label": "Plain 16-digit Visa test number",
+      "kind": "positive",
+      "input": "Payment card 4111111111111111 is on file.",
+      "expected": "Payment card [CC_REDACTED] is on file."
+    },
+    {
+      "id": "hyphenated_card",
+      "label": "Hyphenated card format",
+      "kind": "positive",
+      "input": "Use 4111-1111-1111-1111 for the synthetic billing sample.",
+      "expected": "Use [CC_REDACTED] for the synthetic billing sample."
+    },
+    {
+      "id": "invalid_luhn",
+      "label": "Invalid Luhn number stays visible",
+      "kind": "negative",
+      "input": "Reference 4111111111111112 should not be treated as a card.",
+      "expected": "Reference 4111111111111112 should not be treated as a card."
+    },
+    {
+      "id": "member_id",
+      "label": "Short member ID is ignored",
+      "kind": "negative",
+      "input": "Member ID 123456789012 remains visible.",
+      "expected": "Member ID 123456789012 remains visible."
+    }
+  ]
+}

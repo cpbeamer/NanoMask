@@ -1,0 +1,117 @@
+# Healthcare claims-gateway example.
+#
+# Create the mounted assets before applying this Deployment:
+#   kubectl create configmap nanomask-healthcare-claims --from-file=starters/healthcare/schemas/claims-processing.nmschema --from-file=starters/healthcare/entities/claims-processing.txt
+#   kubectl create secret generic nanomask-healthcare-hash --from-file=hash-key.txt=starters/healthcare/hash-key.example.txt
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nanomask-claims-gateway
+  labels:
+    app.kubernetes.io/name: nanomask
+    app.kubernetes.io/component: claims-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nanomask
+      app.kubernetes.io/component: claims-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nanomask
+        app.kubernetes.io/component: claims-gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: nanomask
+          image: nanomask:0.1.0
+          env:
+            - name: NANOMASK_LISTEN_HOST
+              value: "0.0.0.0"
+            - name: NANOMASK_LISTEN_PORT
+              value: "8081"
+            - name: NANOMASK_TARGET_HOST
+              value: claims-upstream.internal
+            - name: NANOMASK_TARGET_PORT
+              value: "443"
+            - name: NANOMASK_TARGET_TLS
+              value: "true"
+            - name: NANOMASK_ENTITY_FILE
+              value: /etc/nanomask/starter/claims-processing.txt
+            - name: NANOMASK_SCHEMA_FILE
+              value: /etc/nanomask/starter/claims-processing.nmschema
+            - name: NANOMASK_SCHEMA_DEFAULT
+              value: KEEP
+            - name: NANOMASK_HASH_KEY_FILE
+              value: /etc/nanomask/hash/hash-key.txt
+            - name: NANOMASK_ENABLE_IP
+              value: "true"
+            - name: NANOMASK_ENABLE_HEALTHCARE
+              value: "true"
+            - name: NANOMASK_AUDIT_LOG
+              value: "true"
+            - name: NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS
+              value: "90000"
+            - name: NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS
+              value: "45000"
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: starter
+              mountPath: /etc/nanomask/starter
+              readOnly: true
+            - name: hash
+              mountPath: /etc/nanomask/hash
+              readOnly: true
+      volumes:
+        - name: starter
+          configMap:
+            name: nanomask-healthcare-claims
+        - name: hash
+          secret:
+            secretName: nanomask-healthcare-hash
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nanomask-claims-gateway
+  labels:
+    app.kubernetes.io/name: nanomask
+    app.kubernetes.io/component: claims-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nanomask
+    app.kubernetes.io/component: claims-gateway
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http

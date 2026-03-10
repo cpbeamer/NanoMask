@@ -1,0 +1,9 @@
+# Encounter-note payloads with structured metadata and scanned note text.
+schema.name = encounter_notes
+schema.version = 2026-03-09
+schema.default = KEEP
+encounter_id = HASH
+patient.display_name = REDACT
+patient.date_of_birth = REDACT
+patient.internal_id = HASH
+note.summary = SCAN

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: nanomask
+description: >-
+  High-performance PII redaction proxy — strips SSNs, entity names, and
+  sensitive data from HTTP traffic at wire speed using SIMD and Aho-Corasick.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - privacy
+  - pii
+  - redaction
+  - proxy
+  - hipaa
+  - fedramp
+maintainers:
+  - name: NanoMask Team
+home: https://github.com/cpbeamer/NanoMask
+sources:
+  - https://github.com/cpbeamer/NanoMask

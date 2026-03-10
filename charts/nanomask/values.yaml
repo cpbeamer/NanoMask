@@ -1,0 +1,188 @@
+# -- Number of NanoMask pod replicas.
+replicaCount: 1
+
+image:
+  # -- Container image repository.
+  repository: nanomask
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion).
+  tag: ""
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override the release name prefix.
+nameOverride: ""
+# -- Override the full release name.
+fullnameOverride: ""
+
+# ── Proxy configuration ──────────────────────────────────────────────
+proxy:
+  # -- Host/IP NanoMask binds to inside the container.
+  # Use 127.0.0.1 for sidecar-only pod traffic, 0.0.0.0 for Service-backed gateway mode,
+  # or :: for dual-stack IPv6 gateway mode.
+  listenHost: 0.0.0.0
+  # -- Port NanoMask listens on inside the container.
+  listenPort: 8081
+  # -- Upstream target hostname.
+  targetHost: httpbin.org
+  # -- Upstream target port.
+  targetPort: 80
+  # -- Enable TLS for upstream connections.
+  targetTls: false
+  # -- Suppress system CA bundle loading.
+  # When using tls.caData for self-signed certs, also set this to true.
+  tlsNoSystemCa: false
+  # -- Fuzzy match similarity threshold (0.0–1.0).
+  fuzzyThreshold: 0.8
+  # -- Maximum concurrent connections.
+  maxConnections: 128
+  # -- Log verbosity: debug, info, warn, error.
+  logLevel: info
+  # -- Enable detailed redaction audit events.
+  auditLog: false
+  # -- Maximum request body size in bytes (default 10 MB).
+  maxBodySize: 10485760
+  # -- Unsupported request body handling: bypass or reject.
+  unsupportedRequestBodyBehavior: reject
+  # -- Unsupported response body handling: bypass or reject.
+  unsupportedResponseBodyBehavior: bypass
+  # -- Upstream TCP connect timeout in milliseconds (0 disables).
+  upstreamConnectTimeoutMs: 5000
+  # -- Upstream response read timeout in milliseconds (0 disables).
+  upstreamReadTimeoutMs: 30000
+  # -- Overall upstream request timeout in milliseconds (0 disables).
+  upstreamRequestTimeoutMs: 60000
+  # -- Graceful shutdown drain window in milliseconds (0 disables waiting).
+  shutdownDrainTimeoutMs: 30000
+
+# ── Admin API ────────────────────────────────────────────────────────
+adminApi:
+  # -- Enable the /_admin/entities REST API.
+  enabled: false
+  # -- Bearer token required for admin endpoints when adminApi.enabled is true.
+  # Anonymous admin mode is not supported.
+  token: ""
+  # -- Optional dedicated admin listener address, for example 127.0.0.1:9091.
+  # This listener is not exposed on the main Service unless you add a separate Service yourself.
+  listenAddress: ""
+  # -- Optional comma-separated exact client IP allowlist for admin routes.
+  allowlist: ""
+  # -- Allow GET visibility but reject POST/PUT/DELETE runtime mutations.
+  readOnly: false
+  # -- Maximum entity mutations per minute across admin routes (0 disables).
+  mutationRateLimitPerMinute: 60
+
+# ── Entity list ──────────────────────────────────────────────────────
+entities:
+  # -- Newline-delimited entity names to redact (mounted as a ConfigMap).
+  # Leave empty to run in SSN-only mode.
+  data: ""
+  # -- File watcher poll interval in milliseconds for mounted entity files.
+  watchIntervalMs: 1000
+
+# -- Optional pattern-library redaction toggles.
+features:
+  # -- Redact email addresses.
+  email: false
+  # -- Redact phone numbers.
+  phone: false
+  # -- Redact credit card numbers with Luhn validation.
+  creditCard: false
+  # -- Redact IPv4 and IPv6 addresses.
+  ipAddress: false
+  # -- Redact healthcare identifiers such as MRN, ICD-10, and insurance IDs.
+  healthcarePatterns: false
+
+# -- Optional schema-aware JSON redaction.
+schema:
+  # -- Filename to write inside the schema ConfigMap volume.
+  fileName: schema.nmschema
+  # -- Inline NanoMask schema document using line-based `field.path = ACTION` rules. Leave empty to disable schema mode.
+  data: ""
+  # -- Default action for keys not listed in the schema: REDACT, KEEP, or SCAN.
+  defaultAction: KEEP
+
+# -- Optional HASH-mode key configuration.
+hashing:
+  # -- Inline 64-character hex key exposed as NANOMASK_HASH_KEY.
+  # Prefer an external secret manager for production workloads.
+  # Empty string = disabled (Helm treats "" as falsy).
+  key: ""
+  # -- Filename to write when mounting a hash key file.
+  fileName: hash-key.txt
+  # -- File contents exposed through NANOMASK_HASH_KEY_FILE.
+  # Set only one of hashing.key or hashing.fileData.
+  fileData: ""
+
+# ── Listener TLS (client → NanoMask) ─────────────────────────────────
+tls:
+  # -- Enable TLS termination on the listener.
+  enabled: false
+  # -- Base64-encoded PEM certificate.
+  certData: ""
+  # -- Base64-encoded PEM private key.
+  keyData: ""
+  # -- Base64-encoded custom CA bundle PEM for upstream verification.
+  # When set, also enable proxy.tlsNoSystemCa to suppress the default CA bundle.
+  caData: ""
+
+# ── Kubernetes resources ─────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 64Mi
+
+# -- Pod termination grace period in seconds. Keep this higher than proxy.shutdownDrainTimeoutMs / 1000.
+terminationGracePeriodSeconds: 35
+
+# ── Pod security context (applied at pod level) ─────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+
+# ── Container security context ──────────────────────────────────────
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# ── Service ──────────────────────────────────────────────────────────
+service:
+  # -- Service type.
+  type: ClusterIP
+  # -- Service port (maps to proxy.listenPort).
+  port: 8081
+
+# -- Metrics exposure on the main listener.
+metrics:
+  # -- Enable Prometheus scrape annotations on the NanoMask Service.
+  enabled: false
+  # -- Prometheus path served by NanoMask.
+  path: /metrics
+  service:
+    # -- Extra Service annotations for Prometheus Operator or custom scrapers.
+    annotations: {}
+    # -- Extra Service labels for ServiceMonitor selectors or inventory.
+    labels: {}
+
+# ── Network policy ───────────────────────────────────────────────────
+networkPolicy:
+  # -- Create a NetworkPolicy restricting egress to the upstream and DNS.
+  enabled: true
+  # -- Optional CIDR to restrict upstream egress (e.g. "10.0.0.0/8").
+  # Leave empty to allow egress to any IP on the target port.
+  egressCIDR: ""
+
+# ── Node scheduling ─────────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}

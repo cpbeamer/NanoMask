@@ -143,14 +143,79 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
-    //
-    // The Zig build system is entirely implemented in userland, which means
-    // that it cannot hook into private compiler APIs. All compilation work
-    // orchestrated by the build system will result in other Zig compiler
-    // subcommands being invoked with the right flags defined. You can observe
-    // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
-    //
-    // Lastly, the Zig build system is relatively simple and self-contained,
-    // and reading its source code will allow you to master it.
+
+    // --- Benchmark step (opt-in: `zig build bench`) ---
+    // Creates a test executable with is_benchmark=true so benchmark tests run.
+    const bench_options = b.addOptions();
+    bench_options.addOption(bool, "is_benchmark", true);
+
+    const bench_mod = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    bench_mod.root_module.addOptions("build_options", bench_options);
+    const run_bench = b.addRunArtifact(bench_mod);
+    const bench_step = b.step("bench", "Run benchmarks (opt-in, ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
+    // --- Standalone benchmark runner: `zig build bench-all` ---
+    // Runs all three pipeline stages in a standalone binary for clean output.
+    const bench_exe = b.addExecutable(.{
+        .name = "NanoMask-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_all = b.addRunArtifact(bench_exe);
+    const bench_all_step = b.step("bench-all", "Run all pipeline benchmarks (standalone, ReleaseFast)");
+    bench_all_step.dependOn(&run_bench_all.step);
+
+    // --- Compatibility suite: `zig build compat-test` ---
+    const compat_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compat_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_compat_tests = b.addRunArtifact(compat_tests);
+    const compat_test_step = b.step("compat-test", "Run the compatibility integration suite");
+    compat_test_step.dependOn(&run_compat_tests.step);
+
+    // --- Compatibility matrix artifact: `zig build compat-matrix -- <output>` ---
+    const compat_matrix_exe = b.addExecutable(.{
+        .name = "NanoMask-compat-matrix",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compat_matrix.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_compat_matrix = b.addRunArtifact(compat_matrix_exe);
+    if (b.args) |args| {
+        run_compat_matrix.addArgs(args);
+    }
+    const compat_matrix_step = b.step("compat-matrix", "Generate the compatibility matrix JSON artifact");
+    compat_matrix_step.dependOn(&run_compat_matrix.step);
+
+    // --- Accuracy + benchmark proof artifact: `zig build proof-report -- <json> <markdown>` ---
+    const proof_report_exe = b.addExecutable(.{
+        .name = "NanoMask-proof-report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/proof_report.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_proof_report = b.addRunArtifact(proof_report_exe);
+    if (b.args) |args| {
+        run_proof_report.addArgs(args);
+    }
+    const proof_report_step = b.step("proof-report", "Generate accuracy and benchmark proof artifacts");
+    proof_report_step.dependOn(&run_proof_report.step);
 }

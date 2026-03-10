@@ -1,0 +1,40 @@
+{
+  "suite": "healthcare",
+  "label": "Healthcare Identifier Redaction",
+  "description": "Healthcare-oriented representative note snippets with synthetic MRN, insurance, and ICD-10 values that are safe for source control.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "mrn_and_icd10",
+      "label": "Representative triage note with MRN and ICD-10",
+      "kind": "positive",
+      "input": "Triage note: Patient MRN: 7654321 admitted with diagnosis E11.65 and stable vitals.",
+      "expected": "Triage note: Patient MRN: [MRN_REDACTED] admitted with diagnosis [ICD10_REDACTED] and stable vitals."
+    },
+    {
+      "id": "insurance_label",
+      "label": "Insurance identifier with label",
+      "kind": "positive",
+      "input": "Billing summary: Insurance ID: ABC12345678 verified before submission.",
+      "expected": "Billing summary: Insurance ID: [INSURANCE_REDACTED] verified before submission."
+    },
+    {
+      "id": "short_icd",
+      "label": "Incomplete ICD code is ignored",
+      "kind": "negative",
+      "input": "Discussion of category E11 should remain visible without an extension.",
+      "expected": "Discussion of category E11 should remain visible without an extension."
+    },
+    {
+      "id": "standalone_digits",
+      "label": "Standalone digits do not trigger healthcare redaction",
+      "kind": "negative",
+      "input": "Room 7654321 is a location code and remains unchanged.",
+      "expected": "Room 7654321 is a location code and remains unchanged."
+    }
+  ]
+}

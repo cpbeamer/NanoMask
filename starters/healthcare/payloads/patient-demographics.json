@@ -1,0 +1,18 @@
+{
+  "patient": {
+    "full_name": "Jane Smith",
+    "date_of_birth": "1984-05-17",
+    "medical_record_number": "1234567",
+    "phone": "(312) 555-0188",
+    "email": "jane.smith@clinic.example",
+    "address": {
+      "line1": "101 Wellness Ave",
+      "city": "Springfield",
+      "state": "IL",
+      "postal_code": "62704"
+    },
+    "subscriber_id": "SUB-778899",
+    "payer": "Northwind Health"
+  },
+  "notes": "Jane Smith confirmed SSN 123-45-6789 and MRN: 1234567 during intake."
+}

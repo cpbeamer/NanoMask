@@ -1,0 +1,33 @@
+name: Proof Harness
+
+on:
+  workflow_dispatch:  # Manual-only; trigger from develop or main
+
+jobs:
+  proof_report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Generate Proof Report
+        id: proof_report
+        continue-on-error: true
+        run: zig build proof-report -- zig-out/proof/proof-report.json zig-out/proof/proof-report.md
+
+      - name: Upload Proof Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-harness-report
+          path: |
+            zig-out/proof/proof-report.json
+            zig-out/proof/proof-report.md
+
+      - name: Fail On Accuracy Regressions
+        if: steps.proof_report.outcome == 'failure'
+        run: exit 1

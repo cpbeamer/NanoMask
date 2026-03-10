@@ -1,0 +1,228 @@
+{{- if and .Values.adminApi.enabled (not .Values.adminApi.token) }}
+{{- fail "Set adminApi.token when adminApi.enabled is true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nanomask.fullname" . }}
+  labels:
+    {{- include "nanomask.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nanomask.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nanomask.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Force a rollout when the entity ConfigMap changes.
+        {{- if .Values.entities.data }}
+        checksum/entities: {{ .Values.entities.data | sha256sum }}
+        {{- end }}
+        {{- if .Values.schema.data }}
+        checksum/schema: {{ printf "%s:%s" .Values.schema.fileName .Values.schema.data | sha256sum }}
+        {{- end }}
+        {{- if or .Values.hashing.key .Values.hashing.fileData }}
+        checksum/hashing: {{ printf "%s:%s:%s" .Values.hashing.fileName .Values.hashing.key .Values.hashing.fileData | sha256sum }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: nanomask
+          image: {{ include "nanomask.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.proxy.listenPort }}
+              protocol: TCP
+          env:
+            - name: NANOMASK_LISTEN_HOST
+              value: {{ .Values.proxy.listenHost | quote }}
+            - name: NANOMASK_LISTEN_PORT
+              value: {{ .Values.proxy.listenPort | quote }}
+            - name: NANOMASK_TARGET_HOST
+              value: {{ .Values.proxy.targetHost | quote }}
+            - name: NANOMASK_TARGET_PORT
+              value: {{ .Values.proxy.targetPort | quote }}
+            - name: NANOMASK_FUZZY_THRESHOLD
+              value: {{ .Values.proxy.fuzzyThreshold | quote }}
+            - name: NANOMASK_MAX_CONNECTIONS
+              value: {{ .Values.proxy.maxConnections | quote }}
+            - name: NANOMASK_LOG_LEVEL
+              value: {{ .Values.proxy.logLevel | quote }}
+            - name: NANOMASK_MAX_BODY_SIZE
+              value: {{ .Values.proxy.maxBodySize | quote }}
+            - name: NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR
+              value: {{ .Values.proxy.unsupportedRequestBodyBehavior | quote }}
+            - name: NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR
+              value: {{ .Values.proxy.unsupportedResponseBodyBehavior | quote }}
+            - name: NANOMASK_UPSTREAM_CONNECT_TIMEOUT_MS
+              value: {{ .Values.proxy.upstreamConnectTimeoutMs | quote }}
+            - name: NANOMASK_UPSTREAM_READ_TIMEOUT_MS
+              value: {{ .Values.proxy.upstreamReadTimeoutMs | quote }}
+            - name: NANOMASK_UPSTREAM_REQUEST_TIMEOUT_MS
+              value: {{ .Values.proxy.upstreamRequestTimeoutMs | quote }}
+            - name: NANOMASK_SHUTDOWN_DRAIN_TIMEOUT_MS
+              value: {{ .Values.proxy.shutdownDrainTimeoutMs | quote }}
+            - name: NANOMASK_ENABLE_EMAIL
+              value: {{ .Values.features.email | quote }}
+            - name: NANOMASK_ENABLE_PHONE
+              value: {{ .Values.features.phone | quote }}
+            - name: NANOMASK_ENABLE_CREDIT_CARD
+              value: {{ .Values.features.creditCard | quote }}
+            - name: NANOMASK_ENABLE_IP
+              value: {{ .Values.features.ipAddress | quote }}
+            - name: NANOMASK_ENABLE_HEALTHCARE
+              value: {{ .Values.features.healthcarePatterns | quote }}
+            {{- if .Values.proxy.targetTls }}
+            - name: NANOMASK_TARGET_TLS
+              value: "true"
+            {{- end }}
+            {{- if .Values.proxy.tlsNoSystemCa }}
+            - name: NANOMASK_TLS_NO_SYSTEM_CA
+              value: "true"
+            {{- end }}
+            {{- if .Values.proxy.auditLog }}
+            - name: NANOMASK_AUDIT_LOG
+              value: "true"
+            {{- end }}
+            {{- if .Values.adminApi.enabled }}
+            - name: NANOMASK_ADMIN_API
+              value: "true"
+            - name: NANOMASK_ADMIN_MUTATION_RATE_LIMIT
+              value: {{ .Values.adminApi.mutationRateLimitPerMinute | quote }}
+            {{- end }}
+            {{- if .Values.adminApi.token }}
+            - name: NANOMASK_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nanomask.fullname" . }}-admin
+                  key: token
+            {{- end }}
+            {{- if .Values.adminApi.listenAddress }}
+            - name: NANOMASK_ADMIN_LISTEN_ADDRESS
+              value: {{ .Values.adminApi.listenAddress | quote }}
+            {{- end }}
+            {{- if .Values.adminApi.allowlist }}
+            - name: NANOMASK_ADMIN_ALLOWLIST
+              value: {{ .Values.adminApi.allowlist | quote }}
+            {{- end }}
+            {{- if .Values.adminApi.readOnly }}
+            - name: NANOMASK_ADMIN_READ_ONLY
+              value: "true"
+            {{- end }}
+            {{- if .Values.entities.data }}
+            - name: NANOMASK_ENTITY_FILE
+              value: /etc/nanomask/entities/entities.txt
+            - name: NANOMASK_WATCH_INTERVAL
+              value: {{ .Values.entities.watchIntervalMs | quote }}
+            {{- end }}
+            {{- if .Values.schema.data }}
+            - name: NANOMASK_SCHEMA_FILE
+              value: /etc/nanomask/schema/{{ .Values.schema.fileName }}
+            - name: NANOMASK_SCHEMA_DEFAULT
+              value: {{ .Values.schema.defaultAction | quote }}
+            {{- end }}
+            {{- if .Values.hashing.key }}
+            - name: NANOMASK_HASH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nanomask.fullname" . }}-hashing
+                  key: hash-key
+            {{- end }}
+            {{- if .Values.hashing.fileData }}
+            - name: NANOMASK_HASH_KEY_FILE
+              value: /etc/nanomask/hash/{{ .Values.hashing.fileName }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: NANOMASK_TLS_CERT
+              value: /etc/nanomask/tls/tls.crt
+            - name: NANOMASK_TLS_KEY
+              value: /etc/nanomask/tls/tls.key
+            {{- end }}
+            {{- if .Values.tls.caData }}
+            - name: NANOMASK_CA_FILE
+              value: /etc/nanomask/tls/ca.crt
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.entities.data }}
+            - name: entities
+              mountPath: /etc/nanomask/entities
+              readOnly: true
+            {{- end }}
+            {{- if .Values.schema.data }}
+            - name: schema
+              mountPath: /etc/nanomask/schema
+              readOnly: true
+            {{- end }}
+            {{- if .Values.hashing.fileData }}
+            - name: hash
+              mountPath: /etc/nanomask/hash
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls-certs
+              mountPath: /etc/nanomask/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.entities.data }}
+        - name: entities
+          configMap:
+            name: {{ include "nanomask.fullname" . }}-entities
+        {{- end }}
+        {{- if .Values.schema.data }}
+        - name: schema
+          configMap:
+            name: {{ include "nanomask.fullname" . }}-schema
+        {{- end }}
+        {{- if .Values.hashing.fileData }}
+        - name: hash
+          secret:
+            secretName: {{ include "nanomask.fullname" . }}-hashing
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls-certs
+          secret:
+            secretName: {{ include "nanomask.fullname" . }}-tls
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

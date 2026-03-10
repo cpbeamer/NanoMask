@@ -1,0 +1,13 @@
+# Intake and registration payloads with a free-text notes field.
+schema.name = patient_demographics
+schema.version = 2026-03-09
+schema.default = KEEP
+patient.full_name = REDACT
+patient.date_of_birth = REDACT
+patient.medical_record_number = REDACT
+patient.phone = REDACT
+patient.email = REDACT
+patient.address.line1 = REDACT
+patient.address.postal_code = REDACT
+patient.subscriber_id = HASH
+notes = SCAN

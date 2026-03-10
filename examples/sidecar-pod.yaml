@@ -1,0 +1,142 @@
+# Example: NanoMask as a sidecar proxy
+#
+# The application container sends requests to localhost:8081 (NanoMask).
+# NanoMask scrubs PII and forwards to the real upstream API.
+# Both containers share the same network namespace (default in K8s pods).
+#
+# Usage:
+#   kubectl apply -f examples/sidecar-pod.yaml
+# For healthcare-focused starter assets, see starters/healthcare/deployments/.
+#
+# NanoMask performs inline redaction for JSON and text payloads.
+# Common binary formats such as PDF, image/*, audio/*, video/*, and octet-stream bodies are bypassed unchanged.
+# It does not perform OCR or PDF/image parsing itself; feed OCR-derived text or JSON into the proxy.
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-nanomask
+  labels:
+    app: app-with-nanomask
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    # ── Your application container ──────────────────────────────────────
+    - name: app
+      image: curlimages/curl:latest
+      # Example: continuously send a request through NanoMask every 10s.
+      command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            echo "Sending request through NanoMask sidecar..."
+            curl -s -X POST http://localhost:8081/post \
+              -H "X-ZPG-Entities: Jane Smith" \
+              -H "Content-Type: application/json" \
+              -d '{"patient": "Jane Smith", "patient_email": "jane.smith@example.com", "patient_phone": "202-555-0147", "patient_id": "A1234567", "notes": "SSN 123-45-6789, card 4111-1111-1111-1111, source 203.0.113.7, MRN MRN123456"}'
+            echo ""
+            sleep 10
+          done
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+    # ── NanoMask sidecar ────────────────────────────────────────────────
+    - name: nanomask
+      image: nanomask:0.1.0
+      # Default payload policy: reject unsupported request bodies, bypass unsupported upstream responses.
+      env:
+        - name: NANOMASK_LISTEN_HOST
+          value: "127.0.0.1"
+        - name: NANOMASK_LISTEN_PORT
+          value: "8081"
+        - name: NANOMASK_TARGET_HOST
+          value: httpbin.org
+        - name: NANOMASK_TARGET_PORT
+          value: "80"
+        - name: NANOMASK_UNSUPPORTED_REQUEST_BODY_BEHAVIOR
+          value: "reject"
+        - name: NANOMASK_UNSUPPORTED_RESPONSE_BODY_BEHAVIOR
+          value: "bypass"
+        - name: NANOMASK_LOG_LEVEL
+          value: info
+        - name: NANOMASK_AUDIT_LOG
+          value: "true"
+        - name: NANOMASK_ENABLE_EMAIL
+          value: "true"
+        - name: NANOMASK_ENABLE_PHONE
+          value: "true"
+        - name: NANOMASK_ENABLE_CREDIT_CARD
+          value: "true"
+        - name: NANOMASK_ENABLE_IP
+          value: "true"
+        - name: NANOMASK_ENABLE_HEALTHCARE
+          value: "true"
+        - name: NANOMASK_SCHEMA_FILE
+          value: /etc/nanomask/schema/schema.nmschema
+        - name: NANOMASK_SCHEMA_DEFAULT
+          value: KEEP
+        # ⚠️ EXAMPLE ONLY — never use this key in production.
+        # In production, prefer a mounted Secret or external secret manager.
+        - name: NANOMASK_HASH_KEY
+          value: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      ports:
+        - containerPort: 8081
+          protocol: TCP
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8081
+        initialDelaySeconds: 5
+        periodSeconds: 15
+        timeoutSeconds: 3
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 8081
+        initialDelaySeconds: 2
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 2
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: schema
+          mountPath: /etc/nanomask/schema
+          readOnly: true
+  volumes:
+    - name: schema
+      configMap:
+        name: nanomask-sidecar-schema
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nanomask-sidecar-schema
+data:
+  schema.nmschema: |
+    schema.name = sidecar_example
+    schema.version = 2026-03-09
+    schema.default = KEEP
+    patient = KEEP
+    patient_email = REDACT
+    patient_phone = REDACT
+    patient_id = HASH
+    notes = SCAN

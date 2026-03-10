@@ -1,0 +1,40 @@
+{
+  "suite": "email",
+  "label": "Email Redaction",
+  "description": "Anonymized email-like inputs measuring detector recall on valid addresses and precision on nearby clean text.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "simple_email",
+      "label": "Simple hospital email",
+      "kind": "positive",
+      "input": "Contact jane.smith@hospital.org for scheduling.",
+      "expected": "Contact [EMAIL_REDACTED] for scheduling."
+    },
+    {
+      "id": "mixed_case_domain",
+      "label": "Mixed-case address",
+      "kind": "positive",
+      "input": "Escalate to QA.Team@ExampleHealth.com for review.",
+      "expected": "Escalate to [EMAIL_REDACTED] for review."
+    },
+    {
+      "id": "missing_tld",
+      "label": "Missing top-level domain is ignored",
+      "kind": "negative",
+      "input": "Draft alias jane.smith@hospital should remain visible.",
+      "expected": "Draft alias jane.smith@hospital should remain visible."
+    },
+    {
+      "id": "plain_sentence",
+      "label": "Sentence without email remains unchanged",
+      "kind": "negative",
+      "input": "Routing note for the care team remains unchanged.",
+      "expected": "Routing note for the care team remains unchanged."
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+# Healthcare encounter-note sidecar example.
+#
+# Create the mounted assets before applying this Pod:
+#   kubectl create configmap nanomask-healthcare-encounter --from-file=starters/healthcare/schemas/encounter-notes.nmschema --from-file=starters/healthcare/entities/encounter-notes.txt --from-file=starters/healthcare/payloads/encounter-note.json
+#   kubectl create secret generic nanomask-healthcare-hash --from-file=hash-key.txt=starters/healthcare/hash-key.example.txt
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: encounter-app-with-nanomask
+  labels:
+    app: encounter-app-with-nanomask
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+  containers:
+    - name: encounter-app
+      image: curlimages/curl:latest
+      command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            curl -s -X POST http://localhost:8081/v1/encounters \
+              -H "Content-Type: application/json" \
+              --data-binary @/starter/encounter-note.json
+            echo
+            sleep 15
+          done
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: starter
+          mountPath: /starter
+          readOnly: true
+    - name: nanomask
+      image: nanomask:0.1.0
+      env:
+        - name: NANOMASK_LISTEN_HOST
+          value: "127.0.0.1"
+        - name: NANOMASK_LISTEN_PORT
+          value: "8081"
+        - name: NANOMASK_TARGET_HOST
+          value: encounter-upstream.internal
+        - name: NANOMASK_TARGET_PORT
+          value: "443"
+        - name: NANOMASK_TARGET_TLS
+          value: "true"
+        - name: NANOMASK_ENTITY_FILE
+          value: /etc/nanomask/starter/encounter-notes.txt
+        - name: NANOMASK_SCHEMA_FILE
+          value: /etc/nanomask/starter/encounter-notes.nmschema
+        - name: NANOMASK_SCHEMA_DEFAULT
+          value: KEEP
+        - name: NANOMASK_HASH_KEY_FILE
+          value: /etc/nanomask/hash/hash-key.txt
+        - name: NANOMASK_FUZZY_THRESHOLD
+          value: "0.85"
+        - name: NANOMASK_ENABLE_EMAIL
+          value: "true"
+        - name: NANOMASK_ENABLE_PHONE
+          value: "true"
+        - name: NANOMASK_ENABLE_HEALTHCARE
+          value: "true"
+        - name: NANOMASK_AUDIT_LOG
+          value: "true"
+      ports:
+        - containerPort: 8081
+          protocol: TCP
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 8081
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8081
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: starter
+          mountPath: /etc/nanomask/starter
+          readOnly: true
+        - name: hash
+          mountPath: /etc/nanomask/hash
+          readOnly: true
+  volumes:
+    - name: starter
+      configMap:
+        name: nanomask-healthcare-encounter
+    - name: hash
+      secret:
+        secretName: nanomask-healthcare-hash

@@ -1,0 +1,48 @@
+{
+  "suite": "entity_fuzzy",
+  "label": "Fuzzy Entity Matching",
+  "description": "OCR-style and format-variant names used to score fuzzy matching behavior against benign text.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "ocr_full_name",
+      "label": "OCR substitution in full name",
+      "kind": "positive",
+      "entities": ["John Doe"],
+      "fuzzy_threshold": 0.8,
+      "input": "Patient J0hn Doe was seen today.",
+      "expected": "Patient Entity_A was seen today."
+    },
+    {
+      "id": "middle_initial_variant",
+      "label": "Middle initial insertion",
+      "kind": "positive",
+      "entities": ["John Doe"],
+      "fuzzy_threshold": 0.75,
+      "input": "Patient John E Doe was seen today.",
+      "expected": "Patient Entity_A was seen today."
+    },
+    {
+      "id": "last_name_only",
+      "label": "Last-name-only mention",
+      "kind": "positive",
+      "entities": ["John Doe"],
+      "fuzzy_threshold": 0.8,
+      "input": "Mr. Doe was discharged this morning.",
+      "expected": "Mr. Entity_A was discharged this morning."
+    },
+    {
+      "id": "benign_text",
+      "label": "Unrelated sentence remains unchanged",
+      "kind": "negative",
+      "entities": ["John Doe"],
+      "fuzzy_threshold": 0.8,
+      "input": "The weather is nice today and the clinic is quiet.",
+      "expected": "The weather is nice today and the clinic is quiet."
+    }
+  ]
+}

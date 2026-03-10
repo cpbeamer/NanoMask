@@ -1,0 +1,55 @@
+{
+  "suite": "schema",
+  "label": "Schema-Driven JSON Redaction",
+  "description": "Structured JSON payloads covering REDACT, SCAN, and HASH actions with synthetic healthcare-oriented content.",
+  "thresholds": {
+    "precision_min": 1.0,
+    "recall_min": 1.0,
+    "false_positive_rate_max": 0.0
+  },
+  "cases": [
+    {
+      "id": "redact_and_keep",
+      "label": "Flat REDACT and KEEP fields",
+      "kind": "positive",
+      "schema": "patient_name = REDACT\nvisit_date = KEEP\nschema.default = KEEP",
+      "input": "{\"patient_name\":\"Jane Smith\",\"visit_date\":\"2026-03-08\"}",
+      "expected": "{\"patient_name\":\"[REDACTED]\",\"visit_date\":\"2026-03-08\"}"
+    },
+    {
+      "id": "scan_healthcare_note",
+      "label": "SCAN field with SSN and healthcare identifiers",
+      "kind": "positive",
+      "schema": "schema.default = KEEP\nnotes = SCAN",
+      "input": "{\"notes\":\"Patient SSN 123-45-6789 with MRN: 7654321 and diagnosis E11.65\",\"status\":\"queued\"}",
+      "enable_healthcare": true,
+      "expected": "{\"notes\":\"Patient SSN ***-**-**** with MRN: [MRN_REDACTED] and diagnosis [ICD10_REDACTED]\",\"status\":\"queued\"}"
+    },
+    {
+      "id": "hash_and_scan",
+      "label": "HASH plus SCAN in one payload",
+      "kind": "positive",
+      "schema": "schema.default = KEEP\npatient_name = REDACT\ninternal_id = HASH\nnotes = SCAN",
+      "hash_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "input": "{\"patient_name\":\"John Doe\",\"internal_id\":\"PT-99001\",\"notes\":\"SSN 123-45-6789 appears here\"}",
+      "must_contain": [
+        "\"patient_name\":\"[REDACTED]\"",
+        "\"internal_id\":\"PSEUDO_",
+        "\"notes\":\"SSN ***-**-**** appears here\""
+      ],
+      "must_not_contain": [
+        "John Doe",
+        "PT-99001",
+        "123-45-6789"
+      ]
+    },
+    {
+      "id": "keep_only",
+      "label": "KEEP-only payload remains unchanged",
+      "kind": "negative",
+      "schema": "schema.default = KEEP",
+      "input": "{\"status\":\"ok\",\"message\":\"No PHI here\"}",
+      "expected": "{\"status\":\"ok\",\"message\":\"No PHI here\"}"
+    }
+  ]
+}

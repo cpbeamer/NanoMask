@@ -1,0 +1,15 @@
+.git
+.github
+.zig-cache
+zig-cache
+zig-out
+architecture.md
+backlog.md
+backlog_v2.md
+business_plan.md
+phase1_backlog.md
+*.pdb
+*.obj
+*.o
+*.exe
+LICENSE

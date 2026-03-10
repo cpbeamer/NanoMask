@@ -1,0 +1,14 @@
+{
+  "claim": {
+    "claim_id": "CLM-20402",
+    "member_name": "Marisol Vega",
+    "member_id": "MBR-887766",
+    "date_of_birth": "1976-11-02",
+    "payer": {
+      "name": "Northwind Health",
+      "policy_number": "POL99887766"
+    },
+    "service_note": "Marisol Vega called from 203.0.113.10 about MRN: 8899001 and diagnosis Z87.891. Member ID: AB12345678 verified.",
+    "facility": "Riverside Clinic"
+  }
+}

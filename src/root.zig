@@ -1,23 +1,84 @@
 //! By convention, root.zig is the root source file when making a library.
-const std = @import("std");
+//! Re-exports the core NanoMask modules for consumers.
+pub const redact = @import("redaction/redact.zig");
+pub const entity_mask = @import("redaction/entity_mask.zig");
+pub const fuzzy_match = @import("redaction/fuzzy_match.zig");
+pub const versioned_entity_set = @import("entity/versioned_entity_set.zig");
+pub const config = @import("infra/config.zig");
+pub const file_watcher = @import("entity/file_watcher.zig");
+pub const admin = @import("admin/admin.zig");
+pub const tls_server = @import("crypto/tls.zig");
+pub const logger = @import("infra/logger.zig");
+pub const observability = @import("infra/observability.zig");
+pub const shutdown = @import("infra/shutdown.zig");
+pub const redaction_audit = @import("infra/redaction_audit.zig");
+pub const body_policy = @import("net/body_policy.zig");
+pub const runtime_model = @import("net/runtime_model.zig");
+pub const upstream_client = @import("net/upstream_client.zig");
+pub const proxy_server = @import("net/proxy_server.zig");
 
-pub fn bufferedPrint() !void {
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
+// Pattern library (Phase 5 / Epic 7)
+pub const email = @import("patterns/email.zig");
+pub const phone = @import("patterns/phone.zig");
+pub const credit_card = @import("patterns/credit_card.zig");
+pub const ip_address = @import("patterns/ip_address.zig");
+pub const healthcare = @import("patterns/healthcare.zig");
+pub const pattern_scanner = @import("patterns/scanner.zig");
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+// Schema-aware redaction (Phase 5 / Epic 8)
+pub const schema = @import("schema/schema.zig");
+pub const json_redactor = @import("schema/json_redactor.zig");
+pub const hasher = @import("schema/hasher.zig");
 
-    try stdout.flush(); // Don't forget to flush!
-}
+// E2E integration testing (Phase 5 / Epic 9) — test-only, not exposed in production builds
+pub const mock_upstream = if (@import("builtin").is_test) @import("test/mock_upstream.zig") else @compileError("test-only");
+pub const e2e_harness = if (@import("builtin").is_test) @import("test/e2e_harness.zig") else @compileError("test-only");
+pub const compliance_suite = if (@import("builtin").is_test) @import("test/compliance_suite.zig") else @compileError("test-only");
+pub const compatibility_matrix = if (@import("builtin").is_test) @import("test/compatibility_matrix.zig") else @compileError("test-only");
+const healthcare_starter_pack = if (@import("builtin").is_test) @import("test/healthcare_starter_pack.zig") else @compileError("test-only");
+const integration_kits = if (@import("builtin").is_test) @import("test/integration_kits.zig") else @compileError("test-only");
+const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig") else @compileError("test-only");
+const runtime_bench_harness = if (@import("builtin").is_test) @import("test/runtime_bench_harness.zig") else @compileError("test-only");
+const bench_util = if (@import("builtin").is_test) @import("test/bench_util.zig") else @compileError("test-only");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test {
+    // Ensure all tests in re-exported modules are discovered by `zig build test`.
+    _ = redact;
+    _ = entity_mask;
+    _ = fuzzy_match;
+    _ = versioned_entity_set;
+    _ = config;
+    _ = file_watcher;
+    _ = admin;
+    _ = tls_server;
+    _ = logger;
+    _ = observability;
+    _ = shutdown;
+    _ = body_policy;
+    _ = runtime_model;
+    _ = redaction_audit;
+    _ = upstream_client;
+    _ = proxy_server;
+    _ = @import("net/http_util.zig");
+    // Pattern library
+    _ = email;
+    _ = phone;
+    _ = credit_card;
+    _ = ip_address;
+    _ = healthcare;
+    _ = pattern_scanner;
+    // Schema-aware redaction
+    _ = schema;
+    _ = json_redactor;
+    _ = hasher;
+    // E2E integration tests
+    _ = mock_upstream;
+    _ = e2e_harness;
+    _ = compliance_suite;
+    _ = compatibility_matrix;
+    _ = healthcare_starter_pack;
+    _ = integration_kits;
+    _ = proof_harness;
+    _ = runtime_bench_harness;
+    _ = bench_util;
 }
