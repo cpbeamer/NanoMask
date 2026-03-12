@@ -834,6 +834,63 @@ pub fn writeJson(writer: anytype, results: []const FlowResult) !void {
     try writer.writeAll("]}");
 }
 
+pub fn writeMarkdown(writer: anytype, results: []const FlowResult) !void {
+    var passed: usize = 0;
+    var failed: usize = 0;
+    for (results) |result| {
+        switch (result.status) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
+    try writer.writeAll("# NanoMask Compatibility Matrix\n\n");
+
+    const icon = if (failed == 0) "✅" else "❌";
+    try writer.print("{s} **{d}/{d}** flows passing\n\n", .{ icon, passed, passed + failed });
+
+    try writer.writeAll("| Flow | Vendor | Headers (Req) | Body | Headers (Resp) | Streaming | Path/Query | Latency | Status |\n");
+    try writer.writeAll("|------|--------|:---:|:---:|:---:|:---:|:---:|---:|:---:|\n");
+
+    for (results) |result| {
+        try writer.print("| {s} | {s} | {s} | {s} | {s} | {s} | {s} | ", .{
+            result.label,
+            result.vendor,
+            checkStatusIcon(result.checks.request_header_fidelity),
+            checkStatusIcon(result.checks.body_mutation),
+            checkStatusIcon(result.checks.response_header_fidelity),
+            checkStatusIcon(result.checks.streaming),
+            checkStatusIcon(result.checks.path_query_fidelity),
+        });
+        if (result.checks.first_token_latency_ms) |latency| {
+            try writer.print("{d} ms", .{latency});
+        } else {
+            try writer.writeAll("—");
+        }
+        try writer.print(" | {s} |\n", .{if (result.status == .pass) "✅" else "❌"});
+    }
+
+    if (failed > 0) {
+        try writer.writeAll("\n## Failures\n\n");
+        for (results) |result| {
+            if (result.status == .fail) {
+                try writer.print("- **{s}**: {s}\n", .{
+                    result.label,
+                    result.failure_reason orelse "unknown",
+                });
+            }
+        }
+    }
+}
+
+fn checkStatusIcon(status: CheckStatus) []const u8 {
+    return switch (status) {
+        .pass => "✅",
+        .fail => "❌",
+        .not_applicable => "➖",
+    };
+}
+
 test "compatibility matrix - OpenAI-compatible JSON flow" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;

@@ -2,6 +2,10 @@
   <h1 align="center">🛡️ NanoMask</h1>
   <p align="center"><strong>Wire-speed PII/PHI redaction proxy — pure Zig, zero dependencies</strong></p>
   <p align="center">
+    <a href="https://github.com/cpbeamer/NanoMask/actions/workflows/zig-ci.yml"><img src="https://github.com/cpbeamer/NanoMask/actions/workflows/zig-ci.yml/badge.svg" alt="Zig CI"></a>
+    <a href="https://github.com/cpbeamer/NanoMask/actions/workflows/compatibility.yml"><img src="https://github.com/cpbeamer/NanoMask/actions/workflows/compatibility.yml/badge.svg" alt="Compatibility"></a>
+  </p>
+  <p align="center">
     <a href="#benchmarks">16+ GB/s SSN redaction</a> · <a href="#algorithms">3-stage privacy pipeline</a> · <a href="#quick-start">Single binary deploy</a>
   </p>
 </p>
@@ -350,6 +354,27 @@ Client ◄──── Response with real names restored
 **Threading model**: Thread-per-connection with atomic connection counter (default cap: 128). All handler threads share a single `std.http.Client` with a thread-safe, built-in connection pool (keep-alive, default 32 upstream connections).
 
 See [`architecture.md`](architecture.md) for the full technical design and [`backlog.md`](backlog.md) for planned improvements.
+
+## TLS & Production Deployment
+
+**Recommended**: Terminate listener-side TLS at a hardened ingress tier (NGINX Ingress, Envoy, AWS ALB, Traefik) and run NanoMask as plaintext HTTP behind it. This provides full cipher suite coverage, automated cert management, OCSP/CRL, and a security posture buyers recognize.
+
+**Alternative**: NanoMask includes a built-in TLS 1.3 server for dev, testing, edge, and air-gapped environments. Enable via `--tls-cert` and `--tls-key`.
+
+```bash
+# Minimal TLS Ingress + NanoMask (Kubernetes)
+# 1. NanoMask runs HTTP on :8081 behind a ClusterIP Service
+# 2. Ingress terminates TLS and forwards to the Service
+# See examples/standalone-deployment.yaml for the full manifest
+```
+
+| Topology | Listener TLS | How |
+|---|---|---|
+| **Gateway** (shared) | Ingress tier | `Ingress (TLS) → Service → NanoMask (HTTP) → Upstream (TLS)` |
+| **Sidecar** (per-pod) | Not needed | `Pod [ App → localhost:8081 → NanoMask ] → Upstream (TLS)` |
+| **Edge / Air-gapped** | Built-in TLS 1.3 | `--tls-cert cert.pem --tls-key key.pem` |
+
+For the full strategy, decision matrix, cipher details, and known limitations see [`docs/tls_strategy.md`](docs/tls_strategy.md).
 
 ## Project Structure
 

@@ -40,6 +40,7 @@ const integration_kits = if (@import("builtin").is_test) @import("test/integrati
 const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig") else @compileError("test-only");
 const runtime_bench_harness = if (@import("builtin").is_test) @import("test/runtime_bench_harness.zig") else @compileError("test-only");
 const bench_util = if (@import("builtin").is_test) @import("test/bench_util.zig") else @compileError("test-only");
+const tls_smoke_test = if (@import("builtin").is_test) @import("test/tls_smoke_test.zig") else @compileError("test-only");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -81,4 +82,5 @@ test {
     _ = proof_harness;
     _ = runtime_bench_harness;
     _ = bench_util;
+    _ = tls_smoke_test;
 }
