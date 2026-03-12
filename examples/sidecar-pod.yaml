@@ -4,6 +4,12 @@
 # NanoMask scrubs PII and forwards to the real upstream API.
 # Both containers share the same network namespace (default in K8s pods).
 #
+# TLS Architecture:
+#   Sidecar mode uses pod-internal localhost traffic, so listener-side TLS
+#   is unnecessary — traffic never leaves the pod network namespace.
+#   Terminate TLS at the cluster Ingress tier (NGINX, Envoy, ALB) instead.
+#   See docs/tls_strategy.md for the full production TLS strategy.
+#
 # Usage:
 #   kubectl apply -f examples/sidecar-pod.yaml
 # For healthcare-focused starter assets, see starters/healthcare/deployments/.

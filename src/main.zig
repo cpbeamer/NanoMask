@@ -299,6 +299,36 @@ pub fn main() !void {
         log.warn("no_tls_warning", null);
     }
 
+    // --- TLS posture summary ---
+    // Emit a structured log summarizing the listener and upstream TLS
+    // configuration so operators can verify the deployment matches their
+    // intended security posture at a glance.
+    const listener_cipher = if (tls_enabled) "TLS_AES_128_GCM_SHA256" else "none";
+    const listener_cert = if (cfg.tls_cert) |cert| cert else "none";
+    const upstream_ca_source: []const u8 = if (cfg.ca_file != null and cfg.tls_no_system_ca)
+        "custom_only"
+    else if (cfg.ca_file != null)
+        "custom"
+    else if (cfg.tls_no_system_ca)
+        "none"
+    else
+        "system";
+    log.log(.info, "tls_posture", null, &.{
+        .{ .key = "listener_tls", .value = .{ .boolean = tls_enabled } },
+        .{ .key = "listener_cipher", .value = .{ .string = listener_cipher } },
+        .{ .key = "listener_cert", .value = .{ .string = listener_cert } },
+        .{ .key = "upstream_tls", .value = .{ .boolean = cfg.target_tls } },
+        .{ .key = "upstream_ca_source", .value = .{ .string = upstream_ca_source } },
+    });
+    // Hint: built-in TLS works but a hardened ingress tier is recommended
+    // for production deployments (see docs/tls_strategy.md).
+    if (tls_enabled) {
+        log.log(.info, "production_tls_hint", null, &.{
+            .{ .key = "recommendation", .value = .{ .string = "use a hardened ingress tier (NGINX, Envoy, ALB) for production TLS termination" } },
+            .{ .key = "docs", .value = .{ .string = "docs/tls_strategy.md" } },
+        });
+    }
+
     // --- Upstream TLS status ---
     if (cfg.target_tls) {
         if (cfg.ca_file) |ca| {

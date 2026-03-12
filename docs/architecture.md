@@ -104,9 +104,26 @@ The proxy applies redaction rules in sequence on the request path:
 On the response path:
 1.  **Entity Unmasking** (aliases → names) — Aho-Corasick reverse scan
 
-## 6. State Management
+## 6. TLS Architecture
+
+NanoMask supports TLS on both the **listener** (client → NanoMask) and **upstream** (NanoMask → API) legs.
+
+### Recommended Production Architecture
+
+Terminate listener-side TLS at a **hardened ingress tier** (NGINX Ingress, Envoy, AWS ALB, Traefik) and run NanoMask as a plaintext HTTP service behind it. This provides full cipher suite coverage, automated certificate management via cert-manager, OCSP/CRL support, and a security posture that buyers recognize without additional review.
+
+### Supported Alternative
+
+NanoMask includes a built-in TLS 1.3 server (`src/crypto/tls.zig`) for development, testing, edge, and air-gapped environments. It implements X25519 key exchange, AES-128-GCM-SHA256, and ECDSA P-256 / Ed25519 signing. Enable via `--tls-cert` and `--tls-key`.
+
+### Upstream TLS
+
+Upstream TLS uses `std.http.Client` with system or custom CA bundles (`--target-tls`, `--ca-file`, `--tls-no-system-ca`). This leg operates independently of the listener TLS strategy.
+
+For the full strategy document, decision matrix, and deployment topology diagrams, see [docs/tls_strategy.md](tls_strategy.md).
+
+## 7. State Management
 
 Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers and HTTP server instance. A single `std.http.Client` is shared across all handler threads; its built-in `ConnectionPool` is thread-safe (uses `std.Thread.Mutex`) and reuses TCP connections with keep-alive (default 32 pooled connections). This eliminates per-request TCP handshake overhead. An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context; both are optional, enabling SSN-only proxy mode without entity masking.
 
 **Phase 3 Scalability**: The current thread-per-connection model is a deliberate simplicity trade-off. An `io_uring`/IOCP-based event loop via `std.Io` would be the natural evolution for 10K+ concurrent connection workloads.
-
