@@ -1,0 +1,16 @@
+#!/bin/sh
+# Pre-push hook: auto-format Zig source files before pushing.
+# If zig fmt produces changes, they are staged and the top commit is
+# amended so the pushed code always passes CI's `zig fmt --check`.
+
+# Run zig fmt on all tracked .zig files
+zig fmt src/ build.zig 2>/dev/null
+
+# Check if formatting produced any unstaged changes
+if ! git diff --quiet -- '*.zig'; then
+    echo "[pre-push] zig fmt produced changes — amending commit..."
+    git add -u -- '*.zig'
+    git commit --amend --no-edit --no-verify
+fi
+
+exit 0
