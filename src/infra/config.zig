@@ -126,6 +126,10 @@ pub const Config = struct {
     /// Wildcard binds probe loopback so container HEALTHCHECK still works.
     healthcheck: bool = false,
 
+    /// When true, validate all configuration (files, flags, consistency)
+    /// and print a summary without starting the server.
+    validate_config: bool = false,
+
     allocator: std.mem.Allocator,
 
     pub const ParseError = error{
@@ -250,6 +254,7 @@ pub const Config = struct {
         \\  --admin-mutation-rate-limit <n>     Maximum entity mutations per minute (0 disables, default: 60)
         \\  --entity-file-sync                  Write API entity changes back to entity file
         \\  --healthcheck                       Probe /healthz on the local listener and exit
+        \\  --validate-config                   Validate configuration and print summary without starting the server
         \\  --help                              Print this help message and exit
         \\
         \\Optional detection features:
@@ -1090,6 +1095,8 @@ pub const Config = struct {
                 }
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
+            } else if (std.mem.eql(u8, arg, "--validate-config")) {
+                config.validate_config = true;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -1922,4 +1929,50 @@ test "Config - unsupported body behavior invalid value" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidUnsupportedBodyBehavior, res);
+}
+
+test "Config - validate-config flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--validate-config",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.validate_config);
+}
+
+test "Config - validate-config combined with other flags" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--listen-host",
+        "0.0.0.0",
+        "--target-host",
+        "api.openai.com",
+        "--target-port",
+        "443",
+        "--target-tls",
+        "--enable-email",
+        "--validate-config",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.validate_config);
+    try testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
+    try testing.expectEqualStrings("api.openai.com", cfg.target_host);
+    try testing.expectEqual(@as(u16, 443), cfg.target_port);
+    try testing.expect(cfg.target_tls);
+    try testing.expect(cfg.enable_email);
+}
+
+test "Config - validate-config defaults to false" {
+    const args = [_][]const u8{"nanomask"};
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(!cfg.validate_config);
 }

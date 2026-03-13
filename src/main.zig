@@ -89,6 +89,59 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    // --- Validate-config mode ---
+    // When --validate-config is set, print the resolved configuration
+    // summary and exit 0. All file existence, flag pairing, and
+    // consistency checks already ran during Config.parse().
+    if (cfg.validate_config) {
+        std.debug.print(
+            "NanoMask configuration valid.\n" ++
+                "\n" ++
+                "  Network\n" ++
+                "    listen        {s}:{d}\n" ++
+                "    target        {s}:{d}\n" ++
+                "    target_tls    {s}\n" ++
+                "    listener_tls  {s}\n" ++
+                "    max_conns     {d}\n" ++
+                "    runtime       {s}\n" ++
+                "\n" ++
+                "  Redaction\n" ++
+                "    entity_file   {s}\n" ++
+                "    schema_file   {s}\n" ++
+                "    email         {s}\n" ++
+                "    phone         {s}\n" ++
+                "    credit_card   {s}\n" ++
+                "    ip            {s}\n" ++
+                "    healthcare    {s}\n" ++
+                "\n" ++
+                "  Admin\n" ++
+                "    admin_api     {s}\n" ++
+                "    audit_log     {s}\n" ++
+                "    log_level     {s}\n",
+            .{
+                cfg.listen_host,
+                cfg.listen_port,
+                cfg.target_host,
+                cfg.target_port,
+                if (cfg.target_tls) "enabled" else "disabled",
+                if (cfg.tls_cert != null) "enabled" else "disabled",
+                cfg.max_connections,
+                cfg.runtime_model.label(),
+                cfg.entity_file orelse "none",
+                cfg.schema_file orelse "none",
+                if (cfg.enable_email) "enabled" else "disabled",
+                if (cfg.enable_phone) "enabled" else "disabled",
+                if (cfg.enable_credit_card) "enabled" else "disabled",
+                if (cfg.enable_ip) "enabled" else "disabled",
+                if (cfg.enable_healthcare) "enabled" else "disabled",
+                if (cfg.admin_api) "enabled" else "disabled",
+                if (cfg.audit_log) "enabled" else "disabled",
+                @tagName(cfg.log_level),
+            },
+        );
+        std.process.exit(0);
+    }
+
     // --- Structured Logger ---
     var log = Logger.init(cfg.log_level, cfg.audit_log, cfg.log_file) catch |err| {
         std.debug.print("error: failed to initialise logger: {}\n", .{err});

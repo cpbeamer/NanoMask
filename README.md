@@ -30,6 +30,37 @@ NanoMask currently operates on HTTP text and JSON payloads. It does not perform 
 
 ## Quick Start
 
+### Docker (Recommended)
+
+```bash
+# Pull the image
+docker pull ghcr.io/cpbeamer/nanomask:latest
+
+# Run NanoMask (forwards to httpbin.org for demo)
+docker run --rm -p 8081:8081 \
+  ghcr.io/cpbeamer/nanomask:latest \
+  --listen-host 0.0.0.0 --target-host httpbin.org --target-port 80
+
+# In another terminal — send a request with PII:
+curl -s -X POST http://localhost:8081/post \
+  -H "Content-Type: application/json" \
+  -H "X-ZPG-Entities: John Doe, Jane Smith" \
+  -d '{"note": "Patient John Doe SSN 123-45-6789 was referred by Jane Smith"}'
+```
+
+**Expected output** — names replaced with aliases, SSN masked:
+
+```json
+{"note": "Patient Entity_A SSN ***-**-**** was referred by Entity_B"}
+```
+
+Validate your deployment config without starting the server:
+
+```bash
+docker run --rm ghcr.io/cpbeamer/nanomask:latest \
+  --validate-config --target-host api.openai.com --target-port 443 --target-tls
+```
+
 ### Prerequisites
 
 - [Zig 0.15.2](https://ziglang.org/download/) (no other dependencies)
