@@ -561,6 +561,19 @@ metrics:
 
 Health endpoints are logged at `DEBUG` level only to avoid log noise.
 
+## Security
+
+NanoMask ships with a complete security evidence package for enterprise evaluators:
+
+- **[Customer Security Packet](docs/security_packet.md)** — architecture summary, hardening guidance, network boundaries, audit behavior, secrets handling, known limitations
+- **[Threat Model](docs/threat_model.md)** — STRIDE-based analysis covering ingress, egress, admin API, and filesystem boundaries
+- **[Pentest Findings](docs/pentest_findings.md)** — assessment plan, findings tracker, and TLS interoperability results
+- **[TLS Strategy](docs/tls_strategy.md)** — production TLS decision, deployment topologies, and cipher details
+- **[Release Signing](docs/release_signing.md)** — SBOM generation and binary/image signing workflow
+- **[Security Review Checklist](docs/security_review_checklist.md)** — per-release verification checklist
+- **[HIPAA BAA Template](docs/hipaa_baa_template.md)** — draft Business Associate Agreement for healthcare buyers
+- **[FedRAMP Readiness](docs/fedramp_readiness.md)** — NIST SP 800-53 control mapping and gap analysis
+
 ## License
 
 See [LICENSE](LICENSE) for details.

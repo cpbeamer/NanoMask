@@ -170,3 +170,4 @@ NanoMask is a privacy-firewall reverse proxy that intercepts HTTP traffic, scans
 | Date | Author | Change |
 |------|--------|--------|
 | 2026-03-13 | NMV3-004 | Initial STRIDE threat model |
+| 2026-03-13 | NMV3-005 | Added cross-reference to [pentest_findings.md](pentest_findings.md) and [security_packet.md](security_packet.md) |
