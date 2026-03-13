@@ -41,6 +41,11 @@ const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig
 const runtime_bench_harness = if (@import("builtin").is_test) @import("test/runtime_bench_harness.zig") else @compileError("test-only");
 const bench_util = if (@import("builtin").is_test) @import("test/bench_util.zig") else @compileError("test-only");
 const tls_smoke_test = if (@import("builtin").is_test) @import("test/tls_smoke_test.zig") else @compileError("test-only");
+// Security testing (NMV3-004)
+const fuzz_json_parser = if (@import("builtin").is_test) @import("test/fuzz_json_parser.zig") else @compileError("test-only");
+const fuzz_schema_parser = if (@import("builtin").is_test) @import("test/fuzz_schema_parser.zig") else @compileError("test-only");
+const fuzz_redaction = if (@import("builtin").is_test) @import("test/fuzz_redaction.zig") else @compileError("test-only");
+const security_http_tests = if (@import("builtin").is_test) @import("test/security_http_tests.zig") else @compileError("test-only");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -83,4 +88,9 @@ test {
     _ = runtime_bench_harness;
     _ = bench_util;
     _ = tls_smoke_test;
+    // Security tests (NMV3-004)
+    _ = fuzz_json_parser;
+    _ = fuzz_schema_parser;
+    _ = fuzz_redaction;
+    _ = security_http_tests;
 }
