@@ -17,6 +17,32 @@ const std = @import("std");
 // ---------------------------------------------------------------------------
 
 const replacement = "[PHONE_REDACTED]";
+const fax_replacement = "[FAX_REDACTED]";
+
+const fax_keywords = [_][]const u8{ "fax", "facsimile" };
+
+fn hasFaxContext(buf: []const u8, start: usize, end: usize) bool {
+    const window_start = if (start > 15) start - 15 else 0;
+    const window_before = buf[window_start..start];
+    var lower_buf: [30]u8 = undefined;
+    for (window_before, 0..) |col, i| lower_buf[i] = std.ascii.toLower(col);
+    const lower_before = lower_buf[0..window_before.len];
+
+    for (fax_keywords) |kw| {
+        if (std.mem.indexOf(u8, lower_before, kw) != null) return true;
+    }
+
+    const window_end = if (end + 15 < buf.len) end + 15 else buf.len;
+    const window_after = buf[end..window_end];
+    for (window_after, 0..) |col, i| lower_buf[i] = std.ascii.toLower(col);
+    const lower_after = lower_buf[0..window_after.len];
+
+    for (fax_keywords) |kw| {
+        if (std.mem.indexOf(u8, lower_after, kw) != null) return true;
+    }
+
+    return false;
+}
 
 /// Extract a phone candidate starting at `start`.
 /// Collects digits while allowing separators (dash, dot, space, parens).
@@ -118,7 +144,11 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
     if (!isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;
     // Not followed by more digits
     if (candidate.end < buf.len and std.ascii.isDigit(buf[candidate.end])) return null;
-    return .{ .start = candidate.actual_start, .end = candidate.end, .redact_start = candidate.actual_start, .replacement = replacement };
+
+    const is_fax = hasFaxContext(buf, candidate.actual_start, candidate.end);
+    const repl = if (is_fax) fax_replacement else replacement;
+
+    return .{ .start = candidate.actual_start, .end = candidate.end, .redact_start = candidate.actual_start, .replacement = repl };
 }
 
 // ---------------------------------------------------------------------------
@@ -191,4 +221,18 @@ test "phone - embedded in longer digit sequence rejected" {
     // sequence has 14 digits which fails US phone validation.
     const start = std.mem.indexOf(u8, input, "99").?;
     try std.testing.expect(tryMatchAt(input, start) == null);
+}
+
+test "phone - fax context before" {
+    const input = "Send fax to 555-234-5678 please";
+    const start = std.mem.indexOf(u8, input, "555").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings(fax_replacement, m.replacement);
+}
+
+test "phone - fax context after" {
+    const input = "Number: (555) 234-5678 (Fax)";
+    const start = std.mem.indexOf(u8, input, "(555)").?;
+    const m = tryMatchAt(input, start).?;
+    try std.testing.expectEqualStrings(fax_replacement, m.replacement);
 }

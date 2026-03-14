@@ -1,0 +1,411 @@
+diff --git a/src/infra/config.zig b/src/infra/config.zig
+index ace2bd4..6bd87c6 100644
+--- a/src/infra/config.zig
++++ b/src/infra/config.zig
+@@ -121,6 +121,21 @@ pub const Config = struct {
+     enable_passport_src: ConfigSource = .default,
+     enable_intl_phone: bool = false,
+     enable_intl_phone_src: ConfigSource = .default,
++    // --- Phase 1 / V4 Pattern library flags ---
++    enable_dates: bool = false,
++    enable_dates_src: ConfigSource = .default,
++    enable_addresses: bool = false,
++    enable_addresses_src: ConfigSource = .default,
++    enable_fax: bool = false,
++    enable_fax_src: ConfigSource = .default,
++    enable_accounts: bool = false,
++    enable_accounts_src: ConfigSource = .default,
++    enable_licenses: bool = false,
++    enable_licenses_src: ConfigSource = .default,
++    enable_urls: bool = false,
++    enable_urls_src: ConfigSource = .default,
++    enable_vehicle_ids: bool = false,
++    enable_vehicle_ids_src: ConfigSource = .default,
+     // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
+     schema_file: ?[]const u8 = null,
+     schema_file_src: ConfigSource = .default,
+@@ -352,6 +367,13 @@ pub const Config = struct {
+         \\  --enable-uk-nino                    Redact UK National Insurance numbers (default: disabled)
+         \\  --enable-passport                   Redact passport numbers when label-qualified (default: disabled)
+         \\  --enable-intl-phone                 Redact common non-US international phone numbers (default: disabled)
++        \\  --enable-dates                      Redact dates and aggregate ages > 89 (default: disabled)
++        \\  --enable-addresses                  Redact US street addresses, ZIPs, city/states (default: disabled)
++        \\  --enable-fax                        Redact fax numbers (default: disabled)
++        \\  --enable-accounts                   Redact banking and financial account numbers (default: disabled)
++        \\  --enable-licenses                   Redact US driver's licenses, DEA, and NPI numbers (default: disabled)
++        \\  --enable-urls                       Redact HTTP/HTTPS URLs (default: disabled)
++        \\  --enable-vehicle-ids                Redact VINs and heuristic license plates (default: disabled)
+         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
+         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
+         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
+@@ -424,6 +446,13 @@ pub const Config = struct {
+         "--enable-uk-nino",
+         "--enable-passport",
+         "--enable-intl-phone",
++        "--enable-dates",
++        "--enable-addresses",
++        "--enable-fax",
++        "--enable-accounts",
++        "--enable-licenses",
++        "--enable-urls",
++        "--enable-vehicle-ids",
+         "--schema-file",
+         "--schema-default",
+         "--hash-key",
+@@ -749,6 +778,27 @@ pub const Config = struct {
+         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_INTL_PHONE")) {
+             config.enable_intl_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+             config.enable_intl_phone_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_DATES")) {
++            config.enable_dates = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_dates_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_ADDRESSES")) {
++            config.enable_addresses = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_addresses_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_FAX")) {
++            config.enable_fax = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_fax_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_ACCOUNTS")) {
++            config.enable_accounts = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_accounts_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_LICENSES")) {
++            config.enable_licenses = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_licenses_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_URLS")) {
++            config.enable_urls = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_urls_src = .env_var;
++        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_VEHICLE_IDS")) {
++            config.enable_vehicle_ids = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
++            config.enable_vehicle_ids_src = .env_var;
+         } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_FILE")) {
+             config.schema_file = try allocator.dupe(u8, value);
+             config.schema_file_src = .env_var;
+diff --git a/src/main.zig b/src/main.zig
+index f5df873..2a2be7b 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -81,7 +81,15 @@ fn buildFeatureSummary(
+     if (cfg.enable_uk_nino) try appendFeature(&features, allocator, "uk-nino");
+     if (cfg.enable_passport) try appendFeature(&features, allocator, "passport");
+     if (cfg.enable_intl_phone) try appendFeature(&features, allocator, "intl-phone");
++    if (cfg.enable_dates) try appendFeature(&features, allocator, "dates");
++    if (cfg.enable_addresses) try appendFeature(&features, allocator, "addresses");
++    if (cfg.enable_accounts) try appendFeature(&features, allocator, "accounts");
++    if (cfg.enable_licenses) try appendFeature(&features, allocator, "licenses");
++    if (cfg.enable_urls) try appendFeature(&features, allocator, "urls");
++    if (cfg.enable_vehicle_ids) try appendFeature(&features, allocator, "vehicle-ids");
++
+     if (schema_field_count > 0) try appendFeature(&features, allocator, "schema");
++    if (cfg.target_tls) try appendFeature(&features, allocator, "upstream-tls");
+     if (cfg.report_only) try appendFeature(&features, allocator, "report-only");
+ 
+     if (cfg.enable_guardrails) {
+@@ -213,6 +221,12 @@ pub fn main() !void {
+                 "    uk_nino       {s}\n" ++
+                 "    passport      {s}\n" ++
+                 "    intl_phone    {s}\n" ++
++                "    dates         {s}\n" ++
++                "    addresses     {s}\n" ++
++                "    accounts      {s}\n" ++
++                "    licenses      {s}\n" ++
++                "    urls          {s}\n" ++
++                "    vehicle_ids   {s}\n" ++
+                 "    report_only   {s}\n" ++
+                 "    guardrails    {s} ({s})\n" ++
+                 "    sem_cache     {s} ttl={d}ms entries={d}\n" ++
+@@ -245,6 +259,12 @@ pub fn main() !void {
+                 if (cfg.enable_uk_nino) "enabled" else "disabled",
+                 if (cfg.enable_passport) "enabled" else "disabled",
+                 if (cfg.enable_intl_phone) "enabled" else "disabled",
++                if (cfg.enable_dates) "enabled" else "disabled",
++                if (cfg.enable_addresses) "enabled" else "disabled",
++                if (cfg.enable_accounts) "enabled" else "disabled",
++                if (cfg.enable_licenses) "enabled" else "disabled",
++                if (cfg.enable_urls) "enabled" else "disabled",
++                if (cfg.enable_vehicle_ids) "enabled" else "disabled",
+                 if (cfg.report_only) "enabled" else "disabled",
+                 if (cfg.enable_guardrails) "enabled" else "disabled",
+                 cfg.guardrail_mode.label(),
+@@ -765,6 +785,12 @@ pub fn main() !void {
+                 .enable_uk_nino = cfg.enable_uk_nino,
+                 .enable_passport = cfg.enable_passport,
+                 .enable_intl_phone = cfg.enable_intl_phone,
++                .enable_dates = cfg.enable_dates,
++                .enable_addresses = cfg.enable_addresses,
++                .enable_accounts = cfg.enable_accounts,
++                .enable_licenses = cfg.enable_licenses,
++                .enable_urls = cfg.enable_urls,
++                .enable_vehicle_ids = cfg.enable_vehicle_ids,
+                 .guardrail_settings = .{
+                     .enabled = cfg.enable_guardrails,
+                     .mode = cfg.guardrail_mode,
+@@ -826,6 +852,12 @@ pub fn main() !void {
+                     .enable_uk_nino = cfg.enable_uk_nino,
+                     .enable_passport = cfg.enable_passport,
+                     .enable_intl_phone = cfg.enable_intl_phone,
++                    .enable_dates = cfg.enable_dates,
++                    .enable_addresses = cfg.enable_addresses,
++                    .enable_accounts = cfg.enable_accounts,
++                    .enable_licenses = cfg.enable_licenses,
++                    .enable_urls = cfg.enable_urls,
++                    .enable_vehicle_ids = cfg.enable_vehicle_ids,
+                     .guardrail_settings = .{
+                         .enabled = cfg.enable_guardrails,
+                         .mode = cfg.guardrail_mode,
+diff --git a/src/net/proxy.zig b/src/net/proxy.zig
+index 64d799b..5088d8b 100644
+--- a/src/net/proxy.zig
++++ b/src/net/proxy.zig
+@@ -559,6 +559,12 @@ pub const ProxyContext = struct {
+     enable_uk_nino: bool = false,
+     enable_passport: bool = false,
+     enable_intl_phone: bool = false,
++    enable_dates: bool = false,
++    enable_addresses: bool = false,
++    enable_accounts: bool = false,
++    enable_licenses: bool = false,
++    enable_urls: bool = false,
++    enable_vehicle_ids: bool = false,
+     guardrail_settings: guardrails_mod.Settings = .{},
+     semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
+     semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
+@@ -585,6 +591,12 @@ pub const ProxyContext = struct {
+             .uk_nino = self.enable_uk_nino,
+             .passport = self.enable_passport,
+             .intl_phone = self.enable_intl_phone,
++            .dates = self.enable_dates,
++            .addresses = self.enable_addresses,
++            .accounts = self.enable_accounts,
++            .licenses = self.enable_licenses,
++            .urls = self.enable_urls,
++            .vehicle_ids = self.enable_vehicle_ids,
+         };
+     }
+ };
+diff --git a/src/net/proxy_server.zig b/src/net/proxy_server.zig
+index 24882fb..b616280 100644
+--- a/src/net/proxy_server.zig
++++ b/src/net/proxy_server.zig
+@@ -50,6 +50,12 @@ pub const ConnectionContext = struct {
+     enable_uk_nino: bool,
+     enable_passport: bool,
+     enable_intl_phone: bool,
++    enable_dates: bool,
++    enable_addresses: bool,
++    enable_accounts: bool,
++    enable_licenses: bool,
++    enable_urls: bool,
++    enable_vehicle_ids: bool,
+     guardrail_settings: guardrails_mod.Settings = .{},
+     semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
+     semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
+@@ -306,6 +312,12 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ConnectionContex
+             .enable_uk_nino = ctx.enable_uk_nino,
+             .enable_passport = ctx.enable_passport,
+             .enable_intl_phone = ctx.enable_intl_phone,
++            .enable_dates = ctx.enable_dates,
++            .enable_addresses = ctx.enable_addresses,
++            .enable_accounts = ctx.enable_accounts,
++            .enable_licenses = ctx.enable_licenses,
++            .enable_urls = ctx.enable_urls,
++            .enable_vehicle_ids = ctx.enable_vehicle_ids,
+             .guardrail_settings = ctx.guardrail_settings,
+             .semantic_cache = ctx.semantic_cache,
+             .semantic_cache_tenant_header = ctx.semantic_cache_tenant_header,
+diff --git a/src/patterns/phone.zig b/src/patterns/phone.zig
+index bf0f5fb..bcd60f3 100644
+--- a/src/patterns/phone.zig
++++ b/src/patterns/phone.zig
+@@ -17,6 +17,34 @@ const std = @import("std");
+ // ---------------------------------------------------------------------------
+ 
+ const replacement = "[PHONE_REDACTED]";
++const fax_replacement = "[FAX_REDACTED]";
++
++const fax_keywords = [_][]const u8{
++    "fax", "facsimile"
++};
++
++fn hasFaxContext(buf: []const u8, start: usize, end: usize) bool {
++    const window_start = if (start > 15) start - 15 else 0;
++    const window_before = buf[window_start..start];
++    var lower_buf: [30]u8 = undefined;
++    for (window_before, 0..) |col, i| lower_buf[i] = std.ascii.toLower(col);
++    const lower_before = lower_buf[0..window_before.len];
++
++    for (fax_keywords) |kw| {
++        if (std.mem.indexOf(u8, lower_before, kw) != null) return true;
++    }
++
++    const window_end = if (end + 15 < buf.len) end + 15 else buf.len;
++    const window_after = buf[end..window_end];
++    for (window_after, 0..) |col, i| lower_buf[i] = std.ascii.toLower(col);
++    const lower_after = lower_buf[0..window_after.len];
++
++    for (fax_keywords) |kw| {
++        if (std.mem.indexOf(u8, lower_after, kw) != null) return true;
++    }
++
++    return false;
++}
+ 
+ /// Extract a phone candidate starting at `start`.
+ /// Collects digits while allowing separators (dash, dot, space, parens).
+@@ -118,7 +146,11 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
+     if (!isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;
+     // Not followed by more digits
+     if (candidate.end < buf.len and std.ascii.isDigit(buf[candidate.end])) return null;
+-    return .{ .start = candidate.actual_start, .end = candidate.end, .redact_start = candidate.actual_start, .replacement = replacement };
++    
++    const is_fax = hasFaxContext(buf, candidate.actual_start, candidate.end);
++    const repl = if (is_fax) fax_replacement else replacement;
++    
++    return .{ .start = candidate.actual_start, .end = candidate.end, .redact_start = candidate.actual_start, .replacement = repl };
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -192,3 +224,17 @@ test "phone - embedded in longer digit sequence rejected" {
+     const start = std.mem.indexOf(u8, input, "99").?;
+     try std.testing.expect(tryMatchAt(input, start) == null);
+ }
++
++test "phone - fax context before" {
++    const input = "Send fax to 555-234-5678 please";
++    const start = std.mem.indexOf(u8, input, "555").?;
++    const m = tryMatchAt(input, start).?;
++    try std.testing.expectEqualStrings(fax_replacement, m.replacement);
++}
++
++test "phone - fax context after" {
++    const input = "Number: (555) 234-5678 (Fax)";
++    const start = std.mem.indexOf(u8, input, "(555)").?;
++    const m = tryMatchAt(input, start).?;
++    try std.testing.expectEqualStrings(fax_replacement, m.replacement);
++}
+diff --git a/src/patterns/scanner.zig b/src/patterns/scanner.zig
+index 2261715..c368f12 100644
+--- a/src/patterns/scanner.zig
++++ b/src/patterns/scanner.zig
+@@ -8,6 +8,12 @@ const iban_mod = @import("iban.zig");
+ const uk_nino_mod = @import("uk_nino.zig");
+ const passport_mod = @import("passport.zig");
+ const intl_phone_mod = @import("intl_phone.zig");
++const date_mod = @import("date.zig");
++const address_mod = @import("address.zig");
++const account_mod = @import("account.zig");
++const license_mod = @import("license.zig");
++const url_mod = @import("url.zig");
++const vin_mod = @import("vin.zig");
+ 
+ // ---------------------------------------------------------------------------
+ // Unified single-pass pattern scanner
+@@ -52,10 +58,16 @@ pub const PatternFlags = struct {
+     uk_nino: bool = false,
+     passport: bool = false,
+     intl_phone: bool = false,
++    dates: bool = false,
++    addresses: bool = false,
++    accounts: bool = false,
++    licenses: bool = false,
++    urls: bool = false,
++    vehicle_ids: bool = false,
+ 
+     pub fn anyEnabled(self: PatternFlags) bool {
+         return self.email or self.phone or self.credit_card or self.ip or self.healthcare or
+-            self.iban or self.uk_nino or self.passport or self.intl_phone;
++            self.iban or self.uk_nino or self.passport or self.intl_phone or self.dates or self.addresses or self.accounts or self.licenses or self.urls or self.vehicle_ids;
+     }
+ };
+ 
+@@ -79,6 +91,39 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
+ 
+     var cursor: usize = 0;
+     while (cursor < input.len) {
++        if ((flags.dates or flags.addresses) and (std.ascii.isDigit(input[cursor]) or std.ascii.isAlphabetic(input[cursor]))) {
++            if (flags.dates) {
++                if (date_mod.tryMatchAt(input, cursor)) |m| {
++                    const match = toMatch(m);
++                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
++                        try spans.append(allocator, match);
++                        cursor = match.end;
++                        continue;
++                    }
++                }
++            }
++            if (flags.addresses) {
++                if (address_mod.tryMatchAt(input, cursor)) |m| {
++                    const match = toMatch(m);
++                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
++                        try spans.append(allocator, match);
++                        cursor = match.end;
++                        continue;
++                    }
++                }
++            }
++            if (flags.vehicle_ids) {
++                if (vin_mod.tryMatchAt(input, cursor)) |m| {
++                    const match = toMatch(m);
++                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
++                        try spans.append(allocator, match);
++                        cursor = match.end;
++                        continue;
++                    }
++                }
++            }
++        }
++
+         if (flags.email and input[cursor] == '@') {
+             if (email_mod.tryMatchAt(input, cursor)) |m| {
+                 const match = toMatch(m);
+@@ -90,6 +135,14 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
+             }
+         }
+ 
++        if (flags.urls and (input[cursor] == 'h' or input[cursor] == 'w' or input[cursor] == 'H' or input[cursor] == 'W')) {
++            if (url_mod.tryMatchAt(input, cursor)) |m| {
++                try spans.append(allocator, toMatch(m));
++                cursor = m.end;
++                continue;
++            }
++        }
++
+         if (std.ascii.isDigit(input[cursor])) {
+             if (flags.phone) {
+                 if (phone_mod.tryMatchAt(input, cursor)) |m| {
+@@ -105,6 +158,13 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
+                     continue;
+                 }
+             }
++            if (flags.licenses) {
++                if (license_mod.tryMatchAt(input, cursor)) |m| {
++                    try spans.append(allocator, toMatch(m));
++                    cursor = m.end;
++                    continue;
++                }
++            }
+         }
+ 
+         if (flags.ip) {
+@@ -143,7 +203,21 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
+             }
+         }
+ 
+-        if ((flags.iban or flags.uk_nino) and std.ascii.isAlphabetic(input[cursor])) {
++        if ((flags.iban or flags.uk_nino or flags.accounts or flags.licenses) and std.ascii.isAlphabetic(input[cursor])) {
++            if (flags.licenses) {
++                if (license_mod.tryMatchAt(input, cursor)) |m| {
++                    try spans.append(allocator, toMatch(m));
++                    cursor = m.end;
++                    continue;
++                }
++            }
++            if (flags.accounts) {
++                if (account_mod.tryMatchAt(input, cursor)) |m| {
++                    try spans.append(allocator, toMatch(m));
++                    cursor = m.end;
++                    continue;
++                }
++            }
+             if (flags.iban) {
+                 if (iban_mod.tryMatchAt(input, cursor)) |m| {
+                     try spans.append(allocator, toMatch(m));

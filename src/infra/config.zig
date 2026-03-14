@@ -121,6 +121,21 @@ pub const Config = struct {
     enable_passport_src: ConfigSource = .default,
     enable_intl_phone: bool = false,
     enable_intl_phone_src: ConfigSource = .default,
+    // --- Phase 1 / V4 Pattern library flags ---
+    enable_dates: bool = false,
+    enable_dates_src: ConfigSource = .default,
+    enable_addresses: bool = false,
+    enable_addresses_src: ConfigSource = .default,
+    enable_fax: bool = false,
+    enable_fax_src: ConfigSource = .default,
+    enable_accounts: bool = false,
+    enable_accounts_src: ConfigSource = .default,
+    enable_licenses: bool = false,
+    enable_licenses_src: ConfigSource = .default,
+    enable_urls: bool = false,
+    enable_urls_src: ConfigSource = .default,
+    enable_vehicle_ids: bool = false,
+    enable_vehicle_ids_src: ConfigSource = .default,
     // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
     schema_file: ?[]const u8 = null,
     schema_file_src: ConfigSource = .default,
@@ -352,6 +367,13 @@ pub const Config = struct {
         \\  --enable-uk-nino                    Redact UK National Insurance numbers (default: disabled)
         \\  --enable-passport                   Redact passport numbers when label-qualified (default: disabled)
         \\  --enable-intl-phone                 Redact common non-US international phone numbers (default: disabled)
+        \\  --enable-dates                      Redact dates and aggregate ages > 89 (default: disabled)
+        \\  --enable-addresses                  Redact US street addresses, ZIPs, city/states (default: disabled)
+        \\  --enable-fax                        Redact fax numbers (default: disabled)
+        \\  --enable-accounts                   Redact banking and financial account numbers (default: disabled)
+        \\  --enable-licenses                   Redact US driver's licenses, DEA, and NPI numbers (default: disabled)
+        \\  --enable-urls                       Redact HTTP/HTTPS URLs (default: disabled)
+        \\  --enable-vehicle-ids                Redact VINs and heuristic license plates (default: disabled)
         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
@@ -424,6 +446,13 @@ pub const Config = struct {
         "--enable-uk-nino",
         "--enable-passport",
         "--enable-intl-phone",
+        "--enable-dates",
+        "--enable-addresses",
+        "--enable-fax",
+        "--enable-accounts",
+        "--enable-licenses",
+        "--enable-urls",
+        "--enable-vehicle-ids",
         "--schema-file",
         "--schema-default",
         "--hash-key",
@@ -749,6 +778,27 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_INTL_PHONE")) {
             config.enable_intl_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_intl_phone_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_DATES")) {
+            config.enable_dates = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_dates_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_ADDRESSES")) {
+            config.enable_addresses = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_addresses_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_FAX")) {
+            config.enable_fax = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_fax_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_ACCOUNTS")) {
+            config.enable_accounts = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_accounts_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_LICENSES")) {
+            config.enable_licenses = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_licenses_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_URLS")) {
+            config.enable_urls = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_urls_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_VEHICLE_IDS")) {
+            config.enable_vehicle_ids = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_vehicle_ids_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_FILE")) {
             config.schema_file = try allocator.dupe(u8, value);
             config.schema_file_src = .env_var;

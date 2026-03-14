@@ -81,7 +81,15 @@ fn buildFeatureSummary(
     if (cfg.enable_uk_nino) try appendFeature(&features, allocator, "uk-nino");
     if (cfg.enable_passport) try appendFeature(&features, allocator, "passport");
     if (cfg.enable_intl_phone) try appendFeature(&features, allocator, "intl-phone");
+    if (cfg.enable_dates) try appendFeature(&features, allocator, "dates");
+    if (cfg.enable_addresses) try appendFeature(&features, allocator, "addresses");
+    if (cfg.enable_accounts) try appendFeature(&features, allocator, "accounts");
+    if (cfg.enable_licenses) try appendFeature(&features, allocator, "licenses");
+    if (cfg.enable_urls) try appendFeature(&features, allocator, "urls");
+    if (cfg.enable_vehicle_ids) try appendFeature(&features, allocator, "vehicle-ids");
+
     if (schema_field_count > 0) try appendFeature(&features, allocator, "schema");
+    if (cfg.target_tls) try appendFeature(&features, allocator, "upstream-tls");
     if (cfg.report_only) try appendFeature(&features, allocator, "report-only");
 
     if (cfg.enable_guardrails) {
@@ -213,6 +221,12 @@ pub fn main() !void {
                 "    uk_nino       {s}\n" ++
                 "    passport      {s}\n" ++
                 "    intl_phone    {s}\n" ++
+                "    dates         {s}\n" ++
+                "    addresses     {s}\n" ++
+                "    accounts      {s}\n" ++
+                "    licenses      {s}\n" ++
+                "    urls          {s}\n" ++
+                "    vehicle_ids   {s}\n" ++
                 "    report_only   {s}\n" ++
                 "    guardrails    {s} ({s})\n" ++
                 "    sem_cache     {s} ttl={d}ms entries={d}\n" ++
@@ -245,6 +259,12 @@ pub fn main() !void {
                 if (cfg.enable_uk_nino) "enabled" else "disabled",
                 if (cfg.enable_passport) "enabled" else "disabled",
                 if (cfg.enable_intl_phone) "enabled" else "disabled",
+                if (cfg.enable_dates) "enabled" else "disabled",
+                if (cfg.enable_addresses) "enabled" else "disabled",
+                if (cfg.enable_accounts) "enabled" else "disabled",
+                if (cfg.enable_licenses) "enabled" else "disabled",
+                if (cfg.enable_urls) "enabled" else "disabled",
+                if (cfg.enable_vehicle_ids) "enabled" else "disabled",
                 if (cfg.report_only) "enabled" else "disabled",
                 if (cfg.enable_guardrails) "enabled" else "disabled",
                 cfg.guardrail_mode.label(),
@@ -765,6 +785,12 @@ pub fn main() !void {
                 .enable_uk_nino = cfg.enable_uk_nino,
                 .enable_passport = cfg.enable_passport,
                 .enable_intl_phone = cfg.enable_intl_phone,
+                .enable_dates = cfg.enable_dates,
+                .enable_addresses = cfg.enable_addresses,
+                .enable_accounts = cfg.enable_accounts,
+                .enable_licenses = cfg.enable_licenses,
+                .enable_urls = cfg.enable_urls,
+                .enable_vehicle_ids = cfg.enable_vehicle_ids,
                 .guardrail_settings = .{
                     .enabled = cfg.enable_guardrails,
                     .mode = cfg.guardrail_mode,
@@ -826,6 +852,12 @@ pub fn main() !void {
                     .enable_uk_nino = cfg.enable_uk_nino,
                     .enable_passport = cfg.enable_passport,
                     .enable_intl_phone = cfg.enable_intl_phone,
+                    .enable_dates = cfg.enable_dates,
+                    .enable_addresses = cfg.enable_addresses,
+                    .enable_accounts = cfg.enable_accounts,
+                    .enable_licenses = cfg.enable_licenses,
+                    .enable_urls = cfg.enable_urls,
+                    .enable_vehicle_ids = cfg.enable_vehicle_ids,
                     .guardrail_settings = .{
                         .enabled = cfg.enable_guardrails,
                         .mode = cfg.guardrail_mode,

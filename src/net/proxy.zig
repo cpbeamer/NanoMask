@@ -559,6 +559,12 @@ pub const ProxyContext = struct {
     enable_uk_nino: bool = false,
     enable_passport: bool = false,
     enable_intl_phone: bool = false,
+    enable_dates: bool = false,
+    enable_addresses: bool = false,
+    enable_accounts: bool = false,
+    enable_licenses: bool = false,
+    enable_urls: bool = false,
+    enable_vehicle_ids: bool = false,
     guardrail_settings: guardrails_mod.Settings = .{},
     semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
     semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
@@ -585,6 +591,12 @@ pub const ProxyContext = struct {
             .uk_nino = self.enable_uk_nino,
             .passport = self.enable_passport,
             .intl_phone = self.enable_intl_phone,
+            .dates = self.enable_dates,
+            .addresses = self.enable_addresses,
+            .accounts = self.enable_accounts,
+            .licenses = self.enable_licenses,
+            .urls = self.enable_urls,
+            .vehicle_ids = self.enable_vehicle_ids,
         };
     }
 };

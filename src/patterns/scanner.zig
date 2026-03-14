@@ -8,6 +8,12 @@ const iban_mod = @import("iban.zig");
 const uk_nino_mod = @import("uk_nino.zig");
 const passport_mod = @import("passport.zig");
 const intl_phone_mod = @import("intl_phone.zig");
+const date_mod = @import("date.zig");
+const address_mod = @import("address.zig");
+const account_mod = @import("account.zig");
+const license_mod = @import("license.zig");
+const url_mod = @import("url.zig");
+const vin_mod = @import("vin.zig");
 
 // ---------------------------------------------------------------------------
 // Unified single-pass pattern scanner
@@ -52,10 +58,16 @@ pub const PatternFlags = struct {
     uk_nino: bool = false,
     passport: bool = false,
     intl_phone: bool = false,
+    dates: bool = false,
+    addresses: bool = false,
+    accounts: bool = false,
+    licenses: bool = false,
+    urls: bool = false,
+    vehicle_ids: bool = false,
 
     pub fn anyEnabled(self: PatternFlags) bool {
         return self.email or self.phone or self.credit_card or self.ip or self.healthcare or
-            self.iban or self.uk_nino or self.passport or self.intl_phone;
+            self.iban or self.uk_nino or self.passport or self.intl_phone or self.dates or self.addresses or self.accounts or self.licenses or self.urls or self.vehicle_ids;
     }
 };
 
@@ -79,6 +91,41 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
 
     var cursor: usize = 0;
     while (cursor < input.len) {
+        const is_word_start = cursor == 0 or !std.ascii.isAlphanumeric(input[cursor - 1]);
+
+        if (is_word_start and (flags.dates or flags.addresses or flags.vehicle_ids) and (std.ascii.isDigit(input[cursor]) or std.ascii.isAlphabetic(input[cursor]))) {
+            if (flags.dates) {
+                if (date_mod.tryMatchAt(input, cursor)) |m| {
+                    const match = toMatch(m);
+                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
+                        try spans.append(allocator, match);
+                        cursor = match.end;
+                        continue;
+                    }
+                }
+            }
+            if (flags.addresses) {
+                if (address_mod.tryMatchAt(input, cursor)) |m| {
+                    const match = toMatch(m);
+                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
+                        try spans.append(allocator, match);
+                        cursor = match.end;
+                        continue;
+                    }
+                }
+            }
+            if (flags.vehicle_ids) {
+                if (vin_mod.tryMatchAt(input, cursor)) |m| {
+                    const match = toMatch(m);
+                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
+                        try spans.append(allocator, match);
+                        cursor = match.end;
+                        continue;
+                    }
+                }
+            }
+        }
+
         if (flags.email and input[cursor] == '@') {
             if (email_mod.tryMatchAt(input, cursor)) |m| {
                 const match = toMatch(m);
@@ -87,6 +134,14 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
                     cursor = match.end;
                     continue;
                 }
+            }
+        }
+
+        if (is_word_start and flags.urls and (input[cursor] == 'h' or input[cursor] == 'w' or input[cursor] == 'H' or input[cursor] == 'W')) {
+            if (url_mod.tryMatchAt(input, cursor)) |m| {
+                try spans.append(allocator, toMatch(m));
+                cursor = m.end;
+                continue;
             }
         }
 
@@ -100,6 +155,13 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
             }
             if (flags.credit_card) {
                 if (cc_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+            if (is_word_start and flags.licenses) {
+                if (license_mod.tryMatchAt(input, cursor)) |m| {
                     try spans.append(allocator, toMatch(m));
                     cursor = m.end;
                     continue;
@@ -143,7 +205,21 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
             }
         }
 
-        if ((flags.iban or flags.uk_nino) and std.ascii.isAlphabetic(input[cursor])) {
+        if ((flags.iban or flags.uk_nino or flags.accounts or flags.licenses) and std.ascii.isAlphabetic(input[cursor])) {
+            if (is_word_start and flags.licenses) {
+                if (license_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+            if (is_word_start and flags.accounts) {
+                if (account_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
             if (flags.iban) {
                 if (iban_mod.tryMatchAt(input, cursor)) |m| {
                     try spans.append(allocator, toMatch(m));
