@@ -21,6 +21,27 @@ pub const LogLevel = enum {
     }
 };
 
+pub const VaultBackend = enum {
+    memory,
+    file,
+    external,
+
+    pub fn parse(s: []const u8) !VaultBackend {
+        if (std.mem.eql(u8, s, "memory")) return .memory;
+        if (std.mem.eql(u8, s, "file")) return .file;
+        if (std.mem.eql(u8, s, "external")) return .external;
+        return error.InvalidVaultBackend;
+    }
+
+    pub fn asStr(self: VaultBackend) []const u8 {
+        return switch (self) {
+            .memory => "memory",
+            .file => "file",
+            .external => "external",
+        };
+    }
+};
+
 pub const ConfigSource = enum {
     default,
     env_var,
@@ -149,6 +170,11 @@ pub const Config = struct {
     // --- Report-only mode (Phase 2 / NMV3-007) ---
     report_only: bool = false,
     report_only_src: ConfigSource = .default,
+    // --- Persistent Token Vault (Phase 2 / NMV4-007) ---
+    vault_backend: VaultBackend = .memory,
+    vault_backend_src: ConfigSource = .default,
+    vault_file_path: ?[]const u8 = null,
+    vault_file_path_src: ConfigSource = .default,
     // --- Phase 5: AI guardrails and semantic caching ---
     enable_guardrails: bool = false,
     enable_guardrails_src: ConfigSource = .default,
@@ -229,6 +255,9 @@ pub const Config = struct {
         InvalidAuditBufferSize,
         InvalidMtlsConfig,
         InvalidMtlsPemFormat,
+        InvalidVaultBackend,
+        MissingVaultFilePath,
+        VaultFileNotFound,
         UnknownFlag,
         OutOfMemory,
     };
@@ -272,6 +301,9 @@ pub const Config = struct {
         }
         if (self.hash_key_file != null and self.hash_key_file_src == .env_var) {
             self.allocator.free(self.hash_key_file.?);
+        }
+        if (self.vault_file_path != null and self.vault_file_path_src == .env_var) {
+            self.allocator.free(self.vault_file_path.?);
         }
         if (self.schema_default) |sd| {
             self.allocator.free(sd);
@@ -380,6 +412,8 @@ pub const Config = struct {
         \\  --hash-key-file <path>              File containing the 64-char hex HMAC key
         \\  --hash-key-exec <command>           Shell command that outputs the HMAC key on stdout (Phase 3)
         \\                                      WARNING: command is executed as a shell; only use with trusted config sources
+        \\  --vault-backend <type>              Backend for HASH-mode persistence: memory, file, external (default: memory)
+        \\  --vault-file-path <path>            File path for encrypted local storage (required with --vault-backend file)
         \\
         \\Enterprise observability (Phase 3):
         \\  --audit-buffer-size <n>              In-memory audit ring buffer size (default: 1000)
@@ -458,6 +492,8 @@ pub const Config = struct {
         "--hash-key",
         "--hash-key-file",
         "--hash-key-exec",
+        "--vault-backend",
+        "--vault-file-path",
         "--audit-buffer-size",
         "--otel-service-name",
         "--syslog-address",
@@ -905,6 +941,15 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY_EXEC")) {
             config.hash_key_exec = try allocator.dupe(u8, value);
             config.hash_key_exec_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_VAULT_BACKEND")) {
+            config.vault_backend = VaultBackend.parse(value) catch {
+                std.debug.print("error: NANOMASK_VAULT_BACKEND must be memory, file, or external, got '{s}'\n", .{value});
+                return error.InvalidVaultBackend;
+            };
+            config.vault_backend_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_VAULT_FILE_PATH")) {
+            config.vault_file_path = try allocator.dupe(u8, value);
+            config.vault_file_path_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_CA")) {
             try checkPemFile(value, "mTLS CA");
             config.mtls_ca = try allocator.dupe(u8, value);
@@ -1478,6 +1523,28 @@ pub const Config = struct {
                     std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ args[i], @errorName(err) });
                     return error.HashKeyFileNotFound;
                 }
+            } else if (std.mem.eql(u8, arg, "--vault-backend")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --vault-backend\n", .{});
+                    return error.MissingValue;
+                }
+                config.vault_backend = VaultBackend.parse(args[i]) catch {
+                    std.debug.print("error: --vault-backend must be memory, file, or external, got '{s}'\n", .{args[i]});
+                    return error.InvalidVaultBackend;
+                };
+                config.vault_backend_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--vault-file-path")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --vault-file-path\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.vault_file_path != null and config.vault_file_path_src == .env_var) {
+                    allocator.free(config.vault_file_path.?);
+                }
+                config.vault_file_path = args[i];
+                config.vault_file_path_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--report-only")) {
                 config.report_only = true;
                 config.report_only_src = .cli_flag;
@@ -1680,6 +1747,12 @@ pub const Config = struct {
         if (config.admin_api and config.admin_token == null and config.admin_api_key_file == null) {
             std.debug.print("error: --admin-api requires --admin-token <secret> or --admin-api-key-file <path> for authentication\n", .{});
             return error.MissingAdminToken;
+        }
+
+        // Validate Vault combinations
+        if (config.vault_backend == .file and config.vault_file_path == null) {
+            std.debug.print("error: --vault-backend file requires --vault-file-path\n", .{});
+            return error.MissingVaultFilePath;
         }
 
         if (config.admin_api) {
@@ -2553,3 +2626,42 @@ test "Config - validate-config defaults to false" {
 
     try testing.expect(!cfg.validate_config);
 }
+
+test "Config - vault-backend valid type" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--vault-backend",
+        "file",
+        "--vault-file-path",
+        "/tmp/vault.enc",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(VaultBackend.file, cfg.vault_backend);
+    try testing.expectEqualStrings("/tmp/vault.enc", cfg.vault_file_path.?);
+}
+
+test "Config - vault-backend file requires path" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--vault-backend",
+        "file",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingVaultFilePath, res);
+}
+
+test "Config - vault-backend invalid type" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--vault-backend",
+        "postgres",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidVaultBackend, res);
+}
+

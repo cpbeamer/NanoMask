@@ -139,6 +139,9 @@ pub const Observability = struct {
     semantic_cache_misses_total: AtomicU64 = AtomicU64.init(0),
     semantic_cache_evictions_total: AtomicU64 = AtomicU64.init(0),
     semantic_cache_entries: AtomicU64 = AtomicU64.init(0),
+    vault_store_total: AtomicU64 = AtomicU64.init(0),
+    vault_lookup_hits_total: AtomicU64 = AtomicU64.init(0),
+    vault_lookup_misses_total: AtomicU64 = AtomicU64.init(0),
     startup_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     entity_reload_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     shutdown_draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -236,6 +239,18 @@ pub const Observability = struct {
         if (after.evictions > before.evictions)
             _ = self.semantic_cache_evictions_total.fetchAdd(after.evictions - before.evictions, .monotonic);
         self.semantic_cache_entries.store(after.entries, .release);
+    }
+
+    pub fn recordVaultStore(self: *Observability) void {
+        _ = self.vault_store_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordVaultLookup(self: *Observability, hit: bool) void {
+        if (hit) {
+            _ = self.vault_lookup_hits_total.fetchAdd(1, .monotonic);
+        } else {
+            _ = self.vault_lookup_misses_total.fetchAdd(1, .monotonic);
+        }
     }
 
     pub fn renderMetrics(self: *const Observability, allocator: std.mem.Allocator) ![]u8 {
@@ -440,6 +455,31 @@ pub const Observability = struct {
             writer,
             "nanomask_active_connections {d}\n\n",
             .{self.active_connections.load(.acquire)},
+        );
+
+        try writer.writeAll(
+            \\# HELP nanomask_vault_store_total Total tokens securely persisted in the token vault.
+            \\# TYPE nanomask_vault_store_total counter
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_vault_store_total {d}\n\n",
+            .{self.vault_store_total.load(.acquire)},
+        );
+
+        try writer.writeAll(
+            \\# HELP nanomask_vault_lookup_total Token vault resolutions (hit or miss).
+            \\# TYPE nanomask_vault_lookup_total counter
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_vault_lookup_total{{result=\"hit\"}} {d}\n",
+            .{self.vault_lookup_hits_total.load(.acquire)},
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_vault_lookup_total{{result=\"miss\"}} {d}\n\n",
+            .{self.vault_lookup_misses_total.load(.acquire)},
         );
 
         try writer.writeAll(

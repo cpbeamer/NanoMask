@@ -30,6 +30,10 @@ const ApiKeyStore = rbac.ApiKeyStore;
 const audit_store_mod = @import("infra/audit_store.zig");
 const AuditStore = audit_store_mod.AuditStore;
 const semantic_cache_mod = @import("infra/semantic_cache.zig");
+const vault_mod = @import("vault/vault.zig");
+const memory_vault_mod = @import("vault/memory_vault.zig");
+const file_vault_mod = @import("vault/file_vault.zig");
+const external_vault_mod = @import("vault/external_vault.zig");
 
 var termination_signal_requested = std.atomic.Value(bool).init(false);
 
@@ -83,6 +87,7 @@ fn buildFeatureSummary(
     if (cfg.enable_intl_phone) try appendFeature(&features, allocator, "intl-phone");
     if (cfg.enable_dates) try appendFeature(&features, allocator, "dates");
     if (cfg.enable_addresses) try appendFeature(&features, allocator, "addresses");
+    if (cfg.enable_fax) try appendFeature(&features, allocator, "fax");
     if (cfg.enable_accounts) try appendFeature(&features, allocator, "accounts");
     if (cfg.enable_licenses) try appendFeature(&features, allocator, "licenses");
     if (cfg.enable_urls) try appendFeature(&features, allocator, "urls");
@@ -389,6 +394,7 @@ pub fn main() !void {
             ef,
             cfg.fuzzy_threshold,
             1,
+            &log,
             allocator,
         ) catch {
             std.process.exit(1);
@@ -425,6 +431,7 @@ pub fn main() !void {
             &empty_names,
             cfg.fuzzy_threshold,
             1,
+            &log,
             allocator,
         ) catch {
             log.err("empty_entity_set_failed", null);
@@ -460,8 +467,20 @@ pub fn main() !void {
         });
     }
 
+    var vault_instance: ?vault_mod.VaultBackend = null;
     var hasher_instance: ?hasher_mod.Hasher = null;
-    defer if (hasher_instance) |*h| h.deinit();
+    defer {
+        // Hasher does NOT own the vault — deinit only frees hasher-internal state.
+        if (hasher_instance) |*h| h.deinit();
+        // Vault is owned by main and freed here.
+        if (vault_instance) |*v| {
+            switch (v.*) {
+                .memory => |m| m.vaultInterface().deinit(),
+                .file => |f| f.vaultInterface().deinit(),
+                .external => |e| e.vaultInterface().deinit(),
+            }
+        }
+    }
 
     // Only create a hasher when an explicit key is provided or the schema
     // actually contains HASH-action fields. This avoids unnecessary
@@ -471,9 +490,12 @@ pub fn main() !void {
         (if (schema_instance) |*s| s.hasHashFields() else false);
 
     if (needs_hasher) {
+        // 1. Resolve the HMAC key bytes first — FileVault needs them for encryption.
+        var resolved_key_hex: ?[]const u8 = null;
+        var exec_output_owned: ?[]u8 = null;
+        defer if (exec_output_owned) |eo| allocator.free(eo);
+
         if (cfg.hash_key_exec) |cmd| {
-            // --- hash-key-exec: run a shell command to obtain the HMAC key ---
-            // SECURITY: only use with trusted, operator-controlled config sources.
             const argv = if (builtin.os.tag == .windows)
                 &[_][]const u8{ "cmd.exe", "/c", cmd }
             else
@@ -481,46 +503,107 @@ pub fn main() !void {
 
             var child = std.process.Child.init(argv, allocator);
             child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Inherit; // surface command errors to the operator
+            child.stderr_behavior = .Inherit;
             child.spawn() catch |err| {
                 std.debug.print("error: failed to spawn hash-key-exec command '{s}': {}\n", .{ cmd, err });
                 std.process.exit(1);
             };
-            const exec_output = child.stdout.?.readToEndAlloc(allocator, 256) catch |err| {
+            exec_output_owned = child.stdout.?.readToEndAlloc(allocator, 256) catch |err| {
                 std.debug.print("error: failed to read hash-key-exec output: {}\n", .{err});
                 std.process.exit(1);
             };
-            defer allocator.free(exec_output);
             _ = child.wait() catch {};
+            resolved_key_hex = std.mem.trim(u8, exec_output_owned.?, " \t\r\n");
+        } else if (cfg.hash_key_file) |kf| {
+            // Read the key file to get the hex string (reuse Hasher.initFromFile
+            // later, but we need the raw bytes for FileVault too).
+            resolved_key_hex = kf; // sentinal: initFromFile path handled below
+        } else {
+            resolved_key_hex = cfg.hash_key; // may be null → auto-generated
+        }
 
-            const key_hex = std.mem.trim(u8, exec_output, " \t\r\n");
-            hasher_instance = hasher_mod.Hasher.init(key_hex, allocator) catch |err| {
+        // Parse or auto-generate the 32-byte key for vault encryption.
+        // The Hasher parses the same hex string internally, so we derive
+        // the raw bytes here for the FileVault encryption key.
+        var vault_key: [32]u8 = undefined;
+        const have_hex = resolved_key_hex != null and cfg.hash_key_file == null;
+        var vault_key_from_hex = false;
+
+        if (have_hex) {
+            if (resolved_key_hex) |hex| {
+                if (hex.len == 64) {
+                    if (std.fmt.hexToBytes(&vault_key, hex)) |_| {
+                        vault_key_from_hex = true;
+                    } else |_| {
+                        // Invalid hex chars — Hasher.init will also reject this
+                    }
+                }
+            }
+        }
+
+        if (!vault_key_from_hex) {
+            // Auto-generate — either no hex key provided, key-file path
+            // (Hasher reads it internally), or hex decode failed.
+            std.crypto.random.bytes(&vault_key);
+        }
+
+        // 2. Initialize the correct Vault backend
+        switch (cfg.vault_backend) {
+            .memory => {
+                vault_instance = .{ .memory = memory_vault_mod.MemoryVault.init(allocator) catch |err| {
+                    std.debug.print("error: failed to initialize memory vault: {}\n", .{err});
+                    std.process.exit(1);
+                } };
+            },
+            .file => {
+                vault_instance = .{ .file = file_vault_mod.FileVault.init(allocator, cfg.vault_file_path.?, vault_key) catch |err| {
+                    std.debug.print("error: failed to initialize file vault: {}\n", .{err});
+                    std.process.exit(1);
+                } };
+            },
+            .external => {
+                vault_instance = .{ .external = external_vault_mod.ExternalVault.init(allocator) catch |err| {
+                    std.debug.print("error: failed to initialize external vault: {}\n", .{err});
+                    std.process.exit(1);
+                } };
+            },
+        }
+
+        const vault_iface = switch (vault_instance.?) {
+            .memory => |m| m.vaultInterface(),
+            .file => |f| f.vaultInterface(),
+            .external => |e| e.vaultInterface(),
+        };
+
+        // 3. Initialize the Hasher with the resolved key and vault interface
+        const key_source: []const u8 = if (cfg.hash_key_exec != null) "exec" else if (cfg.hash_key_file != null) "file" else if (cfg.hash_key != null) "cli" else "auto";
+
+        if (cfg.hash_key_exec != null) {
+            hasher_instance = hasher_mod.Hasher.init(resolved_key_hex, vault_iface, allocator) catch |err| {
                 std.debug.print("error: hash-key-exec output is not a valid 64-char hex key: {}\n", .{err});
                 std.process.exit(1);
             };
-            log.log(.info, "hasher_initialized", null, &.{
-                .{ .key = "key_source", .value = .{ .string = "exec" } },
-                .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
-            });
         } else if (cfg.hash_key_file) |kf| {
-            hasher_instance = hasher_mod.Hasher.initFromFile(kf, allocator) catch |err| {
+            hasher_instance = hasher_mod.Hasher.initFromFile(kf, vault_iface, allocator) catch |err| {
                 std.debug.print("error: failed to load hash key file: {}\n", .{err});
                 std.process.exit(1);
             };
-            log.log(.info, "hasher_initialized", null, &.{
-                .{ .key = "key_source", .value = .{ .string = "file" } },
-                .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
-            });
         } else {
-            hasher_instance = hasher_mod.Hasher.init(cfg.hash_key, allocator) catch |err| {
+            hasher_instance = hasher_mod.Hasher.init(cfg.hash_key, vault_iface, allocator) catch |err| {
                 std.debug.print("error: failed to initialise hasher: {}\n", .{err});
                 std.process.exit(1);
             };
-            log.log(.info, "hasher_initialized", null, &.{
-                .{ .key = "key_source", .value = .{ .string = if (cfg.hash_key != null) "cli" else "auto" } },
-                .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
-            });
         }
+
+        log.log(.info, "hasher_initialized", null, &.{
+            .{ .key = "key_source", .value = .{ .string = key_source } },
+            .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
+            .{ .key = "vault_backend", .value = .{ .string = cfg.vault_backend.asStr() } },
+        });
+    }
+
+    if (hasher_instance) |*h| {
+        h.setObservability(&observability);
     }
 
     // --- TLS setup ---

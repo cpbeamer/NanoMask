@@ -1,42 +1,50 @@
 const std = @import("std");
+const vault = @import("../vault/vault.zig");
 
 /// Deterministic HMAC-SHA256 pseudonymization for HASH-mode fields.
 /// Generates stable `PSEUDO_<16hex>` tokens from input values using a session key,
-/// and maintains a reverse map for unhashing on the response path.
+/// and uses a Vault to maintain a reverse map for unhashing on the response path.
 pub const Hasher = struct {
     session_key: [32]u8,
-    /// Maps pseudonym (owned []u8) → original (owned []u8) for response-path reversal.
-    /// Capped at `max_reverse_entries` to prevent unbounded memory growth.
-    reverse_map: std.StringHashMapUnmanaged([]u8),
+    /// Backing store for token -> original mappings.
+    vault_inst: vault.Vault,
     allocator: std.mem.Allocator,
-    /// NMV3-015: operator metrics for scaling observability
+    observability: ?*@import("../infra/observability.zig").Observability = null,
+    
+    /// Metrics for observability
+    store_count: u64 = 0,
+    lookup_count: u64 = 0,
     miss_count: u64 = 0,
-    /// Counts the number of full eviction cycles (calls to evictAll), not individual entries.
     eviction_cycle_count: u64 = 0,
 
-    /// Maximum number of reverse-map entries before eviction.
-    /// At ~40 bytes per entry overhead, 100K entries ≈ 4 MB worst-case.
+    /// Optional cap on vault size before forced eviction to protect memory.
+    /// External vaults might handle mapping limits implicitly, but for MemoryVault
+    /// we want to prevent unbounded growth.
     const max_reverse_entries: usize = 100_000;
 
     pub const HasherStats = struct {
-        reverse_map_size: usize,
+        store_count: u64,
+        lookup_count: u64,
         miss_count: u64,
-        /// Number of full eviction cycles. Each cycle clears the entire reverse map.
-        /// A single cycle may evict up to max_reverse_entries tokens.
         eviction_cycle_count: u64,
     };
 
     /// Return current operator-facing stats.
     pub fn stats(self: *const Hasher) HasherStats {
         return .{
-            .reverse_map_size = self.reverse_map.count(),
+            .store_count = self.store_count,
+            .lookup_count = self.lookup_count,
             .miss_count = self.miss_count,
             .eviction_cycle_count = self.eviction_cycle_count,
         };
     }
 
+    pub fn setObservability(self: *Hasher, obs: *@import("../infra/observability.zig").Observability) void {
+        self.observability = obs;
+    }
+
     /// Initialize with an explicit key or auto-generate a random one.
-    pub fn init(key_hex: ?[]const u8, allocator: std.mem.Allocator) !Hasher {
+    pub fn init(key_hex: ?[]const u8, vault_inst: vault.Vault, allocator: std.mem.Allocator) !Hasher {
         var key: [32]u8 = undefined;
 
         if (key_hex) |hex| {
@@ -58,13 +66,13 @@ pub const Hasher = struct {
 
         return .{
             .session_key = key,
-            .reverse_map = .empty,
+            .vault_inst = vault_inst,
             .allocator = allocator,
         };
     }
 
     /// Load key from a file (reads first 64 hex chars).
-    pub fn initFromFile(path: []const u8, allocator: std.mem.Allocator) !Hasher {
+    pub fn initFromFile(path: []const u8, vault_inst: vault.Vault, allocator: std.mem.Allocator) !Hasher {
         const file = std.fs.cwd().openFile(path, .{}) catch |err| {
             std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ path, @errorName(err) });
             return error.HashKeyFileNotFound;
@@ -87,16 +95,12 @@ pub const Hasher = struct {
             return error.InvalidHashKey;
         }
 
-        return init(hex_str[0..64], allocator);
+        return init(hex_str[0..64], vault_inst, allocator);
     }
 
+    // Hasher does NOT own the vault — the caller (main.zig) manages its lifetime.
     pub fn deinit(self: *Hasher) void {
-        var it = self.reverse_map.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.reverse_map.deinit(self.allocator);
+        _ = self;
     }
 
     /// Produce a deterministic pseudonym for the given value.
@@ -121,42 +125,43 @@ pub const Hasher = struct {
         const token: []u8 = try std.fmt.allocPrint(self.allocator, "PSEUDO_{s}", .{hex_buf});
         errdefer self.allocator.free(token);
 
-        // Evict BEFORE inserting. Evicting after would free the just-inserted
-        // key, making gop.key_ptr.* a dangling pointer on the return below.
-        // Deterministic hashing means the same inputs re-populate the map on
-        // next occurrence, so a pre-insertion evict loses nothing.
-        if (self.reverse_map.count() >= max_reverse_entries) {
+        // Evict before inserting if we've exceeded the safety cap.
+        // Deterministic hashing means the same inputs re-populate on next occurrence.
+        if (self.store_count >= max_reverse_entries) {
             self.evictAll();
         }
 
-        // Store reverse mapping if not already present
-        const gop = try self.reverse_map.getOrPut(self.allocator, token);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = try self.allocator.dupe(u8, original);
-        } else {
-            // Token already mapped — free the duplicate token
-            self.allocator.free(token);
-        }
+        // Store in vault — count success, log failures via observability
+        self.vault_inst.store(token, original) catch {
+            // Surface the failure but don't crash the proxy
+            self.miss_count += 1;
+            return token;
+        };
+        self.store_count += 1;
+        if (self.observability) |obs| obs.recordVaultStore();
 
-        // Return a caller-owned copy. The internal map retains its own copy.
-        return try self.allocator.dupe(u8, gop.key_ptr.*);
+        // Return the token (since store handles its own copies if needed,
+        // and caller owns the returned token)
+        return token;
     }
 
     /// Look up the original value for a pseudonym token.
-    pub fn unhash(self: *const Hasher, token: []const u8) ?[]const u8 {
-        return if (self.reverse_map.get(token)) |v| v else null;
+    pub fn unhash(self: *Hasher, token: []const u8) ?[]const u8 {
+        self.lookup_count += 1;
+        if (self.vault_inst.lookup(token) catch null) |v| {
+            if (self.observability) |obs| obs.recordVaultLookup(true);
+            return v;
+        } else {
+            self.miss_count += 1;
+            if (self.observability) |obs| obs.recordVaultLookup(false);
+            return null;
+        }
     }
 
-    /// Evict all entries from the reverse map to reclaim memory.
-    /// Called automatically when the map exceeds `max_reverse_entries`.
-    fn evictAll(self: *Hasher) void {
+    /// Evict all entries from the vault to reclaim memory or rotate keys.
+    pub fn evictAll(self: *Hasher) void {
         self.eviction_cycle_count += 1;
-        var it = self.reverse_map.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.reverse_map.clearRetainingCapacity();
+        self.vault_inst.evictAll() catch {};
     }
 
     /// Scan a JSON response for PSEUDO_ tokens and replace them with originals.
@@ -184,10 +189,8 @@ pub const Hasher = struct {
                         try result.appendSlice(allocator, original);
                         i += token_len;
                         continue;
-                    } else {
-                        // NMV3-015: track restore misses for operator diagnostics.
-                        self.miss_count += 1;
-                    }
+                    } 
+                    // miss_count is now incremented inside unhash()
                 }
             }
             try result.append(allocator, input[i]);
@@ -225,7 +228,9 @@ pub const Hasher = struct {
 // ===========================================================================
 
 test "hasher - deterministic output" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     const t1 = try h.hash("John Doe");
@@ -242,7 +247,9 @@ test "hasher - deterministic output" {
 }
 
 test "hasher - different inputs produce different tokens" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     const t1 = try h.hash("John Doe");
@@ -254,7 +261,9 @@ test "hasher - different inputs produce different tokens" {
 }
 
 test "hasher - round-trip hash then unhash" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     const original = "Patient Zero";
@@ -267,7 +276,9 @@ test "hasher - round-trip hash then unhash" {
 }
 
 test "hasher - unhash unknown token returns null" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     try std.testing.expectEqual(@as(?[]const u8, null), h.unhash("PSEUDO_0000000000000000"));
@@ -276,10 +287,14 @@ test "hasher - unhash unknown token returns null" {
 test "hasher - explicit key produces consistent results" {
     const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    var h1 = try Hasher.init(key_hex, std.testing.allocator);
+    const mem_vault1 = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault1.vaultInterface().deinit();
+    var h1 = try Hasher.init(key_hex, mem_vault1.vaultInterface(), std.testing.allocator);
     defer h1.deinit();
 
-    var h2 = try Hasher.init(key_hex, std.testing.allocator);
+    const mem_vault2 = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault2.vaultInterface().deinit();
+    var h2 = try Hasher.init(key_hex, mem_vault2.vaultInterface(), std.testing.allocator);
     defer h2.deinit();
 
     const t1 = try h1.hash("test value");
@@ -291,7 +306,9 @@ test "hasher - explicit key produces consistent results" {
 }
 
 test "hasher - unhashJson replaces tokens in response" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     const token = try h.hash("John Doe");
@@ -308,7 +325,9 @@ test "hasher - unhashJson replaces tokens in response" {
 }
 
 test "hasher - unhashJson with no tokens returns copy" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     const input = "No pseudonyms here at all.";
@@ -319,13 +338,17 @@ test "hasher - unhashJson with no tokens returns copy" {
 }
 
 test "hasher - invalid key length" {
-    const result = Hasher.init("tooshort", std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    const result = Hasher.init("tooshort", mem_vault.vaultInterface(), std.testing.allocator);
     try std.testing.expectError(error.InvalidHashKey, result);
+    mem_vault.vaultInterface().deinit();
 }
 
 test "hasher - keyHex returns correct representation" {
     const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    var h = try Hasher.init(key_hex, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(key_hex, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     const hex = h.keyHex();
@@ -333,7 +356,9 @@ test "hasher - keyHex returns correct representation" {
 }
 
 test "hasher - eviction cycle increments counter and clears map" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     // Populate a few entries
@@ -342,14 +367,14 @@ test "hasher - eviction cycle increments counter and clears map" {
     const t2 = try h.hash("Bob");
     defer std.testing.allocator.free(t2);
 
-    try std.testing.expectEqual(@as(usize, 2), h.stats().reverse_map_size);
+    try std.testing.expectEqual(@as(u64, 2), h.stats().store_count);
+    // h.stats() doesn't have reverse_map_size anymore, check store count instead
     try std.testing.expectEqual(@as(u64, 0), h.stats().eviction_cycle_count);
 
     // Trigger an eviction cycle directly (private, accessible from same file)
     h.evictAll();
 
-    // Map should be empty and cycle counter incremented
-    try std.testing.expectEqual(@as(usize, 0), h.stats().reverse_map_size);
+    // Stats
     try std.testing.expectEqual(@as(u64, 1), h.stats().eviction_cycle_count);
 
     // After eviction, lookups for previously known tokens should miss
@@ -357,7 +382,9 @@ test "hasher - eviction cycle increments counter and clears map" {
 }
 
 test "hasher - miss_count increments on unknown token in unhashJson" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), h.stats().miss_count);
@@ -373,7 +400,9 @@ test "hasher - miss_count increments on unknown token in unhashJson" {
 }
 
 test "hasher - multiple unique values" {
-    var h = try Hasher.init(null, std.testing.allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var h = try Hasher.init(null, mem_vault.vaultInterface(), std.testing.allocator);
     defer h.deinit();
 
     var tokens: [100][]u8 = undefined;

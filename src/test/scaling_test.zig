@@ -98,16 +98,18 @@ test "scaling - 5000 entity EntityMap builds successfully" {
 test "scaling - hasher stats track misses" {
     const allocator = std.testing.allocator;
 
-    var hasher = try hasher_mod.Hasher.init(null, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var hasher = try hasher_mod.Hasher.init(null, mem_vault.vaultInterface(), allocator);
     defer hasher.deinit();
 
     // Hash a value to populate the reverse map
     const token = try hasher.hash("original_value");
     defer allocator.free(token);
 
-    // Stats should show 1 entry, 0 misses
+    // Stats should show 1 store, 0 misses
     const s1 = hasher.stats();
-    try std.testing.expectEqual(@as(usize, 1), s1.reverse_map_size);
+    try std.testing.expectEqual(@as(u64, 1), s1.store_count);
     try std.testing.expectEqual(@as(u64, 0), s1.miss_count);
 
     // Unhash with a valid-looking but unknown PSEUDO_ token — should miss
@@ -125,12 +127,14 @@ test "scaling - hasher eviction_cycle_count starts at zero" {
     // the stats surface via the public API under normal operating conditions.
     const allocator = std.testing.allocator;
 
-    var hasher = try hasher_mod.Hasher.init(null, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var hasher = try hasher_mod.Hasher.init(null, mem_vault.vaultInterface(), allocator);
     defer hasher.deinit();
 
     // Before any hashing, all stats should be zero
     const s0 = hasher.stats();
-    try std.testing.expectEqual(@as(usize, 0), s0.reverse_map_size);
+    try std.testing.expectEqual(@as(u64, 0), s0.store_count);
     try std.testing.expectEqual(@as(u64, 0), s0.miss_count);
     try std.testing.expectEqual(@as(u64, 0), s0.eviction_cycle_count);
 
@@ -138,7 +142,7 @@ test "scaling - hasher eviction_cycle_count starts at zero" {
     const tok = try hasher.hash("SomePatient");
     defer allocator.free(tok);
     const s1 = hasher.stats();
-    try std.testing.expectEqual(@as(usize, 1), s1.reverse_map_size);
+    try std.testing.expectEqual(@as(u64, 1), s1.store_count);
     try std.testing.expectEqual(@as(u64, 0), s1.eviction_cycle_count);
 }
 
@@ -149,7 +153,8 @@ test "scaling - hasher eviction_cycle_count starts at zero" {
 test "scaling - hasher handles 1000 unique tokens" {
     const allocator = std.testing.allocator;
 
-    var hasher = try hasher_mod.Hasher.init(null, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    var hasher = try hasher_mod.Hasher.init(null, mem_vault.vaultInterface(), allocator);
     defer hasher.deinit();
 
     var tokens = std.ArrayListUnmanaged([]u8).empty;
@@ -165,8 +170,8 @@ test "scaling - hasher handles 1000 unique tokens" {
         try tokens.append(allocator, token);
     }
 
-    // Should have 1000 entries (no collisions expected with HMAC-SHA256)
-    try std.testing.expectEqual(@as(usize, 1000), hasher.stats().reverse_map_size);
+    // Should have 1000 stores (no collisions expected with HMAC-SHA256)
+    try std.testing.expectEqual(@as(u64, 1000), hasher.stats().store_count);
 
     // Unhash the first and last — should restore correctly
     const first_original = hasher.unhash(tokens.items[0]);

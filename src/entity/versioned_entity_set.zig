@@ -143,6 +143,7 @@ pub fn loadSnapshotFromFile(
     path: []const u8,
     fuzzy_threshold: f32,
     version: u32,
+    logger: anytype,
     allocator: std.mem.Allocator,
 ) !*EntitySnapshot {
     var file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -177,8 +178,16 @@ pub fn loadSnapshotFromFile(
         allocator.free(loaded_names);
     }
 
+    var timer = std.time.Timer.start() catch unreachable;
+
     var em = try entity_mask.EntityMap.init(allocator, loaded_names);
     errdefer em.deinit();
+    
+    // Calculate approximate memory used by the automatons
+    const node_size = @sizeOf(entity_mask.AhoCorasick.Node);
+    const automaton_memory_bytes = 
+        (em.forward_ac.nodes.capacity * node_size) + 
+        (em.reverse_ac.nodes.capacity * node_size);
 
     var fm = try fuzzy_match.FuzzyMatcher.init(
         allocator,
@@ -187,6 +196,18 @@ pub fn loadSnapshotFromFile(
         fuzzy_threshold,
     );
     errdefer fm.deinit();
+
+    const build_time_ms = timer.read() / std.time.ns_per_ms;
+
+    if (logger != null) {
+        logger.?.log(.info, "automaton_built", null, &.{
+            .{ .key = "entity_set_size", .value = .{ .uint = loaded_names.len } },
+            .{ .key = "automaton_build_time_ms", .value = .{ .uint = build_time_ms } },
+            .{ .key = "automaton_memory_bytes", .value = .{ .uint = automaton_memory_bytes } },
+            .{ .key = "source", .value = .{ .string = path } },
+            .{ .key = "version", .value = .{ .uint = version } },
+        });
+    }
 
     const snapshot = try allocator.create(EntitySnapshot);
     snapshot.* = .{
@@ -208,6 +229,7 @@ pub fn loadSnapshotFromNames(
     names: []const []const u8,
     fuzzy_threshold: f32,
     version: u32,
+    logger: anytype,
     allocator: std.mem.Allocator,
 ) !*EntitySnapshot {
     // Dupe all names so the snapshot owns its data
@@ -223,8 +245,16 @@ pub fn loadSnapshotFromNames(
         initialized = i + 1;
     }
 
+    var timer = std.time.Timer.start() catch unreachable;
+
     var em = try entity_mask.EntityMap.init(allocator, loaded_names);
     errdefer em.deinit();
+    
+    // Calculate approximate memory used by the automatons
+    const node_size = @sizeOf(entity_mask.AhoCorasick.Node);
+    const automaton_memory_bytes = 
+        (em.forward_ac.nodes.capacity * node_size) + 
+        (em.reverse_ac.nodes.capacity * node_size);
 
     var fm = try fuzzy_match.FuzzyMatcher.init(
         allocator,
@@ -233,6 +263,18 @@ pub fn loadSnapshotFromNames(
         fuzzy_threshold,
     );
     errdefer fm.deinit();
+
+    const build_time_ms = timer.read() / std.time.ns_per_ms;
+
+    if (logger != null) {
+        logger.?.log(.info, "automaton_built", null, &.{
+            .{ .key = "entity_set_size", .value = .{ .uint = loaded_names.len } },
+            .{ .key = "automaton_build_time_ms", .value = .{ .uint = build_time_ms } },
+            .{ .key = "automaton_memory_bytes", .value = .{ .uint = automaton_memory_bytes } },
+            .{ .key = "source", .value = .{ .string = "memory" } },
+            .{ .key = "version", .value = .{ .uint = version } },
+        });
+    }
 
     const snapshot = try allocator.create(EntitySnapshot);
     snapshot.* = .{
@@ -258,6 +300,7 @@ test "EntitySnapshot - acquire and release" {
         "entities.txt",
         0.80,
         1,
+        null,
         allocator,
     );
     // snapshot starts with ref_count = 1
@@ -277,7 +320,7 @@ test "EntitySnapshot - acquire and release" {
 test "VersionedEntitySet - acquire returns current snapshot" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
     var set = VersionedEntitySet.init(snapshot);
     defer set.deinit();
 
@@ -290,11 +333,11 @@ test "VersionedEntitySet - acquire returns current snapshot" {
 test "VersionedEntitySet - swap installs new version" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
-    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, allocator);
+    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, null, allocator);
     set.swap(snap2);
 
     const acquired = set.acquire();
@@ -306,13 +349,13 @@ test "VersionedEntitySet - swap installs new version" {
 test "VersionedEntitySet - version monotonicity across multiple swaps" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
     var last_version: u32 = 1;
     for (2..6) |v| {
-        const new_snap = try loadSnapshotFromFile("entities.txt", 0.80, @intCast(v), allocator);
+        const new_snap = try loadSnapshotFromFile("entities.txt", 0.80, @intCast(v), null, allocator);
         set.swap(new_snap);
 
         const acquired = set.acquire();
@@ -327,7 +370,7 @@ test "VersionedEntitySet - version monotonicity across multiple swaps" {
 test "VersionedEntitySet - old snapshot survives while referenced" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
@@ -335,7 +378,7 @@ test "VersionedEntitySet - old snapshot survives while referenced" {
     const held = set.acquire();
 
     // Swap to a new version — snap1 should NOT be freed (held still references it)
-    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, allocator);
+    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, null, allocator);
     set.swap(snap2);
 
     // The held snapshot should still be valid and usable
@@ -352,7 +395,7 @@ test "VersionedEntitySet - old snapshot survives while referenced" {
 test "loadSnapshotFromFile - loads entities correctly" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
     defer _ = snapshot.release();
 
     // entities.txt has: Jane Smith, John Doe, Dr. Johnson, another name
@@ -367,14 +410,14 @@ test "loadSnapshotFromFile - loads entities correctly" {
 
 test "loadSnapshotFromFile - nonexistent file returns error" {
     const allocator = std.testing.allocator;
-    const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, 1, allocator);
+    const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, 1, null, allocator);
     try std.testing.expectError(error.FileNotFound, result);
 }
 
 test "loadSnapshotFromNames - builds valid snapshot" {
     const allocator = std.testing.allocator;
     const names = [_][]const u8{ "Alice", "Bob", "Charlie" };
-    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, null, allocator);
     defer _ = snapshot.release();
 
     try std.testing.expectEqual(@as(usize, 3), snapshot.loaded_names.len);
@@ -388,7 +431,7 @@ test "loadSnapshotFromNames - builds valid snapshot" {
 test "loadSnapshotFromNames - empty list produces valid snapshot" {
     const allocator = std.testing.allocator;
     const names = [_][]const u8{};
-    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, null, allocator);
     defer _ = snapshot.release();
 
     try std.testing.expectEqual(@as(usize, 0), snapshot.loaded_names.len);

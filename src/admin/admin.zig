@@ -905,6 +905,7 @@ fn rebuildAndSwap(
         names,
         admin_config.fuzzy_threshold,
         new_version,
+        logger,
         allocator,
     );
 

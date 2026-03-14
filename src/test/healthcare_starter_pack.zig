@@ -192,7 +192,9 @@ fn applyStarterCase(test_allocator: std.mem.Allocator, starter_case: StarterCase
         .ctx_ptr = @ptrCast(&runtime),
     };
 
-    var hasher = try hasher_mod.Hasher.initFromFile(starter_hash_key_path, test_allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(test_allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var hasher = try hasher_mod.Hasher.initFromFile(starter_hash_key_path, mem_vault.vaultInterface(), test_allocator);
     defer hasher.deinit();
 
     const hasher_iface = json_redactor.HasherInterface{

@@ -64,6 +64,22 @@ fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{d}", .{ alias_prefix, index + 1 });
 }
 
+/// Generate legacy V3 aliases for backward-compatible HASH restore: Entity_A .. Entity_ZZ.
+/// This matches the exact 702-entity logic used previously. If index exceeds 701,
+/// this returns a memory error (which is caught and handled during initialization).
+fn generateLegacyAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
+    const letters = 26;
+    if (index < letters) {
+        return std.fmt.allocPrint(allocator, "Entity_{c}", .{@as(u8, @intCast(index)) + 'A'});
+    } else if (index < letters * letters + letters) {
+        const i = index - letters;
+        const first: u8 = @intCast(i / letters);
+        const second: u8 = @intCast(i % letters);
+        return std.fmt.allocPrint(allocator, "Entity_{c}{c}", .{ first + 'A', second + 'A' });
+    }
+    return error.LegacyIndexOutOfBounds;
+}
+
 // ---------------------------------------------------------------------------
 // Aho-Corasick Automaton
 // ---------------------------------------------------------------------------
@@ -105,7 +121,7 @@ pub const AhoCorasick = struct {
         break :blk map;
     };
 
-    const Node = struct {
+    pub const Node = struct {
         children: [alphabet_size]u32,
         failure: u32,
         output: ?usize, // pattern index, null if non-accepting
@@ -457,6 +473,7 @@ pub const EntityMap = struct {
     aliases: [][]u8,
     alias_const_slices: []const []const u8,
     name_const_slices: []const []const u8,
+    reverse_name_slices: []const []const u8,
     forward_ac: AhoCorasick,
     reverse_ac: AhoCorasick,
     allocator: std.mem.Allocator,
@@ -471,12 +488,26 @@ pub const EntityMap = struct {
 
         const name_lengths = try allocator.alloc(usize, n);
         defer allocator.free(name_lengths);
-        const alias_lengths = try allocator.alloc(usize, n);
-        defer allocator.free(alias_lengths);
 
         // Track how many elements have been fully initialized for errdefer cleanup.
         var names_initialized: usize = 0;
         var aliases_initialized: usize = 0;
+
+        // The reverse automaton must handle *both* the new numeric alias (Entity_1)
+        // AND the legacy alphabetic alias (Entity_A) for the same name, so it can
+        // successfully unmask stored payloads from previous versions.
+        var reverse_aliases: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (reverse_aliases.items) |a| allocator.free(a);
+            reverse_aliases.deinit(allocator);
+        }
+        var reverse_alias_lengths: std.ArrayListUnmanaged(usize) = .empty;
+        defer reverse_alias_lengths.deinit(allocator);
+
+        // The reverse AC output is a pattern index. We need a map from the
+        // reverse pattern index back to the underlying original name string.
+        var reverse_alias_to_name: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer reverse_alias_to_name.deinit(allocator);
 
         errdefer {
             for (0..names_initialized) |j| allocator.free(names[j]);
@@ -487,15 +518,34 @@ pub const EntityMap = struct {
             names[i] = try allocator.dupe(u8, name);
             names_initialized = i + 1;
             name_lengths[i] = name.len;
+            
+            // Generate the primary (new) numeric alias
             aliases[i] = try generateAlias(allocator, i);
             aliases_initialized = i + 1;
-            alias_lengths[i] = aliases[i].len;
+            
+            // Add primary alias to reverse mapping
+            try reverse_aliases.append(allocator, try allocator.dupe(u8, aliases[i]));
+            try reverse_alias_lengths.append(allocator, aliases[i].len);
+            try reverse_alias_to_name.append(allocator, names[i]);
+
+            // If within legacy limits (<702), also register the legacy alias for unmasking
+            if (generateLegacyAlias(allocator, i)) |legacy_alias| {
+                try reverse_aliases.append(allocator, legacy_alias);
+                try reverse_alias_lengths.append(allocator, legacy_alias.len);
+                try reverse_alias_to_name.append(allocator, names[i]);
+            } else |_| {
+                // Ignore LegacyIndexOutOfBounds for > 702 entities
+            }
         }
 
         // Pre-build const slices to avoid per-call allocation in mask()/unmask().
         const alias_const_slices = try allocator.alloc([]const u8, n);
         errdefer allocator.free(alias_const_slices);
         for (aliases, 0..) |alias, i| alias_const_slices[i] = alias;
+
+        const reverse_name_slices = try allocator.alloc([]const u8, reverse_alias_to_name.items.len);
+        errdefer allocator.free(reverse_name_slices);
+        for (reverse_alias_to_name.items, 0..) |name, i| reverse_name_slices[i] = name;
 
         const name_const_slices = try allocator.alloc([]const u8, n);
         errdefer allocator.free(name_const_slices);
@@ -510,16 +560,21 @@ pub const EntityMap = struct {
 
         var reverse_ac = try AhoCorasick.init(allocator);
         errdefer reverse_ac.deinit();
-        for (aliases, 0..) |alias, i| {
+        for (reverse_aliases.items, 0..) |alias, i| {
             try reverse_ac.addPattern(alias, i);
         }
-        try reverse_ac.build(alias_lengths);
+        try reverse_ac.build(reverse_alias_lengths.items);
+
+        // Free the temporarily allocated reverse_aliases since the AC built successfully
+        for (reverse_aliases.items) |a| allocator.free(a);
+        reverse_aliases.deinit(allocator);
 
         return EntityMap{
             .names = names,
             .aliases = aliases,
             .alias_const_slices = alias_const_slices,
             .name_const_slices = name_const_slices,
+            .reverse_name_slices = reverse_name_slices,
             .forward_ac = forward_ac,
             .reverse_ac = reverse_ac,
             .allocator = allocator,
@@ -533,6 +588,7 @@ pub const EntityMap = struct {
         self.allocator.free(self.aliases);
         self.allocator.free(self.alias_const_slices);
         self.allocator.free(self.name_const_slices);
+        self.allocator.free(self.reverse_name_slices);
         self.forward_ac.deinit();
         self.reverse_ac.deinit();
     }
@@ -676,7 +732,7 @@ pub const EntityMap = struct {
 
     /// Replace aliases back to real names.
     pub fn unmask(self: *const EntityMap, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-        return replaceAll(&self.reverse_ac, input, self.name_const_slices, allocator);
+        return replaceAll(&self.reverse_ac, input, self.reverse_name_slices, allocator);
     }
 
     /// Read-only access to raw name strings for use by the fuzzy matcher.
@@ -827,7 +883,7 @@ pub const EntityMap = struct {
         const result = try replaceAllBounded(
             &self.reverse_ac,
             combined,
-            self.name_const_slices,
+            self.reverse_name_slices,
             safe_end,
             &consumed,
             allocator,
@@ -1044,6 +1100,31 @@ test "EntityMap - unmask round trip" {
     const unmasked = try em.unmask(masked, allocator);
     defer allocator.free(unmasked);
     try std.testing.expectEqualStrings(original, unmasked);
+}
+
+test "EntityMap - unmask legacy aliases" {
+    const allocator = std.testing.allocator;
+    // Index 0 -> legacy Entity_A, new Entity_1
+    // Index 26 -> legacy Entity_AA, new Entity_27
+    var em = try EntityMap.init(allocator, &.{ "First", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Last" });
+    defer em.deinit();
+
+    // Verify both aliases unmask back to the original name successfully
+    const input_new = "Look at Entity_1 and Entity_27";
+    const unmasked_new = try em.unmask(input_new, allocator);
+    defer allocator.free(unmasked_new);
+    try std.testing.expectEqualStrings("Look at First and Last", unmasked_new);
+
+    const input_legacy = "Look at Entity_A and Entity_AA";
+    const unmasked_legacy = try em.unmask(input_legacy, allocator);
+    defer allocator.free(unmasked_legacy);
+    try std.testing.expectEqualStrings("Look at First and Last", unmasked_legacy);
+
+    // Mixed is also fine
+    const input_mixed = "Entity_1 is also Entity_A";
+    const unmasked_mixed = try em.unmask(input_mixed, allocator);
+    defer allocator.free(unmasked_mixed);
+    try std.testing.expectEqualStrings("First is also First", unmasked_mixed);
 }
 
 test "EntityMap - multiple occurrences of same name" {

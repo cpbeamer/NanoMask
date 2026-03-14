@@ -851,8 +851,9 @@ fn evaluateBufferedHash(allocator: std.mem.Allocator, definition: FlowDefinition
     const hasher_mod = @import("../schema/hasher.zig");
     const schema_mod = @import("../schema/schema.zig");
 
-    // Set up a schema with a HASH field and a hasher
-    var hasher = try hasher_mod.Hasher.init(null, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var hasher = try hasher_mod.Hasher.init(null, mem_vault.vaultInterface(), allocator);
     defer hasher.deinit();
 
     // Schema uses INI-like format: key_path = ACTION

@@ -142,6 +142,7 @@ pub const FileWatcher = struct {
             self.path,
             self.fuzzy_threshold,
             new_version,
+            self.logger,
             self.allocator,
         ) catch |err| {
             if (self.logger) |log| {
@@ -218,7 +219,7 @@ test "getFileStat - missing file returns zeroes" {
 test "FileWatcher - start and join lifecycle" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try versioned_entity_set.loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snapshot = try versioned_entity_set.loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
     var set = VersionedEntitySet.init(snapshot);
     defer set.deinit();
 
