@@ -10,6 +10,9 @@ const scanner = @import("../patterns/scanner.zig");
 const schema_mod = @import("../schema/schema.zig");
 const json_redactor = @import("../schema/json_redactor.zig");
 const hasher_mod = @import("../schema/hasher.zig");
+const evaluation_report_mod = @import("evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const PayloadType = evaluation_report_mod.PayloadType;
 
 pub const max_events_per_request: usize = 256;
 
@@ -27,12 +30,31 @@ pub const AuditEmitter = struct {
     emitted: usize = 0,
     dropped: usize = 0,
     limit: usize = max_events_per_request,
+    evaluation_report: ?*EvaluationReport = null,
+    payload_type: PayloadType = .text,
 
     pub fn init(log: *Logger, session_id: []const u8, observability: ?*Observability) AuditEmitter {
         return .{
             .log = log,
             .session_id = session_id,
             .observability = observability,
+        };
+    }
+
+    /// Initialize with an evaluation report for report-only mode match tracking.
+    pub fn initWithReport(
+        log: *Logger,
+        session_id: []const u8,
+        observability: ?*Observability,
+        eval_report: ?*EvaluationReport,
+        payload_type: PayloadType,
+    ) AuditEmitter {
+        return .{
+            .log = log,
+            .session_id = session_id,
+            .observability = observability,
+            .evaluation_report = eval_report,
+            .payload_type = payload_type,
         };
     }
 
@@ -54,6 +76,26 @@ pub const AuditEmitter = struct {
                 null;
 
             if (stage) |s| obs.recordAuditStage(s);
+        }
+
+        // Feed evaluation report when in report-only mode
+        if (self.evaluation_report) |eval_report| {
+            const eval_stage: ?evaluation_report_mod.MatchStage = if (std.mem.eql(u8, event.stage, "entity_mask"))
+                .entity_mask
+            else if (std.mem.eql(u8, event.stage, "ssn"))
+                .ssn
+            else if (std.mem.eql(u8, event.stage, "pattern_library"))
+                .pattern_library
+            else if (std.mem.eql(u8, event.stage, "fuzzy_match"))
+                .fuzzy_match
+            else if (std.mem.eql(u8, event.stage, "schema"))
+                if (!std.mem.eql(u8, event.match_type, "schema_keep")) @as(?evaluation_report_mod.MatchStage, .schema) else null
+            else
+                null;
+
+            if (eval_stage) |es| {
+                eval_report.recordMatch(es, self.payload_type, event.confidence);
+            }
         }
 
         if (!self.log.audit_enabled) return;
@@ -95,6 +137,60 @@ pub fn emitRequestAuditEvents(
     if (!log.audit_enabled and observability == null) return;
 
     var emitter = AuditEmitter.init(log, session_id, observability);
+    defer emitter.finish();
+
+    if (schema) |active_schema| {
+        try emitSchemaAuditEvents(
+            allocator,
+            body,
+            entity_map,
+            fuzzy_matcher,
+            pattern_flags,
+            active_schema,
+            hasher,
+            &emitter,
+        );
+    } else {
+        const redacted = try runTextStages(
+            body,
+            null,
+            .{
+                .entity_mask = true,
+                .ssn = true,
+                .patterns = true,
+                .fuzzy = true,
+            },
+            entity_map,
+            fuzzy_matcher,
+            pattern_flags,
+            &emitter,
+            allocator,
+        );
+        allocator.free(redacted);
+    }
+}
+
+/// Like emitRequestAuditEvents but wires the evaluation report into the emitter
+/// so match events flow into the EvaluationReport. Used by the report-only proxy path.
+pub fn emitRequestAuditEventsWithReport(
+    allocator: std.mem.Allocator,
+    log: *Logger,
+    session_id: []const u8,
+    body: []const u8,
+    entity_map: ?*const entity_mask.EntityMap,
+    fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+    pattern_flags: scanner.PatternFlags,
+    schema: ?*const schema_mod.Schema,
+    hasher: ?*hasher_mod.Hasher,
+    observability: ?*Observability,
+    eval_report: ?*EvaluationReport,
+) !void {
+    if (body.len == 0) return;
+
+    // Determine payload type from content: JSON if schema-aware path is active
+    const payload_type: PayloadType = if (schema != null) .json else .text;
+
+    var emitter = AuditEmitter.initWithReport(log, session_id, observability, eval_report, payload_type);
     defer emitter.finish();
 
     if (schema) |active_schema| {

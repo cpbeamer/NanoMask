@@ -121,6 +121,9 @@ pub const Config = struct {
     hash_key_src: ConfigSource = .default,
     hash_key_file: ?[]const u8 = null,
     hash_key_file_src: ConfigSource = .default,
+    // --- Report-only mode (Phase 2 / NMV3-007) ---
+    report_only: bool = false,
+    report_only_src: ConfigSource = .default,
 
     /// When true, perform a health check probe against the listener and exit.
     /// Wildcard binds probe loopback so container HEALTHCHECK still works.
@@ -164,6 +167,7 @@ pub const Config = struct {
         SchemaFileNotFound,
         InvalidHashKey,
         HashKeyFileNotFound,
+        InvalidReportOnlyFlag,
         UnknownFlag,
         OutOfMemory,
     };
@@ -253,6 +257,7 @@ pub const Config = struct {
         \\  --admin-read-only                   Allow admin visibility but reject runtime entity mutations
         \\  --admin-mutation-rate-limit <n>     Maximum entity mutations per minute (0 disables, default: 60)
         \\  --entity-file-sync                  Write API entity changes back to entity file
+        \\  --report-only                       Detect PII without modifying payloads (evaluation mode, default: disabled)
         \\  --healthcheck                       Probe /healthz on the local listener and exit
         \\  --validate-config                   Validate configuration and print summary without starting the server
         \\  --help                              Print this help message and exit
@@ -563,6 +568,12 @@ pub const Config = struct {
                 std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ value, @errorName(err) });
                 return error.HashKeyFileNotFound;
             }
+        } else if (std.mem.eql(u8, name, "NANOMASK_REPORT_ONLY")) {
+            config.report_only = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_REPORT_ONLY must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidReportOnlyFlag;
+            };
+            config.report_only_src = .env_var;
         }
     }
 
@@ -661,6 +672,7 @@ pub const Config = struct {
             "NANOMASK_SCHEMA_DEFAULT",
             "NANOMASK_HASH_KEY",
             "NANOMASK_HASH_KEY_FILE",
+            "NANOMASK_REPORT_ONLY",
         };
 
         for (env_keys) |key| {
@@ -1093,6 +1105,9 @@ pub const Config = struct {
                     std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ args[i], @errorName(err) });
                     return error.HashKeyFileNotFound;
                 }
+            } else if (std.mem.eql(u8, arg, "--report-only")) {
+                config.report_only = true;
+                config.report_only_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
             } else if (std.mem.eql(u8, arg, "--validate-config")) {

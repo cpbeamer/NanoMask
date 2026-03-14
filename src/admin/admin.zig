@@ -104,7 +104,9 @@ pub const IpAllowlist = struct {
 pub fn isAdminRoute(path: []const u8) bool {
     return std.mem.eql(u8, path, "/_admin/entities") or
         std.mem.startsWith(u8, path, "/_admin/entities?") or
-        std.mem.startsWith(u8, path, "/_admin/entities/");
+        std.mem.startsWith(u8, path, "/_admin/entities/") or
+        std.mem.eql(u8, path, "/_admin/evaluation-report") or
+        std.mem.eql(u8, path, "/_admin/evaluation-report/reset");
 }
 
 /// Handle an admin API request. Returns true if the request was handled
@@ -180,7 +182,7 @@ const RebuildResult = struct {
     entity_count_after: usize,
 };
 
-fn validateBearerToken(auth_value: []const u8, expected: []const u8) bool {
+pub fn validateBearerToken(auth_value: []const u8, expected: []const u8) bool {
     const prefix = "Bearer ";
     if (auth_value.len < prefix.len) return false;
     // Check prefix in constant time to avoid leaking which part failed.

@@ -155,8 +155,12 @@ pub const Schema = struct {
                 };
 
                 const owned_key = try allocator.dupe(u8, key);
-                errdefer allocator.free(owned_key);
-                try schema.fields.put(allocator, owned_key, action);
+                const gop = try schema.fields.getOrPut(allocator, owned_key);
+                if (gop.found_existing) {
+                    // Key already exists in map — free the duplicate we just allocated
+                    allocator.free(owned_key);
+                }
+                gop.value_ptr.* = action;
             }
         }
 

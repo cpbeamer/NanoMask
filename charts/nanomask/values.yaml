@@ -94,6 +94,9 @@ features:
   ipAddress: false
   # -- Redact healthcare identifiers such as MRN, ICD-10, and insurance IDs.
   healthcarePatterns: false
+  # -- Run in report-only mode: detect PII without modifying payloads.
+  # Useful for baseline evaluation against live traffic.
+  reportOnly: false
 
 # -- Optional schema-aware JSON redaction.
 schema:

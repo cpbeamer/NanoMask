@@ -17,6 +17,8 @@ const body_policy = @import("body_policy.zig");
 const shutdown_mod = @import("../infra/shutdown.zig");
 const upstream_client = @import("upstream_client.zig");
 const runtime_model_mod = @import("runtime_model.zig");
+const evaluation_report_mod = @import("../infra/evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
 
 pub const RuntimeModel = runtime_model_mod.RuntimeModel;
 
@@ -47,6 +49,8 @@ pub const ConnectionContext = struct {
     shutdown_state: *shutdown_mod.ShutdownState,
     listener_mode: admin.ListenerMode,
     upstream_timeouts: upstream_client.UpstreamTimeouts,
+    report_only: bool = false,
+    evaluation_report: ?*EvaluationReport = null,
 };
 
 pub const ConnectionHandler = struct {
@@ -298,6 +302,8 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ConnectionContex
             .client_address = connection.address,
             .listener_mode = ctx.listener_mode,
             .upstream_timeouts = ctx.upstream_timeouts,
+            .report_only = ctx.report_only,
+            .evaluation_report = ctx.evaluation_report,
         },
     ) catch |err| {
         ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{

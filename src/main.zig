@@ -23,6 +23,8 @@ const shutdown_mod = @import("infra/shutdown.zig");
 const proxy_server_mod = @import("net/proxy_server.zig");
 const runtime_model_mod = @import("net/runtime_model.zig");
 const upstream_client = @import("net/upstream_client.zig");
+const evaluation_report_mod = @import("infra/evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
 
 var termination_signal_requested = std.atomic.Value(bool).init(false);
 
@@ -113,6 +115,7 @@ pub fn main() !void {
                 "    credit_card   {s}\n" ++
                 "    ip            {s}\n" ++
                 "    healthcare    {s}\n" ++
+                "    report_only   {s}\n" ++
                 "\n" ++
                 "  Admin\n" ++
                 "    admin_api     {s}\n" ++
@@ -134,6 +137,7 @@ pub fn main() !void {
                 if (cfg.enable_credit_card) "enabled" else "disabled",
                 if (cfg.enable_ip) "enabled" else "disabled",
                 if (cfg.enable_healthcare) "enabled" else "disabled",
+                if (cfg.report_only) "enabled" else "disabled",
                 if (cfg.admin_api) "enabled" else "disabled",
                 if (cfg.audit_log) "enabled" else "disabled",
                 @tagName(cfg.log_level),
@@ -185,6 +189,7 @@ pub fn main() !void {
         .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
         .{ .key = "unsupported_request_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_request_body_behavior) } },
         .{ .key = "unsupported_response_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_response_body_behavior) } },
+        .{ .key = "report_only", .value = .{ .boolean = cfg.report_only } },
     });
 
     var admin_state = admin.AdminState{};
@@ -458,6 +463,15 @@ pub fn main() !void {
 
     var shutdown_state = shutdown_mod.ShutdownState{};
 
+    // --- Report-only mode evaluation report (Phase 2 / NMV3-007) ---
+    var evaluation_report: ?EvaluationReport = if (cfg.report_only) .{} else null;
+    if (cfg.report_only) {
+        log.log(.info, "report_only_mode_enabled", null, &.{
+            .{ .key = "mode", .value = .{ .string = "report_only" } },
+            .{ .key = "description", .value = .{ .string = "PII detection active, payload modification disabled" } },
+        });
+    }
+
     observability.markStartupReady();
 
     const net_server = try std.net.Address.listen(bind_address, .{
@@ -528,6 +542,8 @@ pub fn main() !void {
                     .read_timeout_ms = cfg.upstream_read_timeout_ms,
                     .request_timeout_ms = cfg.upstream_request_timeout_ms,
                 },
+                .report_only = cfg.report_only,
+                .evaluation_report = if (evaluation_report) |*er| er else null,
             },
         },
         .max_connections = cfg.max_connections,
@@ -577,6 +593,8 @@ pub fn main() !void {
                         .read_timeout_ms = cfg.upstream_read_timeout_ms,
                         .request_timeout_ms = cfg.upstream_request_timeout_ms,
                     },
+                    .report_only = cfg.report_only,
+                    .evaluation_report = if (evaluation_report) |*er| er else null,
                 },
             },
             .max_connections = cfg.max_connections,

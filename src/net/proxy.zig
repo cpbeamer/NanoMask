@@ -19,6 +19,8 @@ const shutdown_mod = @import("../infra/shutdown.zig");
 const body_policy = @import("body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
 const upstream_client = @import("upstream_client.zig");
+const evaluation_report_mod = @import("../infra/evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
 
 // Unified single-pass pattern scanner (Phase 5 / Epic 7)
 const scanner = @import("../patterns/scanner.zig");
@@ -70,6 +72,20 @@ fn sendTextResponse(
         .status = status,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+        },
+    });
+    return body.len;
+}
+
+fn sendJsonResponse(
+    request_val: *http.Server.Request,
+    status: http.Status,
+    body: []const u8,
+) !usize {
+    try request_val.respond(body, .{
+        .status = status,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
         },
     });
     return body.len;
@@ -301,6 +317,9 @@ pub const ProxyContext = struct {
     client_address: std.net.Address,
     listener_mode: admin.ListenerMode,
     upstream_timeouts: upstream_client.UpstreamTimeouts,
+    // Report-only mode (Phase 2 / NMV3-007)
+    report_only: bool = false,
+    evaluation_report: ?*EvaluationReport = null,
 
     /// Build scanner flags from the proxy context's enable fields.
     pub fn patternFlags(self: ProxyContext) scanner.PatternFlags {
@@ -512,6 +531,56 @@ pub fn handleRequest(
         return;
     }
 
+    // --- Evaluation Report endpoints (Phase 2 / NMV3-007) ---
+    // Reuses admin auth/allowlist checks but is handled separately from entity
+    // management because it serves a different data domain.
+    if (std.mem.eql(u8, uri_str, "/_admin/evaluation-report") or
+        std.mem.eql(u8, uri_str, "/_admin/evaluation-report/reset"))
+    {
+        route = .admin;
+        if (!admin_config.enabled) {
+            response_status = .not_found;
+            response_body_bytes = try sendTextResponse(request, .not_found, "Not Found\n");
+            return;
+        }
+
+        // Auth check (reuses admin token)
+        if (admin_config.token) |expected_token| {
+            const auth_header = http_util.findHeader(request.head_buffer, "Authorization");
+            if (auth_header == null or !admin.validateBearerToken(auth_header.?, expected_token)) {
+                response_status = .unauthorized;
+                response_body_bytes = try sendJsonResponse(request, .unauthorized, "{\"error\":\"unauthorized\"}");
+                return;
+            }
+        }
+
+        if (ctx.evaluation_report) |eval_report| {
+            if (std.mem.eql(u8, uri_str, "/_admin/evaluation-report/reset") and method == .POST) {
+                eval_report.reset();
+                response_status = .ok;
+                response_body_bytes = try sendJsonResponse(request, .ok, "{\"status\":\"reset\"}");
+                return;
+            }
+
+            if (method == .GET) {
+                const snap = eval_report.snapshot();
+                const body = try snap.renderJson(allocator);
+                defer allocator.free(body);
+                response_status = .ok;
+                response_body_bytes = try sendJsonResponse(request, .ok, body);
+                return;
+            }
+
+            response_status = .method_not_allowed;
+            response_body_bytes = try sendJsonResponse(request, .method_not_allowed, "{\"error\":\"method not allowed\"}");
+            return;
+        } else {
+            response_status = .not_found;
+            response_body_bytes = try sendJsonResponse(request, .not_found, "{\"error\":\"report-only mode is not enabled\"}");
+            return;
+        }
+    }
+
     // --- Collect end-to-end request headers for forwarding (NMV2-002) ---
     const req_e2e_headers = try http_util.collectEndToEndHeaders(
         header_allocator,
@@ -638,7 +707,71 @@ pub fn handleRequest(
 
     // --- Request path: apply privacy pipeline to outbound body ---
     if (has_body) {
-        if (request_class.policy == .bypass) {
+        // --- Report-only mode: forward body unmodified, detect matches for evaluation ---
+        if (ctx.report_only) {
+            // Buffer the body so we can run detection *and* forward the original.
+            var report_body: std.ArrayListUnmanaged(u8) = .empty;
+            defer report_body.deinit(allocator);
+
+            var body_read_buf: [8192]u8 = undefined;
+            if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
+                var raw_chunk_buf: [8192]u8 = undefined;
+                while (true) {
+                    const bytes_read = try body_reader.readSliceShort(&raw_chunk_buf);
+                    if (bytes_read == 0) break;
+                    if (report_body.items.len + bytes_read > max_body_size) {
+                        log.log(.warn, "body_too_large", session_id, &.{
+                            .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
+                        });
+                        return error.PayloadTooLarge;
+                    }
+                    try report_body.appendSlice(allocator, raw_chunk_buf[0..bytes_read]);
+                    if (bytes_read < raw_chunk_buf.len) break;
+                }
+            } else |err| {
+                log.log(.warn, "body_read_failed", session_id, &.{
+                    .{ .key = "error", .value = .{ .string = @errorName(err) } },
+                });
+            }
+
+            request_body_bytes = report_body.items.len;
+
+            // Forward the original unmodified body to upstream.
+            var req_body_transfer_buf: [8192]u8 = undefined;
+            var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
+            if (report_body.items.len > 0) {
+                try req_body.writer.writeAll(report_body.items);
+            }
+            try req_body.end();
+            if (client_req.connection) |conn| {
+                try conn.flush();
+            }
+
+            // Run the detection pipeline on the buffered body for evaluation.
+            // Uses initWithReport so match events flow into the EvaluationReport.
+            if (ctx.evaluation_report) |eval_report| {
+                eval_report.recordRequest(request_body_bytes);
+            }
+
+            const active_schema_for_audit = if (ctx.schema != null and request_class.kind.supportsSchemaJson())
+                ctx.schema
+            else
+                null;
+
+            try redaction_audit.emitRequestAuditEventsWithReport(
+                allocator,
+                log,
+                session_id,
+                report_body.items,
+                active_entity_map,
+                session_fuzzy_matcher,
+                ctx.patternFlags(),
+                active_schema_for_audit,
+                ctx.hasher,
+                ctx.observability,
+                ctx.evaluation_report,
+            );
+        } else if (request_class.policy == .bypass) {
             request_body_bytes = try forwardBodyBypass(request, &client_req, max_body_size, log, session_id);
         } else {
             const active_schema_for_request = if (ctx.schema != null and request_class.kind.supportsSchemaJson())
@@ -1096,8 +1229,9 @@ pub fn handleRequest(
         can_unmask or can_unhash,
         ctx.unsupported_response_body_behavior,
     );
-    const should_buffer_response = response_class.policy != .bypass and can_unhash;
-    const should_unmask_response = response_class.policy != .bypass and can_unmask and !should_buffer_response;
+    // Report-only mode: never modify the response body — force passthrough.
+    const should_buffer_response = if (ctx.report_only) false else (response_class.policy != .bypass and can_unhash);
+    const should_unmask_response = if (ctx.report_only) false else (response_class.policy != .bypass and can_unmask and !should_buffer_response);
     const response_mode: ResponseForwardingMode = if (!response_has_body)
         .no_body
     else if (should_buffer_response)

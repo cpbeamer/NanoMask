@@ -12,6 +12,7 @@ pub const logger = @import("infra/logger.zig");
 pub const observability = @import("infra/observability.zig");
 pub const shutdown = @import("infra/shutdown.zig");
 pub const redaction_audit = @import("infra/redaction_audit.zig");
+pub const evaluation_report = @import("infra/evaluation_report.zig");
 pub const body_policy = @import("net/body_policy.zig");
 pub const runtime_model = @import("net/runtime_model.zig");
 pub const upstream_client = @import("net/upstream_client.zig");
@@ -63,6 +64,7 @@ test {
     _ = body_policy;
     _ = runtime_model;
     _ = redaction_audit;
+    _ = evaluation_report;
     _ = upstream_client;
     _ = proxy_server;
     _ = @import("net/http_util.zig");
