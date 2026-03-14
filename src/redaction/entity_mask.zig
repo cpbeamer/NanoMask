@@ -38,7 +38,7 @@ pub const BoundedAuditMatches = struct {
 /// Returns true if the byte is NOT alphanumeric (i.e. is a word boundary).
 /// This prevents partial matches like "John" inside "Johnson".
 fn isWordBoundary(byte: u8) bool {
-    return !std.ascii.isAlphanumeric(byte);
+    return !(std.ascii.isAlphanumeric(byte) or byte >= 128);
 }
 
 fn isWordBoundaryBefore(input: []const u8, pos: usize) bool {
@@ -75,7 +75,7 @@ fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
 /// Uses ArrayListUnmanaged for Zig 0.15 compatibility -- allocator is passed
 /// explicitly to each method that needs allocation.
 pub const AhoCorasick = struct {
-    const alphabet_size = 64; // Shrunk from 256 to fit nodes into L2 cache
+    const alphabet_size = 170; // ASCII-folded plus raw high-bit UTF-8 bytes
     const null_node: u32 = std.math.maxInt(u32);
 
     const char_map: [256]u8 = blk: {
@@ -98,7 +98,10 @@ pub const AhoCorasick = struct {
         idx += 1;
         map['\''] = idx;
         idx += 1;
-        // all mapped characters fit under 64. Unmapped bytes use index 0.
+        for (128..256) |raw| {
+            map[raw] = idx;
+            idx += 1;
+        }
         break :blk map;
     };
 
@@ -886,6 +889,16 @@ test "EntityMap - case insensitive matching" {
     const result = try em.mask("JOHN DOE and john doe are the same.", allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Entity_1 and Entity_1 are the same.", result);
+}
+
+test "EntityMap - exact UTF-8 names match through the automaton" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{"Жан Иванов"});
+    defer em.deinit();
+
+    const result = try em.mask("Пациент Жан Иванов прибыл.", allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Пациент Entity_1 прибыл.", result);
 }
 
 test "EntityMap - word boundary enforcement" {

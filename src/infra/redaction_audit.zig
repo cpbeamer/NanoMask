@@ -497,6 +497,10 @@ const pattern_type_map = std.StaticStringMap([]const u8).initComptime(.{
     .{ "[MRN_REDACTED]", "mrn" },
     .{ "[ICD10_REDACTED]", "icd10" },
     .{ "[INSURANCE_REDACTED]", "insurance" },
+    .{ "[IBAN_REDACTED]", "iban" },
+    .{ "[UK_NINO_REDACTED]", "uk_nino" },
+    .{ "[PASSPORT_REDACTED]", "passport" },
+    .{ "[INTL_PHONE_REDACTED]", "intl_phone" },
 });
 
 fn patternMatchType(replacement: []const u8) []const u8 {

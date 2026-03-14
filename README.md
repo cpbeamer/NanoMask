@@ -177,14 +177,45 @@ NanoMask now includes packaged integration recipes under `examples/integrations/
 
 The sidecar, gateway, and LiteLLM recipes each include smoke-test commands plus operator notes for auth, TLS, streaming, and health checks. The OpenAI-compatible kit includes reusable client environment settings and streaming client samples.
 
+### SDK Wrappers
+
+Phase 5 adds lightweight SDK wrappers under `sdk/` so teams can point official OpenAI clients at NanoMask without hand-assembling `base_url` and entity headers every time.
+
+- `sdk/python`: installable `nanomask-openai` package, imported as `nanomask`
+- `sdk/node`: installable `@nanomask/openai` package
+- both packages default the client endpoint to `http://127.0.0.1:8081/v1`
+- both packages expose `verify()` helpers for CI and readiness checks
+
+Quick local install:
+
+```bash
+pip install ./sdk/python
+npm install openai ./sdk/node
+```
+
+See `sdk/README.md` plus each package README for examples.
+
+### Buyer Evaluation Kit
+
+Phase 5 also packages the buyer-facing evaluation assets:
+
+- `evaluation/README.md`: evaluation kit entry point
+- `evaluation/report-only-workflow.md`: first-pass rollout workflow
+- `evaluation/benchmark-card.md`: short proof artifact
+- `evaluation/pilot-runbook.md`: pilot onboarding flow
+- `evaluation/pilot-success-criteria.md`: scorecard template
+- `docs/commercial_offers.md`: pilot, sidecar, and gateway offer ladder
+- `site/index.html`: single-page landing site with positioning, quick start, and competitor framing
+
 ### Supported Features
 
 Core redaction and restore surface:
 - SSN redaction is always available for supported text and JSON bodies.
 - Entity masking and response unmasking can be driven from `--entity-file` / `NANOMASK_ENTITY_FILE` or per-request `X-ZPG-Entities`.
 - Fuzzy matching targets OCR-style name drift in text that has already been extracted into the HTTP payload.
-- Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, and healthcare identifiers.
+- Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, healthcare identifiers, IBANs, UK National Insurance numbers, passport values, and common international phone formats.
 - Optional schema-aware JSON mode exposes `KEEP`, `REDACT`, `SCAN`, and `HASH` actions through `--schema-file`, `--schema-default`, `--hash-key`, and `--hash-key-file`.
+- Optional AI control-plane features expose request guardrails (`--enable-guardrails`) and tenant-aware semantic caching (`--enable-semantic-cache`).
 - Schema-aware request redaction now streams JSON bodies with bounded parser memory instead of buffering the full request body first.
 
 Current limits:

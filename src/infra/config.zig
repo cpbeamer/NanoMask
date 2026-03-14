@@ -1,8 +1,10 @@
 const std = @import("std");
+const guardrails_mod = @import("../ai/guardrails.zig");
 const body_policy = @import("../net/body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
 const runtime_model = @import("../net/runtime_model.zig");
 const RuntimeModel = runtime_model.RuntimeModel;
+const GuardrailMode = guardrails_mod.Mode;
 
 pub const LogLevel = enum {
     debug,
@@ -111,6 +113,14 @@ pub const Config = struct {
     enable_ip_src: ConfigSource = .default,
     enable_healthcare: bool = false,
     enable_healthcare_src: ConfigSource = .default,
+    enable_iban: bool = false,
+    enable_iban_src: ConfigSource = .default,
+    enable_uk_nino: bool = false,
+    enable_uk_nino_src: ConfigSource = .default,
+    enable_passport: bool = false,
+    enable_passport_src: ConfigSource = .default,
+    enable_intl_phone: bool = false,
+    enable_intl_phone_src: ConfigSource = .default,
     // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
     schema_file: ?[]const u8 = null,
     schema_file_src: ConfigSource = .default,
@@ -124,6 +134,19 @@ pub const Config = struct {
     // --- Report-only mode (Phase 2 / NMV3-007) ---
     report_only: bool = false,
     report_only_src: ConfigSource = .default,
+    // --- Phase 5: AI guardrails and semantic caching ---
+    enable_guardrails: bool = false,
+    enable_guardrails_src: ConfigSource = .default,
+    guardrail_mode: GuardrailMode = .alert,
+    guardrail_mode_src: ConfigSource = .default,
+    enable_semantic_cache: bool = false,
+    enable_semantic_cache_src: ConfigSource = .default,
+    semantic_cache_ttl_ms: u64 = 300_000,
+    semantic_cache_ttl_ms_src: ConfigSource = .default,
+    semantic_cache_max_entries: usize = 256,
+    semantic_cache_max_entries_src: ConfigSource = .default,
+    semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
+    semantic_cache_tenant_header_src: ConfigSource = .default,
     // --- Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013) ---
     admin_api_key_file: ?[]const u8 = null,
     admin_api_key_file_src: ConfigSource = .default,
@@ -180,6 +203,8 @@ pub const Config = struct {
         InvalidAuditLogFlag,
         InvalidUnsupportedBodyBehavior,
         InvalidPatternFlag,
+        InvalidGuardrailMode,
+        InvalidSemanticCacheConfig,
         InvalidSchemaDefault,
         SchemaFileNotFound,
         InvalidHashKey,
@@ -235,6 +260,12 @@ pub const Config = struct {
         }
         if (self.schema_default) |sd| {
             self.allocator.free(sd);
+        }
+        // Only free when the value was heap-allocated from an env var.
+        // cli_flag assignments borrow directly from the argv slice (server lifetime)
+        // so no deinit is needed for that source.
+        if (self.semantic_cache_tenant_header_src == .env_var) {
+            self.allocator.free(self.semantic_cache_tenant_header);
         }
         if (self.admin_api_key_file != null and self.admin_api_key_file_src == .env_var) {
             self.allocator.free(self.admin_api_key_file.?);
@@ -301,6 +332,12 @@ pub const Config = struct {
         \\  --entity-file-sync                  Write API entity changes back to entity file
         \\  --admin-api-key-file <path>         Bootstrap API keys from JSON file for RBAC (Phase 3)
         \\  --report-only                       Detect PII without modifying payloads (evaluation mode, default: disabled)
+        \\  --enable-guardrails                 Enable baseline AI guardrail checks on request bodies
+        \\  --guardrail-mode <mode>             Guardrail action: alert or block (default: alert)
+        \\  --enable-semantic-cache             Cache de-identified prompt-response pairs in memory
+        \\  --semantic-cache-ttl-ms <ms>        Semantic cache entry TTL in ms (default: 300000)
+        \\  --semantic-cache-max-entries <n>    Maximum semantic cache entries; eviction is O(n) per store — keep ≤4096 (default: 256)
+        \\  --semantic-cache-tenant-header <h>  Header used for cache tenant isolation (default: X-NanoMask-Tenant)
         \\  --healthcheck                       Probe /healthz on the local listener and exit
         \\  --validate-config                   Validate configuration and print summary without starting the server
         \\  --help                              Print this help message and exit
@@ -311,6 +348,10 @@ pub const Config = struct {
         \\  --enable-credit-card                Redact credit card numbers with Luhn validation (default: disabled)
         \\  --enable-ip                         Redact IPv4/IPv6 addresses (default: disabled)
         \\  --enable-healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
+        \\  --enable-iban                       Redact EU IBAN values (default: disabled)
+        \\  --enable-uk-nino                    Redact UK National Insurance numbers (default: disabled)
+        \\  --enable-passport                   Redact passport numbers when label-qualified (default: disabled)
+        \\  --enable-intl-phone                 Redact common non-US international phone numbers (default: disabled)
         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
@@ -330,8 +371,125 @@ pub const Config = struct {
         \\
     ;
 
+    const known_flags = [_][]const u8{
+        "--listen-host",
+        "--listen-port",
+        "--target-host",
+        "--target-port",
+        "--target-tls",
+        "--max-connections",
+        "--runtime-model",
+        "--runtime-worker-threads",
+        "--max-body-size",
+        "--entity-file",
+        "--watch-interval",
+        "--fuzzy-threshold",
+        "--log-level",
+        "--log-file",
+        "--audit-log",
+        "--tls-cert",
+        "--tls-key",
+        "--ca-file",
+        "--tls-no-system-ca",
+        "--upstream-connect-timeout-ms",
+        "--upstream-read-timeout-ms",
+        "--upstream-request-timeout-ms",
+        "--shutdown-drain-timeout-ms",
+        "--unsupported-request-body-behavior",
+        "--unsupported-response-body-behavior",
+        "--admin-api",
+        "--admin-token",
+        "--admin-listen-address",
+        "--admin-allowlist",
+        "--admin-read-only",
+        "--admin-mutation-rate-limit",
+        "--entity-file-sync",
+        "--admin-api-key-file",
+        "--report-only",
+        "--enable-guardrails",
+        "--guardrail-mode",
+        "--enable-semantic-cache",
+        "--semantic-cache-ttl-ms",
+        "--semantic-cache-max-entries",
+        "--semantic-cache-tenant-header",
+        "--healthcheck",
+        "--validate-config",
+        "--help",
+        "--enable-email",
+        "--enable-phone",
+        "--enable-credit-card",
+        "--enable-ip",
+        "--enable-healthcare",
+        "--enable-iban",
+        "--enable-uk-nino",
+        "--enable-passport",
+        "--enable-intl-phone",
+        "--schema-file",
+        "--schema-default",
+        "--hash-key",
+        "--hash-key-file",
+        "--hash-key-exec",
+        "--audit-buffer-size",
+        "--otel-service-name",
+        "--syslog-address",
+        "--mtls-ca",
+        "--mtls-cert",
+        "--mtls-key",
+    };
+
     pub fn printHelp() void {
         std.debug.print("{s}", .{help_text});
+    }
+
+    fn levenshteinDistance(a: []const u8, b: []const u8) usize {
+        if (a.len == 0) return b.len;
+        if (b.len == 0) return a.len;
+
+        var prev: [128]usize = undefined;
+        var curr: [128]usize = undefined;
+        std.debug.assert(b.len + 1 <= prev.len);
+
+        for (0..b.len + 1) |j| {
+            prev[j] = j;
+        }
+
+        for (a, 0..) |a_byte, i| {
+            curr[0] = i + 1;
+            for (b, 0..) |b_byte, j| {
+                const substitution_cost: usize = if (a_byte == b_byte) 0 else 1;
+                const deletion = prev[j + 1] + 1;
+                const insertion = curr[j] + 1;
+                const substitution = prev[j] + substitution_cost;
+                curr[j + 1] = @min(@min(deletion, insertion), substitution);
+            }
+            std.mem.copyForwards(usize, prev[0 .. b.len + 1], curr[0 .. b.len + 1]);
+        }
+
+        return prev[b.len];
+    }
+
+    fn suggestFlag(flag: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, flag, "--")) return null;
+        // levenshteinDistance uses a fixed 128-element stack buffer indexed by
+        // b.len + 1. Guard here so we never exceed it regardless of input.
+        if (flag.len >= 128) return null;
+
+        var best_flag: ?[]const u8 = null;
+        var best_distance: usize = std.math.maxInt(usize);
+
+        for (known_flags) |candidate| {
+            const distance = levenshteinDistance(flag, candidate);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_flag = candidate;
+            }
+        }
+
+        if (best_flag) |candidate| {
+            const max_distance: usize = if (flag.len <= 16) 3 else 4;
+            if (best_distance <= max_distance) return candidate;
+        }
+        return null;
     }
 
     fn needsBracketedHost(host: []const u8) bool {
@@ -579,6 +737,18 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_HEALTHCARE")) {
             config.enable_healthcare = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_healthcare_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_IBAN")) {
+            config.enable_iban = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_iban_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_NINO")) {
+            config.enable_uk_nino = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_nino_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_PASSPORT")) {
+            config.enable_passport = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_passport_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_INTL_PHONE")) {
+            config.enable_intl_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_intl_phone_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_FILE")) {
             config.schema_file = try allocator.dupe(u8, value);
             config.schema_file_src = .env_var;
@@ -629,6 +799,37 @@ pub const Config = struct {
                 return error.InvalidReportOnlyFlag;
             };
             config.report_only_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_GUARDRAILS")) {
+            config.enable_guardrails = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_ENABLE_GUARDRAILS must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidPatternFlag;
+            };
+            config.enable_guardrails_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_GUARDRAIL_MODE")) {
+            config.guardrail_mode = GuardrailMode.parse(value) catch {
+                std.debug.print("error: NANOMASK_GUARDRAIL_MODE must be alert or block, got '{s}'\n", .{value});
+                return error.InvalidGuardrailMode;
+            };
+            config.guardrail_mode_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_SEMANTIC_CACHE")) {
+            config.enable_semantic_cache = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_ENABLE_SEMANTIC_CACHE must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidSemanticCacheConfig;
+            };
+            config.enable_semantic_cache_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SEMANTIC_CACHE_TTL_MS")) {
+            config.semantic_cache_ttl_ms = try parseTimeoutValue(value, "NANOMASK_SEMANTIC_CACHE_TTL_MS");
+            config.semantic_cache_ttl_ms_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SEMANTIC_CACHE_MAX_ENTRIES")) {
+            config.semantic_cache_max_entries = std.fmt.parseInt(usize, value, 10) catch {
+                std.debug.print("error: NANOMASK_SEMANTIC_CACHE_MAX_ENTRIES must be a positive integer, got '{s}'\n", .{value});
+                return error.InvalidSemanticCacheConfig;
+            };
+            if (config.semantic_cache_max_entries == 0) return error.InvalidSemanticCacheConfig;
+            config.semantic_cache_max_entries_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SEMANTIC_CACHE_TENANT_HEADER")) {
+            config.semantic_cache_tenant_header = try allocator.dupe(u8, value);
+            config.semantic_cache_tenant_header_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_API_KEY_FILE")) {
             config.admin_api_key_file = try allocator.dupe(u8, value);
             config.admin_api_key_file_src = .env_var;
@@ -760,11 +961,21 @@ pub const Config = struct {
             "NANOMASK_ENABLE_CREDIT_CARD",
             "NANOMASK_ENABLE_IP",
             "NANOMASK_ENABLE_HEALTHCARE",
+            "NANOMASK_ENABLE_IBAN",
+            "NANOMASK_ENABLE_UK_NINO",
+            "NANOMASK_ENABLE_PASSPORT",
+            "NANOMASK_ENABLE_INTL_PHONE",
             "NANOMASK_SCHEMA_FILE",
             "NANOMASK_SCHEMA_DEFAULT",
             "NANOMASK_HASH_KEY",
             "NANOMASK_HASH_KEY_FILE",
             "NANOMASK_REPORT_ONLY",
+            "NANOMASK_ENABLE_GUARDRAILS",
+            "NANOMASK_GUARDRAIL_MODE",
+            "NANOMASK_ENABLE_SEMANTIC_CACHE",
+            "NANOMASK_SEMANTIC_CACHE_TTL_MS",
+            "NANOMASK_SEMANTIC_CACHE_MAX_ENTRIES",
+            "NANOMASK_SEMANTIC_CACHE_TENANT_HEADER",
             "NANOMASK_ADMIN_API_KEY_FILE",
             "NANOMASK_AUDIT_BUFFER_SIZE",
             "NANOMASK_OTEL_SERVICE_NAME",
@@ -1131,6 +1342,18 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-healthcare")) {
                 config.enable_healthcare = true;
                 config.enable_healthcare_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-iban")) {
+                config.enable_iban = true;
+                config.enable_iban_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-nino")) {
+                config.enable_uk_nino = true;
+                config.enable_uk_nino_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-passport")) {
+                config.enable_passport = true;
+                config.enable_passport_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-intl-phone")) {
+                config.enable_intl_phone = true;
+                config.enable_intl_phone_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--schema-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1208,6 +1431,57 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--report-only")) {
                 config.report_only = true;
                 config.report_only_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-guardrails")) {
+                config.enable_guardrails = true;
+                config.enable_guardrails_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--guardrail-mode")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --guardrail-mode\n", .{});
+                    return error.MissingValue;
+                }
+                config.guardrail_mode = GuardrailMode.parse(args[i]) catch {
+                    std.debug.print("error: --guardrail-mode must be alert or block, got '{s}'\n", .{args[i]});
+                    return error.InvalidGuardrailMode;
+                };
+                config.guardrail_mode_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-semantic-cache")) {
+                config.enable_semantic_cache = true;
+                config.enable_semantic_cache_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--semantic-cache-ttl-ms")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --semantic-cache-ttl-ms\n", .{});
+                    return error.MissingValue;
+                }
+                config.semantic_cache_ttl_ms = try parseTimeoutValue(args[i], "--semantic-cache-ttl-ms");
+                config.semantic_cache_ttl_ms_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--semantic-cache-max-entries")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --semantic-cache-max-entries\n", .{});
+                    return error.MissingValue;
+                }
+                config.semantic_cache_max_entries = std.fmt.parseInt(usize, args[i], 10) catch {
+                    std.debug.print("error: --semantic-cache-max-entries must be a positive integer, got '{s}'\n", .{args[i]});
+                    return error.InvalidSemanticCacheConfig;
+                };
+                if (config.semantic_cache_max_entries == 0) {
+                    std.debug.print("error: --semantic-cache-max-entries must be > 0\n", .{});
+                    return error.InvalidSemanticCacheConfig;
+                }
+                config.semantic_cache_max_entries_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--semantic-cache-tenant-header")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --semantic-cache-tenant-header\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.semantic_cache_tenant_header_src == .env_var) {
+                    allocator.free(config.semantic_cache_tenant_header);
+                }
+                config.semantic_cache_tenant_header = args[i];
+                config.semantic_cache_tenant_header_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--admin-api-key-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1315,6 +1589,9 @@ pub const Config = struct {
                 config.validate_config = true;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
+                if (suggestFlag(arg)) |suggested| {
+                    std.debug.print("  hint: did you mean '{s}'?\n", .{suggested});
+                }
                 return error.UnknownFlag;
             }
         }
@@ -1533,6 +1810,14 @@ test "Config - unknown flag" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.UnknownFlag, res);
+}
+
+test "Config - unknown flag suggestion" {
+    try testing.expectEqualStrings("--target-tls", Config.suggestFlag("--target_tls").?);
+}
+
+test "Config - unknown flag without close suggestion" {
+    try testing.expect(Config.suggestFlag("--totally-different") == null);
 }
 
 test "Config - help flag" {

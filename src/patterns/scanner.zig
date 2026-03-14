@@ -4,6 +4,10 @@ const phone_mod = @import("phone.zig");
 const cc_mod = @import("credit_card.zig");
 const ip_mod = @import("ip_address.zig");
 const healthcare_mod = @import("healthcare.zig");
+const iban_mod = @import("iban.zig");
+const uk_nino_mod = @import("uk_nino.zig");
+const passport_mod = @import("passport.zig");
+const intl_phone_mod = @import("intl_phone.zig");
 
 // ---------------------------------------------------------------------------
 // Unified single-pass pattern scanner
@@ -44,9 +48,14 @@ pub const PatternFlags = struct {
     credit_card: bool = false,
     ip: bool = false,
     healthcare: bool = false,
+    iban: bool = false,
+    uk_nino: bool = false,
+    passport: bool = false,
+    intl_phone: bool = false,
 
     pub fn anyEnabled(self: PatternFlags) bool {
-        return self.email or self.phone or self.credit_card or self.ip or self.healthcare;
+        return self.email or self.phone or self.credit_card or self.ip or self.healthcare or
+            self.iban or self.uk_nino or self.passport or self.intl_phone;
     }
 };
 
@@ -114,8 +123,45 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
             }
         }
 
+        // intl_phone is a fallback for `+` prefixes that phone_mod does not
+        // recognise (e.g. +44 UK, +33 France). Both check `+` but only one
+        // fires per cursor position: if phone_mod consumes the match its
+        // `continue` advances the cursor and intl_phone is never reached.
+        if (flags.intl_phone and input[cursor] == '+') {
+            if (intl_phone_mod.tryMatchAt(input, cursor)) |m| {
+                try spans.append(allocator, toMatch(m));
+                cursor = m.end;
+                continue;
+            }
+        }
+
         if (flags.healthcare) {
             if (healthcare_mod.tryMatchAt(input, cursor)) |m| {
+                try spans.append(allocator, toMatch(m));
+                cursor = m.end;
+                continue;
+            }
+        }
+
+        if ((flags.iban or flags.uk_nino) and std.ascii.isAlphabetic(input[cursor])) {
+            if (flags.iban) {
+                if (iban_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+            if (flags.uk_nino) {
+                if (uk_nino_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+        }
+
+        if (flags.passport and (input[cursor] == 'P' or input[cursor] == 'p')) {
+            if (passport_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));
                 cursor = m.end;
                 continue;
@@ -283,4 +329,32 @@ test "scanner - insurance with label" {
     const result = try redact("Insurance ID: ABC12345678 ok", .{ .healthcare = true }, allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Insurance ID: [INSURANCE_REDACTED] ok", result);
+}
+
+test "scanner - iban" {
+    const allocator = std.testing.allocator;
+    const result = try redact("IBAN DE89 3704 0044 0532 0130 00 recorded", .{ .iban = true }, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("IBAN [IBAN_REDACTED] recorded", result);
+}
+
+test "scanner - uk nino" {
+    const allocator = std.testing.allocator;
+    const result = try redact("Employee AA 12 34 56 C onboarded", .{ .uk_nino = true }, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Employee [UK_NINO_REDACTED] onboarded", result);
+}
+
+test "scanner - passport label" {
+    const allocator = std.testing.allocator;
+    const result = try redact("Passport Number: 123456789 verified", .{ .passport = true }, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Passport Number: [PASSPORT_REDACTED] verified", result);
+}
+
+test "scanner - intl phone" {
+    const allocator = std.testing.allocator;
+    const result = try redact("Call +44 7700 900123 today", .{ .intl_phone = true }, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Call [INTL_PHONE_REDACTED] today", result);
 }

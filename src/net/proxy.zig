@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = std.http;
+const guardrails_mod = @import("../ai/guardrails.zig");
 const redact = @import("../redaction/redact.zig");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
@@ -21,6 +22,7 @@ const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
 const upstream_client = @import("upstream_client.zig");
 const evaluation_report_mod = @import("../infra/evaluation_report.zig");
 const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const semantic_cache_mod = @import("../infra/semantic_cache.zig");
 
 // Unified single-pass pattern scanner (Phase 5 / Epic 7)
 const scanner = @import("../patterns/scanner.zig");
@@ -108,6 +110,226 @@ fn sendBodyPolicyResponse(
         },
     ) catch prefix;
     return sendTextResponse(request, status, message);
+}
+
+fn readRequestBodyBuffered(
+    request: *http.Server.Request,
+    allocator: std.mem.Allocator,
+    max_body_size: usize,
+    log: *Logger,
+    session_id: []const u8,
+) ![]u8 {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    errdefer body.deinit(allocator);
+
+    var body_read_buf: [8192]u8 = undefined;
+    if (request.readerExpectContinue(&body_read_buf)) |body_reader| {
+        var raw_chunk_buf: [8192]u8 = undefined;
+        while (true) {
+            const bytes_read = try body_reader.readSliceShort(&raw_chunk_buf);
+            if (bytes_read == 0) break;
+            if (body.items.len + bytes_read > max_body_size) {
+                log.log(.warn, "body_too_large", session_id, &.{
+                    .{ .key = "max_body_size", .value = .{ .uint = max_body_size } },
+                });
+                return error.PayloadTooLarge;
+            }
+            try body.appendSlice(allocator, raw_chunk_buf[0..bytes_read]);
+            if (bytes_read < raw_chunk_buf.len) break;
+        }
+    } else |err| {
+        log.log(.warn, "body_read_failed", session_id, &.{
+            .{ .key = "error", .value = .{ .string = @errorName(err) } },
+        });
+    }
+
+    return try body.toOwnedSlice(allocator);
+}
+
+fn syncSemanticCacheMetrics(
+    observability: *Observability,
+    before: semantic_cache_mod.Stats,
+    after: semantic_cache_mod.Stats,
+) void {
+    observability.recordSemanticCacheStats(before, after);
+}
+
+fn emitGuardrailEvaluation(
+    ctx: ProxyContext,
+    evaluation: guardrails_mod.Evaluation,
+) void {
+    if (evaluation.matches.len == 0) return;
+
+    for (evaluation.matches) |match| {
+        ctx.observability.recordGuardrail(match.category, evaluation.blocked);
+        ctx.log.auditRedaction(ctx.session_id, .{
+            .stage = "guardrail",
+            .match_type = match.category.label(),
+            .offset = @intCast(match.start),
+            .original_length = match.end - match.start,
+            .replacement_type = if (evaluation.blocked) "block" else "alert",
+        });
+    }
+
+    ctx.log.log(if (evaluation.blocked) .warn else .info, "guardrail_triggered", ctx.session_id, &.{
+        .{ .key = "mode", .value = .{ .string = ctx.guardrail_settings.mode.label() } },
+        .{ .key = "blocked", .value = .{ .boolean = evaluation.blocked } },
+        .{ .key = "match_count", .value = .{ .uint = evaluation.matches.len } },
+    });
+}
+
+fn makeHasherInterface(hasher: ?*hasher_mod.Hasher) ?json_redactor.HasherInterface {
+    return if (hasher) |h| .{
+        .hash_fn = &struct {
+            fn call(orig: []const u8, ctx_ptr: *anyopaque) anyerror![]const u8 {
+                const hh: *hasher_mod.Hasher = @ptrCast(@alignCast(ctx_ptr));
+                return hh.hash(orig);
+            }
+        }.call,
+        .ctx_ptr = @ptrCast(@alignCast(h)),
+    } else null;
+}
+
+fn redactBufferedRequestBody(
+    body: []const u8,
+    ctx: ProxyContext,
+    active_entity_map: ?*const entity_mask.EntityMap,
+    session_fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+    request_kind: body_policy.BodyKind,
+) ![]u8 {
+    var emitter = redaction_audit.AuditEmitter.init(ctx.log, ctx.session_id, ctx.observability);
+    defer emitter.finish();
+
+    const active_schema = if (ctx.schema != null and request_kind.supportsSchemaJson())
+        ctx.schema
+    else
+        null;
+
+    if (active_schema) |schema| {
+        const masked_body = try redaction_audit.runTextStages(
+            body,
+            null,
+            .{ .entity_mask = true },
+            active_entity_map,
+            session_fuzzy_matcher,
+            ctx.patternFlags(),
+            &emitter,
+            ctx.allocator,
+        );
+        defer ctx.allocator.free(masked_body);
+
+        const ScanAuditState = struct {
+            const Self = @This();
+
+            proxy_ctx: *const ProxyContext,
+            emitter: *redaction_audit.AuditEmitter,
+            entity_map: ?*const entity_mask.EntityMap,
+            fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+
+            fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+                const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+                return redaction_audit.runTextStages(
+                    input_val,
+                    field_path,
+                    .{
+                        .ssn = true,
+                        .patterns = true,
+                        .fuzzy = true,
+                    },
+                    self.entity_map,
+                    self.fuzzy_matcher,
+                    self.proxy_ctx.patternFlags(),
+                    self.emitter,
+                    alloc,
+                );
+            }
+
+            fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
+                const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+                self.emitter.emit(.{
+                    .stage = "schema",
+                    .match_type = switch (event.action) {
+                        .redact => "schema_redact",
+                        .hash => "schema_hash",
+                        .scan => "schema_scan",
+                        .keep => "schema_keep",
+                    },
+                    .field_path = event.field_path,
+                    .original_length = event.original_length,
+                    .replacement_type = event.replacement_type,
+                });
+            }
+        };
+
+        var scan_audit_state = ScanAuditState{
+            .proxy_ctx = &ctx,
+            .emitter = &emitter,
+            .entity_map = active_entity_map,
+            .fuzzy_matcher = session_fuzzy_matcher,
+        };
+
+        return try json_redactor.redactJsonWithAudit(
+            masked_body,
+            schema,
+            makeHasherInterface(ctx.hasher),
+            .{
+                .scan_fn = &ScanAuditState.doScan,
+                .ctx_ptr = @ptrCast(&scan_audit_state),
+            },
+            .{
+                .audit_fn = &ScanAuditState.onSchemaAction,
+                .ctx_ptr = @ptrCast(&scan_audit_state),
+            },
+            ctx.allocator,
+        );
+    }
+
+    return redaction_audit.runTextStages(
+        body,
+        null,
+        .{
+            .entity_mask = true,
+            .ssn = true,
+            .patterns = true,
+            .fuzzy = true,
+        },
+        active_entity_map,
+        session_fuzzy_matcher,
+        ctx.patternFlags(),
+        &emitter,
+        ctx.allocator,
+    );
+}
+
+fn sendCachedResponse(
+    request: *http.Server.Request,
+    cached: semantic_cache_mod.LookupResult,
+    allocator: std.mem.Allocator,
+) !usize {
+    // Strip hop-by-hop headers from the cached response before forwarding to
+    // the downstream client. Transfer-Encoding, Connection, etc. must not be
+    // replayed because they described the proxy↔upstream transport, not the
+    // proxy↔client transport. Forwarding them breaks HTTP/1.1 keep-alive and
+    // violates RFC 7230 §6.1.
+    var e2e_headers = std.ArrayListUnmanaged(http.Header).empty;
+    defer e2e_headers.deinit(allocator);
+    for (cached.headers) |h| {
+        if (!http_util.isHopByHop(h.name)) {
+            try e2e_headers.append(allocator, h);
+        }
+    }
+
+    var resp_buf: [8192]u8 = undefined;
+    var response_writer = try request.respondStreaming(&resp_buf, .{
+        .content_length = cached.body.len,
+        .respond_options = .{
+            .status = @enumFromInt(cached.status_code),
+            .extra_headers = e2e_headers.items,
+        },
+    });
+    if (cached.body.len > 0) try response_writer.writer.writeAll(cached.body);
+    try response_writer.end();
+    return cached.body.len;
 }
 
 const RequestOutcome = enum {
@@ -328,11 +550,18 @@ pub const ProxyContext = struct {
     unsupported_request_body_behavior: UnsupportedBodyBehavior,
     unsupported_response_body_behavior: UnsupportedBodyBehavior,
     // Pattern library enable flags
-    enable_email: bool,
-    enable_phone: bool,
-    enable_credit_card: bool,
-    enable_ip: bool,
-    enable_healthcare: bool,
+    enable_email: bool = false,
+    enable_phone: bool = false,
+    enable_credit_card: bool = false,
+    enable_ip: bool = false,
+    enable_healthcare: bool = false,
+    enable_iban: bool = false,
+    enable_uk_nino: bool = false,
+    enable_passport: bool = false,
+    enable_intl_phone: bool = false,
+    guardrail_settings: guardrails_mod.Settings = .{},
+    semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
+    semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
     // Schema-aware redaction (Epic 8)
     schema: ?*const schema_mod.Schema = null,
     hasher: ?*hasher_mod.Hasher = null,
@@ -352,6 +581,10 @@ pub const ProxyContext = struct {
             .credit_card = self.enable_credit_card,
             .ip = self.enable_ip,
             .healthcare = self.enable_healthcare,
+            .iban = self.enable_iban,
+            .uk_nino = self.enable_uk_nino,
+            .passport = self.enable_passport,
+            .intl_phone = self.enable_intl_phone,
         };
     }
 };
@@ -388,6 +621,15 @@ pub fn handleRequest(
     var final_flush_per_chunk: bool = false;
     var stream_event_count: u64 = 0;
     var sse_counter = SseCounter{};
+    var semantic_cache_key: ?[]u8 = null;
+    defer if (semantic_cache_key) |key| allocator.free(key);
+    var semantic_cache_tenant: []const u8 = "default";
+    // Tracks whether a guardrail rule fired on this request (alert or block).
+    // Always emitted in the response_sent log.
+    // NOTE (F8): In report-only mode the guardrail evaluator is not run
+    // (report-only is a passive observation mode; it does not block traffic).
+    // As a result, this flag will always be false when ctx.report_only == true.
+    var guardrail_triggered: bool = false;
     defer {
         const raw_total_latency = std.time.nanoTimestamp() - request_start;
         const total_latency_us: u64 = if (raw_total_latency < 0)
@@ -412,7 +654,7 @@ pub fn handleRequest(
             request_outcome;
 
         // NMV3-014: enhanced response_sent log with streaming diagnostics
-        var extra_buf: [9]Logger.KV = undefined;
+        var extra_buf: [11]Logger.KV = undefined;
         var extra_len: usize = 0;
         extra_buf[extra_len] = .{ .key = "status", .value = .{ .uint = @intFromEnum(response_status) } };
         extra_len += 1;
@@ -427,6 +669,8 @@ pub fn handleRequest(
         extra_buf[extra_len] = .{ .key = "buffer_reason", .value = .{ .string = responseBufferReason(final_response_mode) } };
         extra_len += 1;
         extra_buf[extra_len] = .{ .key = "flush_per_chunk", .value = .{ .boolean = final_flush_per_chunk } };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "guardrail_triggered", .value = .{ .boolean = guardrail_triggered } };
         extra_len += 1;
         if (stream_event_count > 0) {
             extra_buf[extra_len] = .{ .key = "stream_event_count", .value = .{ .uint = stream_event_count } };
@@ -747,6 +991,11 @@ pub fn handleRequest(
     // --- Request path: apply privacy pipeline to outbound body ---
     if (has_body) {
         // --- Report-only mode: forward body unmodified, detect matches for evaluation ---
+        // NOTE (F2): Guardrail evaluation is intentionally skipped in this branch.
+        // Report-only is a passive observation mode; requests are forwarded unchanged
+        // and only the redaction detection pipeline runs to produce audit events.
+        // If guardrail alerting in report-only mode is required, add a
+        // non-blocking guardrails_mod.evaluate() call here.
         if (ctx.report_only) {
             // Buffer the body so we can run detection *and* forward the original.
             var report_body: std.ArrayListUnmanaged(u8) = .empty;
@@ -810,6 +1059,78 @@ pub fn handleRequest(
                 ctx.observability,
                 ctx.evaluation_report,
             );
+        } else if ((ctx.guardrail_settings.enabled or ctx.semantic_cache != null) and
+            request_class.policy != .bypass and request_class.kind.supportsInlineTransform())
+        {
+            const buffered_body = try readRequestBodyBuffered(request, allocator, max_body_size, log, session_id);
+            defer allocator.free(buffered_body);
+            request_body_bytes = buffered_body.len;
+
+            if (ctx.guardrail_settings.enabled) {
+                var evaluation = try guardrails_mod.evaluate(buffered_body, ctx.guardrail_settings, allocator);
+                defer evaluation.deinit(allocator);
+                if (evaluation.matches.len > 0) guardrail_triggered = true;
+                emitGuardrailEvaluation(ctx, evaluation);
+                if (evaluation.blocked) {
+                    response_status = .forbidden;
+                    response_body_bytes = try sendTextResponse(request, .forbidden, "Forbidden: guardrail policy blocked request\n");
+                    return;
+                }
+            }
+
+            const transformed_body = try redactBufferedRequestBody(
+                buffered_body,
+                ctx,
+                active_entity_map,
+                session_fuzzy_matcher,
+                request_class.kind,
+            );
+            defer allocator.free(transformed_body);
+
+            if (ctx.semantic_cache) |cache| {
+                semantic_cache_tenant = findHeader(request.head_buffer, ctx.semantic_cache_tenant_header) orelse "default";
+                // Include a guardrail fingerprint in the key so that enabling
+                // guardrails or changing their mode invalidates old cache entries.
+                // This prevents a payload that would now be blocked from being
+                // served a cached 200 OK from a pre-guardrail era (F3).
+                const guardrail_key_component = if (ctx.guardrail_settings.enabled)
+                    ctx.guardrail_settings.mode.label()
+                else
+                    "guardrails_off";
+                const cache_key = try semantic_cache_mod.SemanticCache.buildKeyHex(
+                    allocator,
+                    @tagName(method),
+                    uri_str,
+                    semantic_cache_tenant,
+                    guardrail_key_component,
+                    transformed_body,
+                );
+
+                const before = cache.stats();
+                const cached = cache.lookup(cache_key, semantic_cache_tenant, allocator);
+                const after = cache.stats();
+                syncSemanticCacheMetrics(ctx.observability, before, after);
+
+                if (cached) |hit| {
+                    defer hit.deinit();
+                    allocator.free(cache_key);
+                    response_status = @enumFromInt(hit.status_code);
+                    response_body_bytes = try sendCachedResponse(request, hit, allocator);
+                    return;
+                }
+
+                semantic_cache_key = cache_key;
+            }
+
+            var req_body_transfer_buf: [8192]u8 = undefined;
+            var req_body = try client_req.sendBodyUnflushed(&req_body_transfer_buf);
+            if (transformed_body.len > 0) {
+                try req_body.writer.writeAll(transformed_body);
+            }
+            try req_body.end();
+            if (client_req.connection) |conn| {
+                try conn.flush();
+            }
         } else if (request_class.policy == .bypass) {
             request_body_bytes = try forwardBodyBypass(request, &client_req, max_body_size, log, session_id);
         } else {
@@ -1343,6 +1664,15 @@ pub fn handleRequest(
         try response_headers_list.append(header_allocator, h);
     }
     const response_headers = response_headers_list.items;
+    const semantic_cache_capture_candidate = semantic_cache_key != null and
+        response_has_body and
+        downstream_res.head.status == .ok and
+        !flush_response_per_chunk and
+        response_class.content_encoding == .identity and
+        (response_kind == .json or response_kind == .text);
+    var semantic_cache_response_body = std.ArrayListUnmanaged(u8).empty;
+    defer semantic_cache_response_body.deinit(allocator);
+    var semantic_cache_capture_enabled = semantic_cache_capture_candidate;
 
     if (response_has_body and should_buffer_response) {
         var transfer_buf: [8192]u8 = undefined;
@@ -1442,6 +1772,9 @@ pub fn handleRequest(
         if (unhashed.len > 0) try response_writer.writer.writeAll(unhashed);
         try response_writer.end();
         response_body_bytes = unhashed.len;
+        if (semantic_cache_capture_enabled) {
+            try semantic_cache_response_body.appendSlice(allocator, unhashed);
+        }
     } else {
         const response_content_length: ?u64 = switch (response_mode) {
             .stream_passthrough => downstream_res.head.content_length,
@@ -1498,6 +1831,13 @@ pub fn handleRequest(
                     const chunk = resp_buf[0..bytes_read];
                     try response_writer.writer.writeAll(chunk);
                     response_body_bytes += bytes_read;
+                    if (semantic_cache_capture_enabled) {
+                        if (semantic_cache_response_body.items.len + chunk.len > max_body_size) {
+                            semantic_cache_capture_enabled = false;
+                        } else {
+                            try semantic_cache_response_body.appendSlice(allocator, chunk);
+                        }
+                    }
                     if (flush_response_per_chunk) {
                         stream_event_count += sse_counter.countEvents(chunk);
                         try flushResponseChunk(&response_writer);
@@ -1546,6 +1886,13 @@ pub fn handleRequest(
                     if (unmasked.len > 0) {
                         try response_writer.writer.writeAll(unmasked);
                         response_body_bytes += unmasked.len;
+                        if (semantic_cache_capture_enabled) {
+                            if (semantic_cache_response_body.items.len + unmasked.len > max_body_size) {
+                                semantic_cache_capture_enabled = false;
+                            } else {
+                                try semantic_cache_response_body.appendSlice(allocator, unmasked);
+                            }
+                        }
                         if (flush_response_per_chunk) {
                             stream_event_count += sse_counter.countEvents(unmasked);
                             try flushResponseChunk(&response_writer);
@@ -1558,12 +1905,34 @@ pub fn handleRequest(
                 if (flushed.len > 0) {
                     try response_writer.writer.writeAll(flushed);
                     response_body_bytes += flushed.len;
+                    if (semantic_cache_capture_enabled) {
+                        if (semantic_cache_response_body.items.len + flushed.len > max_body_size) {
+                            semantic_cache_capture_enabled = false;
+                        } else {
+                            try semantic_cache_response_body.appendSlice(allocator, flushed);
+                        }
+                    }
                     if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
                 }
             }
         }
 
         try response_writer.end();
+    }
+
+    if (semantic_cache_capture_enabled and semantic_cache_key != null) {
+        if (ctx.semantic_cache) |cache| {
+            const before = cache.stats();
+            try cache.store(
+                semantic_cache_key.?,
+                semantic_cache_tenant,
+                @intFromEnum(downstream_res.head.status),
+                response_headers,
+                semantic_cache_response_body.items,
+            );
+            const after = cache.stats();
+            syncSemanticCacheMetrics(ctx.observability, before, after);
+        }
     }
 }
 

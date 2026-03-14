@@ -29,7 +29,13 @@ pub const phone = @import("patterns/phone.zig");
 pub const credit_card = @import("patterns/credit_card.zig");
 pub const ip_address = @import("patterns/ip_address.zig");
 pub const healthcare = @import("patterns/healthcare.zig");
+pub const iban = @import("patterns/iban.zig");
+pub const uk_nino = @import("patterns/uk_nino.zig");
+pub const passport = @import("patterns/passport.zig");
+pub const intl_phone = @import("patterns/intl_phone.zig");
 pub const pattern_scanner = @import("patterns/scanner.zig");
+pub const guardrails = @import("ai/guardrails.zig");
+pub const semantic_cache = @import("infra/semantic_cache.zig");
 
 // Schema-aware redaction (Phase 5 / Epic 8)
 pub const schema = @import("schema/schema.zig");
@@ -79,7 +85,13 @@ test {
     _ = credit_card;
     _ = ip_address;
     _ = healthcare;
+    _ = iban;
+    _ = uk_nino;
+    _ = passport;
+    _ = intl_phone;
     _ = pattern_scanner;
+    _ = guardrails;
+    _ = semantic_cache;
     // Schema-aware redaction
     _ = schema;
     _ = json_redactor;

@@ -29,6 +29,7 @@ const rbac = @import("admin/rbac.zig");
 const ApiKeyStore = rbac.ApiKeyStore;
 const audit_store_mod = @import("infra/audit_store.zig");
 const AuditStore = audit_store_mod.AuditStore;
+const semantic_cache_mod = @import("infra/semantic_cache.zig");
 
 var termination_signal_requested = std.atomic.Value(bool).init(false);
 
@@ -47,6 +48,95 @@ fn installTerminationSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+}
+
+fn appendFeature(
+    features: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    label: []const u8,
+) !void {
+    if (features.items.len > 0) {
+        try features.appendSlice(allocator, ", ");
+    }
+    try features.appendSlice(allocator, label);
+}
+
+fn buildFeatureSummary(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    entity_count: usize,
+    schema_field_count: usize,
+) ![]u8 {
+    var features: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer features.deinit(allocator);
+
+    try appendFeature(&features, allocator, "ssn");
+    if (entity_count > 0 or cfg.admin_api) try appendFeature(&features, allocator, "entity-mask");
+    if (cfg.enable_email) try appendFeature(&features, allocator, "email");
+    if (cfg.enable_phone) try appendFeature(&features, allocator, "phone");
+    if (cfg.enable_credit_card) try appendFeature(&features, allocator, "credit-card");
+    if (cfg.enable_ip) try appendFeature(&features, allocator, "ip");
+    if (cfg.enable_healthcare) try appendFeature(&features, allocator, "healthcare");
+    if (cfg.enable_iban) try appendFeature(&features, allocator, "iban");
+    if (cfg.enable_uk_nino) try appendFeature(&features, allocator, "uk-nino");
+    if (cfg.enable_passport) try appendFeature(&features, allocator, "passport");
+    if (cfg.enable_intl_phone) try appendFeature(&features, allocator, "intl-phone");
+    if (schema_field_count > 0) try appendFeature(&features, allocator, "schema");
+    if (cfg.report_only) try appendFeature(&features, allocator, "report-only");
+
+    if (cfg.enable_guardrails) {
+        var guardrail_buf: [48]u8 = undefined;
+        const label = try std.fmt.bufPrint(&guardrail_buf, "guardrails({s})", .{cfg.guardrail_mode.label()});
+        try appendFeature(&features, allocator, label);
+    }
+
+    if (cfg.enable_semantic_cache) {
+        try appendFeature(&features, allocator, "semantic-cache");
+    }
+
+    if (cfg.admin_api) {
+        try appendFeature(&features, allocator, "admin-api");
+    }
+
+    return try features.toOwnedSlice(allocator);
+}
+
+fn printStartupBanner(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    entity_count: usize,
+    schema_field_count: usize,
+) !void {
+    const feature_summary = try buildFeatureSummary(allocator, cfg, entity_count, schema_field_count);
+    defer allocator.free(feature_summary);
+
+    var schema_buf: [32]u8 = undefined;
+    const schema_summary = if (schema_field_count > 0)
+        try std.fmt.bufPrint(&schema_buf, "{d} fields", .{schema_field_count})
+    else
+        "disabled";
+
+    std.debug.print(
+        "\n" ++
+            "NanoMask {s}\n" ++
+            "  Listener  {s}:{d}\n" ++
+            "  Upstream  {s}://{s}:{d}\n" ++
+            "  Entities  {d}\n" ++
+            "  Schema    {s}\n" ++
+            "  Features  {s}\n" ++
+            "\n",
+        .{
+            Config.version,
+            cfg.listen_host,
+            cfg.listen_port,
+            if (cfg.target_tls) "https" else "http",
+            cfg.target_host,
+            cfg.target_port,
+            entity_count,
+            schema_summary,
+            feature_summary,
+        },
+    );
 }
 
 pub fn main() !void {
@@ -119,12 +209,22 @@ pub fn main() !void {
                 "    credit_card   {s}\n" ++
                 "    ip            {s}\n" ++
                 "    healthcare    {s}\n" ++
+                "    iban          {s}\n" ++
+                "    uk_nino       {s}\n" ++
+                "    passport      {s}\n" ++
+                "    intl_phone    {s}\n" ++
                 "    report_only   {s}\n" ++
+                "    guardrails    {s} ({s})\n" ++
+                "    sem_cache     {s} ttl={d}ms entries={d}\n" ++
                 "\n" ++
                 "  Admin\n" ++
                 "    admin_api     {s}\n" ++
                 "    audit_log     {s}\n" ++
-                "    log_level     {s}\n",
+                "    log_level     {s}\n" ++
+                "\n" ++
+                "  Not Yet Implemented (flags accepted, no effect)\n" ++
+                "    syslog        accepted (UDP syslog forwarding not yet implemented)\n" ++
+                "    mtls          accepted (mTLS enforcement not yet implemented)\n",
             .{
                 cfg.listen_host,
                 cfg.listen_port,
@@ -141,7 +241,16 @@ pub fn main() !void {
                 if (cfg.enable_credit_card) "enabled" else "disabled",
                 if (cfg.enable_ip) "enabled" else "disabled",
                 if (cfg.enable_healthcare) "enabled" else "disabled",
+                if (cfg.enable_iban) "enabled" else "disabled",
+                if (cfg.enable_uk_nino) "enabled" else "disabled",
+                if (cfg.enable_passport) "enabled" else "disabled",
+                if (cfg.enable_intl_phone) "enabled" else "disabled",
                 if (cfg.report_only) "enabled" else "disabled",
+                if (cfg.enable_guardrails) "enabled" else "disabled",
+                cfg.guardrail_mode.label(),
+                if (cfg.enable_semantic_cache) "enabled" else "disabled",
+                cfg.semantic_cache_ttl_ms,
+                cfg.semantic_cache_max_entries,
                 if (cfg.admin_api) "enabled" else "disabled",
                 if (cfg.audit_log) "enabled" else "disabled",
                 @tagName(cfg.log_level),
@@ -244,6 +353,7 @@ pub fn main() !void {
     // thread — avoids dangling pointer risk from stack-local optionals.
     var entity_set: ?*VersionedEntitySet = null;
     var watcher: ?FileWatcher = null;
+    var entity_count: usize = 0;
 
     defer {
         // Join the watcher thread before freeing the entity set it references.
@@ -268,6 +378,7 @@ pub fn main() !void {
             .{ .key = "count", .value = .{ .uint = initial_snapshot.loaded_names.len } },
             .{ .key = "file", .value = .{ .string = ef } },
         });
+        entity_count = initial_snapshot.loaded_names.len;
 
         const es = try allocator.create(VersionedEntitySet);
         es.* = VersionedEntitySet.init(initial_snapshot);
@@ -300,6 +411,7 @@ pub fn main() !void {
             std.process.exit(1);
         };
         log.info("admin_api_enabled", null);
+        entity_count = initial_snapshot.loaded_names.len;
         const es = try allocator.create(VersionedEntitySet);
         es.* = VersionedEntitySet.init(initial_snapshot);
         entity_set = es;
@@ -309,6 +421,7 @@ pub fn main() !void {
 
     // --- Schema-aware redaction setup (Epic 8) ---
     var schema_instance: ?schema_mod.Schema = null;
+    var schema_field_count: usize = 0;
     defer if (schema_instance) |*s| s.deinit();
 
     if (cfg.schema_file) |sf| {
@@ -320,9 +433,10 @@ pub fn main() !void {
         if (cfg.schema_default) |sd| {
             schema_instance.?.default_action = schema_mod.SchemaAction.parse(sd) catch .scan;
         }
+        schema_field_count = schema_instance.?.fieldCount();
         log.log(.info, "schema_loaded", null, &.{
             .{ .key = "file", .value = .{ .string = sf } },
-            .{ .key = "fields", .value = .{ .uint = schema_instance.?.fieldCount() } },
+            .{ .key = "fields", .value = .{ .uint = schema_field_count } },
         });
     }
 
@@ -561,6 +675,28 @@ pub fn main() !void {
         });
     }
 
+    var semantic_cache: ?semantic_cache_mod.SemanticCache = if (cfg.enable_semantic_cache)
+        semantic_cache_mod.SemanticCache.init(allocator, cfg.semantic_cache_max_entries, cfg.semantic_cache_ttl_ms)
+    else
+        null;
+    // Wire the logger so OOM warnings in SemanticCache.lookup() reach the
+    // structured log rather than silently disappearing (F2).
+    if (semantic_cache) |*cache| cache.log = &log;
+    defer if (semantic_cache) |*cache| cache.deinit();
+
+    if (cfg.enable_guardrails) {
+        log.log(.info, "guardrails_enabled", null, &.{
+            .{ .key = "mode", .value = .{ .string = cfg.guardrail_mode.label() } },
+        });
+    }
+    if (cfg.enable_semantic_cache) {
+        log.log(.info, "semantic_cache_enabled", null, &.{
+            .{ .key = "ttl_ms", .value = .{ .uint = cfg.semantic_cache_ttl_ms } },
+            .{ .key = "max_entries", .value = .{ .uint = cfg.semantic_cache_max_entries } },
+            .{ .key = "tenant_header", .value = .{ .string = cfg.semantic_cache_tenant_header } },
+        });
+    }
+
     observability.markStartupReady();
 
     const net_server = try std.net.Address.listen(bind_address, .{
@@ -596,6 +732,9 @@ pub fn main() !void {
             .{ .key = "mutation_rate_limit_per_minute", .value = .{ .uint = cfg.admin_mutation_rate_limit_per_minute } },
         });
     }
+    printStartupBanner(allocator, cfg, entity_count, schema_field_count) catch |err| {
+        std.debug.print("warning: failed to print startup summary: {s}\n", .{@errorName(err)});
+    };
 
     var server = proxy_server_mod.ProxyServer{
         .net_server = net_server,
@@ -622,6 +761,16 @@ pub fn main() !void {
                 .enable_credit_card = cfg.enable_credit_card,
                 .enable_ip = cfg.enable_ip,
                 .enable_healthcare = cfg.enable_healthcare,
+                .enable_iban = cfg.enable_iban,
+                .enable_uk_nino = cfg.enable_uk_nino,
+                .enable_passport = cfg.enable_passport,
+                .enable_intl_phone = cfg.enable_intl_phone,
+                .guardrail_settings = .{
+                    .enabled = cfg.enable_guardrails,
+                    .mode = cfg.guardrail_mode,
+                },
+                .semantic_cache = if (semantic_cache) |*cache| cache else null,
+                .semantic_cache_tenant_header = cfg.semantic_cache_tenant_header,
                 .schema = if (schema_instance) |*s| s else null,
                 .hasher = if (hasher_instance) |*h| h else null,
                 .shutdown_state = &shutdown_state,
@@ -673,6 +822,16 @@ pub fn main() !void {
                     .enable_credit_card = cfg.enable_credit_card,
                     .enable_ip = cfg.enable_ip,
                     .enable_healthcare = cfg.enable_healthcare,
+                    .enable_iban = cfg.enable_iban,
+                    .enable_uk_nino = cfg.enable_uk_nino,
+                    .enable_passport = cfg.enable_passport,
+                    .enable_intl_phone = cfg.enable_intl_phone,
+                    .guardrail_settings = .{
+                        .enabled = cfg.enable_guardrails,
+                        .mode = cfg.guardrail_mode,
+                    },
+                    .semantic_cache = if (semantic_cache) |*cache| cache else null,
+                    .semantic_cache_tenant_header = cfg.semantic_cache_tenant_header,
                     .schema = if (schema_instance) |*s| s else null,
                     .hasher = if (hasher_instance) |*h| h else null,
                     .shutdown_state = &shutdown_state,

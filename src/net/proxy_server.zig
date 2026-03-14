@@ -1,4 +1,5 @@
 const std = @import("std");
+const guardrails_mod = @import("../ai/guardrails.zig");
 const proxy = @import("proxy.zig");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
@@ -19,6 +20,7 @@ const upstream_client = @import("upstream_client.zig");
 const runtime_model_mod = @import("runtime_model.zig");
 const evaluation_report_mod = @import("../infra/evaluation_report.zig");
 const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const semantic_cache_mod = @import("../infra/semantic_cache.zig");
 
 pub const RuntimeModel = runtime_model_mod.RuntimeModel;
 
@@ -44,6 +46,13 @@ pub const ConnectionContext = struct {
     enable_credit_card: bool,
     enable_ip: bool,
     enable_healthcare: bool,
+    enable_iban: bool,
+    enable_uk_nino: bool,
+    enable_passport: bool,
+    enable_intl_phone: bool,
+    guardrail_settings: guardrails_mod.Settings = .{},
+    semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
+    semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     shutdown_state: *shutdown_mod.ShutdownState,
@@ -293,6 +302,13 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ConnectionContex
             .enable_credit_card = ctx.enable_credit_card,
             .enable_ip = ctx.enable_ip,
             .enable_healthcare = ctx.enable_healthcare,
+            .enable_iban = ctx.enable_iban,
+            .enable_uk_nino = ctx.enable_uk_nino,
+            .enable_passport = ctx.enable_passport,
+            .enable_intl_phone = ctx.enable_intl_phone,
+            .guardrail_settings = ctx.guardrail_settings,
+            .semantic_cache = ctx.semantic_cache,
+            .semantic_cache_tenant_header = ctx.semantic_cache_tenant_header,
             .schema = ctx.schema,
             .hasher = ctx.hasher,
             .shutdown_state = ctx.shutdown_state,

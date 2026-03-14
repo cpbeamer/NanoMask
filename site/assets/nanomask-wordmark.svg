@@ -1,0 +1,15 @@
+<svg width="820" height="180" viewBox="0 0 820 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="180" height="180" rx="36" fill="#0D1B19"/>
+  <rect x="24" y="24" width="132" height="132" rx="28" fill="url(#bg)"/>
+  <path d="M90 46C65.4 46 45 65.9 45 90.7V113.3C45 137 64.7 157 90 157C115.3 157 135 137 135 113.3V90.7C135 65.9 114.6 46 90 46Z" fill="#FFF9F0"/>
+  <path d="M60 85H119V106.8C119 123.4 105.6 136.8 89 136.8H90C73.4 136.8 60 123.4 60 106.8V85Z" fill="#0F766E"/>
+  <path d="M68 89L82 103L112 73" stroke="#FFF9F0" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="220" y="93" fill="#0D1B19" font-family="Space Grotesk, Segoe UI, sans-serif" font-size="72" font-weight="700">NanoMask</text>
+  <text x="222" y="132" fill="#4A5A56" font-family="IBM Plex Mono, Consolas, monospace" font-size="24">privacy firewall for regulated AI traffic</text>
+  <defs>
+    <linearGradient id="bg" x1="24" y1="24" x2="156" y2="156" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D8F3EE"/>
+      <stop offset="1" stop-color="#F7E4CC"/>
+    </linearGradient>
+  </defs>
+</svg>
