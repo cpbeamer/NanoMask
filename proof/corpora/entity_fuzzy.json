@@ -15,7 +15,7 @@
       "entities": ["John Doe"],
       "fuzzy_threshold": 0.8,
       "input": "Patient J0hn Doe was seen today.",
-      "expected": "Patient Entity_A was seen today."
+      "expected": "Patient Entity_1 was seen today."
     },
     {
       "id": "middle_initial_variant",
@@ -24,7 +24,7 @@
       "entities": ["John Doe"],
       "fuzzy_threshold": 0.75,
       "input": "Patient John E Doe was seen today.",
-      "expected": "Patient Entity_A was seen today."
+      "expected": "Patient Entity_1 was seen today."
     },
     {
       "id": "last_name_only",
@@ -33,7 +33,7 @@
       "entities": ["John Doe"],
       "fuzzy_threshold": 0.8,
       "input": "Mr. Doe was discharged this morning.",
-      "expected": "Mr. Entity_A was discharged this morning."
+      "expected": "Mr. Entity_1 was discharged this morning."
     },
     {
       "id": "benign_text",

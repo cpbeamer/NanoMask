@@ -44,7 +44,7 @@ const starter_cases = [_]StarterCase{
         .must_contain = &.{
             "\"full_name\":\"[REDACTED]\"",
             "\"subscriber_id\":\"PSEUDO_",
-            "\"notes\":\"Entity_A confirmed SSN ***-**-**** and MRN: [MRN_REDACTED] during intake.\"",
+            "\"notes\":\"Entity_1 confirmed SSN ***-**-**** and MRN: [MRN_REDACTED] during intake.\"",
         },
         .must_not_contain = &.{
             "Jane Smith",
@@ -72,7 +72,7 @@ const starter_cases = [_]StarterCase{
             "\"encounter_id\":\"PSEUDO_",
             "\"display_name\":\"[REDACTED]\"",
             "\"internal_id\":\"PSEUDO_",
-            "\"summary\":\"Entity_A reported dizziness. Dr. Entity_B documented MRN: [MRN_REDACTED], diagnosis [ICD10_REDACTED], call back at [PHONE_REDACTED] or [EMAIL_REDACTED] for follow-up.\"",
+            "\"summary\":\"Entity_1 reported dizziness. Dr. Entity_2 documented MRN: [MRN_REDACTED], diagnosis [ICD10_REDACTED], call back at [PHONE_REDACTED] or [EMAIL_REDACTED] for follow-up.\"",
         },
         .must_not_contain = &.{
             "John Doe",
@@ -102,7 +102,7 @@ const starter_cases = [_]StarterCase{
             "\"member_name\":\"[REDACTED]\"",
             "\"member_id\":\"PSEUDO_",
             "\"policy_number\":\"PSEUDO_",
-            "\"service_note\":\"Entity_A called from [IPV4_REDACTED] about MRN: [MRN_REDACTED] and diagnosis [ICD10_REDACTED]. Member ID: [INSURANCE_REDACTED] verified.\"",
+            "\"service_note\":\"Entity_1 called from [IPV4_REDACTED] about MRN: [MRN_REDACTED] and diagnosis [ICD10_REDACTED]. Member ID: [INSURANCE_REDACTED] verified.\"",
         },
         .must_not_contain = &.{
             "Marisol Vega",

@@ -283,6 +283,29 @@ fn flushResponseChunk(writer: *http.BodyWriter) !void {
     try writer.writer.flush();
     try writer.flush();
 }
+
+/// Stateful counter for SSE event boundaries across buffer chunks.
+/// Handles both LF-only (\n\n) and CRLF (\r\n\r\n) delimiters per the SSE spec.
+/// Used to track per-request event counts for operator observability.
+pub const SseCounter = struct {
+    matched_newlines: u8 = 0,
+
+    pub fn countEvents(self: *SseCounter, data: []const u8) u64 {
+        var count: u64 = 0;
+        for (data) |c| {
+            if (c == '\n') {
+                self.matched_newlines += 1;
+                if (self.matched_newlines == 2) {
+                    count += 1;
+                    self.matched_newlines = 0;
+                }
+            } else if (c != '\r') {
+                self.matched_newlines = 0;
+            }
+        }
+        return count;
+    }
+};
 /// Bundles all context needed by the proxy pipeline, replacing the previous
 /// 14-parameter function signature for clarity and maintainability.
 pub const ProxyContext = struct {
@@ -360,6 +383,11 @@ pub fn handleRequest(
     var upstream_latency_recorded = false;
     var request_outcome: RequestOutcome = .normal;
     var timeout_phase: ?upstream_client.TimeoutPhase = null;
+    // NMV3-014: streaming observability — track response mode and SSE event count
+    var final_response_mode: ResponseForwardingMode = .no_body;
+    var final_flush_per_chunk: bool = false;
+    var stream_event_count: u64 = 0;
+    var sse_counter = SseCounter{};
     defer {
         const raw_total_latency = std.time.nanoTimestamp() - request_start;
         const total_latency_us: u64 = if (raw_total_latency < 0)
@@ -383,7 +411,8 @@ pub fn handleRequest(
         else
             request_outcome;
 
-        var extra_buf: [5]Logger.KV = undefined;
+        // NMV3-014: enhanced response_sent log with streaming diagnostics
+        var extra_buf: [9]Logger.KV = undefined;
         var extra_len: usize = 0;
         extra_buf[extra_len] = .{ .key = "status", .value = .{ .uint = @intFromEnum(response_status) } };
         extra_len += 1;
@@ -393,6 +422,16 @@ pub fn handleRequest(
         extra_len += 1;
         extra_buf[extra_len] = .{ .key = "draining", .value = .{ .boolean = draining } };
         extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "response_mode", .value = .{ .string = responseModeLabel(final_response_mode) } };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "buffer_reason", .value = .{ .string = responseBufferReason(final_response_mode) } };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .key = "flush_per_chunk", .value = .{ .boolean = final_flush_per_chunk } };
+        extra_len += 1;
+        if (stream_event_count > 0) {
+            extra_buf[extra_len] = .{ .key = "stream_event_count", .value = .{ .uint = stream_event_count } };
+            extra_len += 1;
+        }
         if (timeout_phase) |phase| {
             extra_buf[extra_len] = .{ .key = "timeout_phase", .value = .{ .string = timeoutPhaseLabel(phase) } };
             extra_len += 1;
@@ -1246,6 +1285,9 @@ pub fn handleRequest(
         response_kind,
         downstream_res.head.content_type,
     );
+    // NMV3-014: capture for deferred response_sent log
+    final_response_mode = response_mode;
+    final_flush_per_chunk = flush_response_per_chunk;
 
     log.log(.info, "upstream_forwarded", session_id, &.{
         .{ .key = "status", .value = .{ .uint = @intFromEnum(downstream_res.head.status) } },
@@ -1453,9 +1495,13 @@ pub fn handleRequest(
                         return err;
                     };
                     if (bytes_read == 0) break;
-                    try response_writer.writer.writeAll(resp_buf[0..bytes_read]);
+                    const chunk = resp_buf[0..bytes_read];
+                    try response_writer.writer.writeAll(chunk);
                     response_body_bytes += bytes_read;
-                    if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
+                    if (flush_response_per_chunk) {
+                        stream_event_count += sse_counter.countEvents(chunk);
+                        try flushResponseChunk(&response_writer);
+                    }
                 }
             } else {
                 var unmask_state = active_entity_map.?.initUnmaskChunkState();
@@ -1500,7 +1546,10 @@ pub fn handleRequest(
                     if (unmasked.len > 0) {
                         try response_writer.writer.writeAll(unmasked);
                         response_body_bytes += unmasked.len;
-                        if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
+                        if (flush_response_per_chunk) {
+                            stream_event_count += sse_counter.countEvents(unmasked);
+                            try flushResponseChunk(&response_writer);
+                        }
                     }
                 }
 
@@ -1558,4 +1607,20 @@ test "parseEntityHeader - trailing and leading commas with whitespace" {
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqualStrings("John Doe", result[0]);
     try std.testing.expectEqualStrings("Jane Smith", result[1]);
+}
+
+test "SseCounter - tracks events across chunk boundaries" {
+    var counter = SseCounter{};
+    
+    // Chunk 1 has part of the CRLF sequence
+    const c1 = counter.countEvents("data: hello\r\n\r");
+    try std.testing.expectEqual(@as(u64, 0), c1);
+    
+    // Chunk 2 finishes the boundary
+    const c2 = counter.countEvents("\n");
+    try std.testing.expectEqual(@as(u64, 1), c2);
+    
+    // Chunk 3 has an LF-only sequence
+    const c3 = counter.countEvents("data: another\n\n");
+    try std.testing.expectEqual(@as(u64, 1), c3);
 }

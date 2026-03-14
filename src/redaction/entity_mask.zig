@@ -5,7 +5,7 @@ const std = @import("std");
 // ---------------------------------------------------------------------------
 // Dictionary-based name pseudonymization for PII/PHI de-identification.
 // Given known names (e.g. "John Doe", "Dr. Smith"), replaces all occurrences
-// with deterministic aliases ("Entity_A", "Entity_B") in a single O(n) pass
+// with deterministic aliases ("Entity_1", "Entity_2") in a single O(n) pass
 // using an Aho-Corasick multi-pattern automaton.
 //
 // Bidirectional: mask() replaces names->aliases, unmask() reverses aliases->names.
@@ -55,33 +55,13 @@ fn isWordBoundaryAfter(input: []const u8, pos: usize) bool {
 // Alias generation
 // ---------------------------------------------------------------------------
 
-/// Maximum supported entities: A-Z (26) + AA-ZZ (676) = 702.
-const max_entities = 702;
-
 /// Prefix used for all generated alias identifiers.
 const alias_prefix = "Entity_";
 
-/// Generate a deterministic alias: Entity_A, Entity_B, ..., Entity_Z, Entity_AA, ...
+/// Generate a deterministic alias: Entity_1, Entity_2, ..., Entity_N.
+/// Unbounded — supports arbitrarily large entity sets.
 fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
-    if (index >= max_entities) return error.TooManyEntities;
-
-    var suffix_buf: [2]u8 = undefined;
-    var suffix_len: usize = 0;
-
-    if (index < 26) {
-        suffix_buf[0] = @as(u8, @intCast(index)) + 'A';
-        suffix_len = 1;
-    } else {
-        const adjusted = index - 26;
-        suffix_buf[0] = @as(u8, @intCast(adjusted / 26)) + 'A';
-        suffix_buf[1] = @as(u8, @intCast(adjusted % 26)) + 'A';
-        suffix_len = 2;
-    }
-
-    const result = try allocator.alloc(u8, alias_prefix.len + suffix_len);
-    @memcpy(result[0..alias_prefix.len], alias_prefix);
-    @memcpy(result[alias_prefix.len..result.len], suffix_buf[0..suffix_len]);
-    return result;
+    return std.fmt.allocPrint(allocator, "{s}{d}", .{ alias_prefix, index + 1 });
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +448,7 @@ pub const AcChunkState = struct {
 ///   defer em.deinit();
 ///   const masked = try em.mask("Patient John Doe was seen by Dr. Smith", allocator);
 ///   defer allocator.free(masked);
-///   // masked == "Patient Entity_A was seen by Entity_B"
+///   // masked == "Patient Entity_1 was seen by Entity_2"
 pub const EntityMap = struct {
     names: [][]u8,
     aliases: [][]u8,
@@ -872,7 +852,7 @@ test "EntityMap - single name replacement" {
 
     const result = try em.mask("Patient John Doe was examined.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Patient Entity_A was examined.", result);
+    try std.testing.expectEqualStrings("Patient Entity_1 was examined.", result);
 }
 
 test "EntityMap - multiple names" {
@@ -882,7 +862,7 @@ test "EntityMap - multiple names" {
 
     const result = try em.mask("John Doe was seen by Dr. Smith today.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Entity_A was seen by Entity_B today.", result);
+    try std.testing.expectEqualStrings("Entity_1 was seen by Entity_2 today.", result);
 }
 
 test "EntityMap - collectMaskMatches exposes selected aliases" {
@@ -894,8 +874,8 @@ test "EntityMap - collectMaskMatches exposes selected aliases" {
     defer allocator.free(matches);
 
     try std.testing.expectEqual(@as(usize, 2), matches.len);
-    try std.testing.expectEqualStrings("Entity_A", matches[0].replacement);
-    try std.testing.expectEqualStrings("Entity_B", matches[1].replacement);
+    try std.testing.expectEqualStrings("Entity_1", matches[0].replacement);
+    try std.testing.expectEqualStrings("Entity_2", matches[1].replacement);
 }
 
 test "EntityMap - case insensitive matching" {
@@ -905,7 +885,7 @@ test "EntityMap - case insensitive matching" {
 
     const result = try em.mask("JOHN DOE and john doe are the same.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Entity_A and Entity_A are the same.", result);
+    try std.testing.expectEqualStrings("Entity_1 and Entity_1 are the same.", result);
 }
 
 test "EntityMap - word boundary enforcement" {
@@ -1046,7 +1026,7 @@ test "EntityMap - unmask round trip" {
 
     const masked = try em.mask(original, allocator);
     defer allocator.free(masked);
-    try std.testing.expectEqualStrings("Entity_A and Entity_B filed claims.", masked);
+    try std.testing.expectEqualStrings("Entity_1 and Entity_2 filed claims.", masked);
 
     const unmasked = try em.unmask(masked, allocator);
     defer allocator.free(unmasked);
@@ -1060,23 +1040,23 @@ test "EntityMap - multiple occurrences of same name" {
 
     const result = try em.mask("John Doe said that John Doe was here.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Entity_A said that Entity_A was here.", result);
+    try std.testing.expectEqualStrings("Entity_1 said that Entity_1 was here.", result);
 }
 
 test "EntityMap - alias generation sequence" {
     const allocator = std.testing.allocator;
-    // Verify alias naming: A, B, C, ...
+    // Verify alias naming: 1, 2, 3, ...
     const a0 = try generateAlias(allocator, 0);
     defer allocator.free(a0);
-    try std.testing.expectEqualStrings("Entity_A", a0);
+    try std.testing.expectEqualStrings("Entity_1", a0);
 
     const a25 = try generateAlias(allocator, 25);
     defer allocator.free(a25);
-    try std.testing.expectEqualStrings("Entity_Z", a25);
+    try std.testing.expectEqualStrings("Entity_26", a25);
 
-    const a26 = try generateAlias(allocator, 26);
-    defer allocator.free(a26);
-    try std.testing.expectEqualStrings("Entity_AA", a26);
+    const a999 = try generateAlias(allocator, 999);
+    defer allocator.free(a999);
+    try std.testing.expectEqualStrings("Entity_1000", a999);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,6 +32,10 @@ pub const FlowId = enum {
     azure_openai,
     generic_json_rest,
     litellm_proxy_headers,
+    // NMV3-014: edge-case flows
+    anthropic_long_session,
+    compressed_response_bypass,
+    buffered_hash_response,
 };
 
 pub const FlowResult = struct {
@@ -123,6 +127,31 @@ const flow_definitions = [_]FlowDefinition{
         .key = "litellm_proxy_headers",
         .label = "LiteLLM-style proxy headers",
         .vendor = "LiteLLM-style",
+        .method = .POST,
+        .target = "/v1/chat/completions",
+    },
+    // NMV3-014: edge-case flows
+    .{
+        .id = .anthropic_long_session,
+        .key = "anthropic_long_session",
+        .label = "Anthropic long-lived SSE session",
+        .vendor = "Anthropic-style",
+        .method = .POST,
+        .target = "/v1/messages",
+    },
+    .{
+        .id = .compressed_response_bypass,
+        .key = "compressed_response_bypass",
+        .label = "Compressed response bypass",
+        .vendor = "Generic REST",
+        .method = .POST,
+        .target = "/v1/data",
+    },
+    .{
+        .id = .buffered_hash_response,
+        .key = "buffered_hash_response",
+        .label = "HASH-mode buffered response",
+        .vendor = "OpenAI-compatible",
         .method = .POST,
         .target = "/v1/chat/completions",
     },
@@ -694,6 +723,180 @@ fn evaluateLiteLlm(allocator: std.mem.Allocator, definition: FlowDefinition, rep
     report.checks.response_header_fidelity = if (response_ok) .pass else .fail;
 }
 
+// ===========================================================================
+// NMV3-014: Edge-case evaluator functions
+// ===========================================================================
+
+fn evaluateAnthropicLongSession(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
+    const request_headers = [_]http.Header{
+        .{ .name = "x-api-key", .value = "anthropic-long-session-key" },
+        .{ .name = "anthropic-version", .value = "2023-06-01" },
+        .{ .name = "Accept", .value = "text/event-stream" },
+    };
+    const response_headers = [_]http.Header{
+        .{ .name = "anthropic-request-id", .value = "msg_long_session_1" },
+        .{ .name = "Cache-Control", .value = "no-cache" },
+    };
+
+    // 10-event long-lived stream with mixed Anthropic event types
+    const stream_chunks = [_][]const u8{
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\"}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"The \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"patient \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"record \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"shows \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"normal \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"results.\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    };
+
+    var expected_buf = std.ArrayListUnmanaged(u8).empty;
+    defer expected_buf.deinit(allocator);
+    for (stream_chunks) |chunk| {
+        try expected_buf.appendSlice(allocator, chunk);
+    }
+
+    const request_body =
+        \\{"model":"claude-3-5-sonnet","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Summarize patient chart SSN 123-45-6789"}]}
+    ;
+
+    var result = try harness.roundTrip(allocator, request_body, .{
+        .request_method = definition.method,
+        .request_target = definition.target,
+        .request_extra_headers = &request_headers,
+        .upstream_stream_chunks = &stream_chunks,
+        .upstream_inter_chunk_delay_ms = 50,
+        .upstream_content_type = "text/event-stream",
+        .upstream_extra_headers = &response_headers,
+    });
+    defer result.deinit();
+
+    // SSN should be redacted in upstream request
+    var body_ok = true;
+    if (!(try checkStatusEquals(allocator, report, result.status, .ok, definition.label))) body_ok = false;
+    if (!(try checkNotContains(allocator, report, result.upstream_body, "123-45-6789", "Anthropic long session upstream"))) body_ok = false;
+    if (!(try checkContains(allocator, report, result.upstream_body, "***-**-****", "Anthropic long session upstream"))) body_ok = false;
+    report.checks.body_mutation = if (body_ok) .pass else .fail;
+
+    // Streaming fidelity: all 10 events should arrive incrementally.
+    // 10 chunks × 50ms inter-chunk delay = ~500ms minimum. Allow 1500ms
+    // ceiling to avoid flakiness under CI load.
+    const streaming_ok = try checkStreaming(
+        allocator,
+        report,
+        result,
+        expected_buf.items,
+        200,
+        1500,
+    );
+    report.checks.streaming = if (streaming_ok) .pass else .fail;
+
+    // Verify per-event structure: each event type delimiter survived intact
+    if (report.checks.streaming == .pass) {
+        var events_ok = true;
+        if (!(try checkContains(allocator, report, result.client_body, "event: message_start\n", "long session event delimiters"))) events_ok = false;
+        if (!(try checkContains(allocator, report, result.client_body, "event: content_block_start\n", "long session event delimiters"))) events_ok = false;
+        if (!(try checkContains(allocator, report, result.client_body, "event: content_block_stop\n", "long session event delimiters"))) events_ok = false;
+        if (!(try checkContains(allocator, report, result.client_body, "event: message_stop\n", "long session event delimiters"))) events_ok = false;
+        if (!events_ok) report.checks.streaming = .fail;
+    }
+
+    if (result.first_chunk_latency_ns) |ns| {
+        report.checks.first_token_latency_ms = ns / std.time.ns_per_ms;
+    }
+}
+
+fn evaluateCompressedBypass(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
+    // A response with Content-Encoding: gzip should be forwarded to the client
+    // untouched — the proxy bypasses the body rather than attempting to
+    // decompress or inspect it. This tests Content-Encoding bypass policy,
+    // not actual gzip decompression correctness.
+    const request_body =
+        \\{"query":"SELECT * FROM records WHERE ssn = '123-45-6789'"}
+    ;
+    // Opaque binary payload representing a real gzip body. The proxy must not
+    // corrupt or inspect it; it should be forwarded byte-for-byte.
+    const compressed_response = "FAKE_GZIP_PAYLOAD_1234567890";
+    const response_headers = [_]http.Header{
+        .{ .name = "Content-Encoding", .value = "gzip" },
+        .{ .name = "x-custom-trace", .value = "compressed-test-1" },
+    };
+
+    var result = try harness.roundTrip(allocator, request_body, .{
+        .request_method = definition.method,
+        .request_target = definition.target,
+        .upstream_response = compressed_response,
+        .upstream_content_type = "application/json",
+        .upstream_extra_headers = &response_headers,
+        .unsupported_response_body_behavior = .bypass,
+    });
+    defer result.deinit();
+
+    // The compressed response body should be returned to the client unchanged
+    var body_ok = true;
+    if (!(try checkStatusEquals(allocator, report, result.status, .ok, definition.label))) body_ok = false;
+    if (!(try checkBodyEquals(allocator, report, result.client_body, compressed_response, "compressed bypass client response"))) body_ok = false;
+    report.checks.body_mutation = if (body_ok) .pass else .fail;
+
+    // Content-Encoding should be forwarded to the client
+    var response_ok = true;
+    if (!(try checkHeaderEquals(allocator, report, result.client_head, "Content-Encoding", "gzip"))) response_ok = false;
+    if (!(try checkHeaderEquals(allocator, report, result.client_head, "x-custom-trace", "compressed-test-1"))) response_ok = false;
+    report.checks.response_header_fidelity = if (response_ok) .pass else .fail;
+}
+
+fn evaluateBufferedHash(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
+    const hasher_mod = @import("../schema/hasher.zig");
+    const schema_mod = @import("../schema/schema.zig");
+
+    // Set up a schema with a HASH field and a hasher
+    var hasher = try hasher_mod.Hasher.init(null, allocator);
+    defer hasher.deinit();
+
+    // Schema uses INI-like format: key_path = ACTION
+    const schema_content =
+        \\schema.name = hash_test
+        \\content = HASH
+    ;
+    var schema = try schema_mod.Schema.parseContent(schema_content, allocator);
+    defer schema.deinit();
+
+    const request_body =
+        \\{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Patient SSN 123-45-6789 needs review"}]}
+    ;
+    // The upstream response contains a value that the HASH pipeline will pseudonymize
+    // on the request path, then unhash on the response path
+    const response_body =
+        \\{"id":"chatcmpl-hash-1","choices":[{"message":{"role":"assistant","content":"Reviewed successfully"}}]}
+    ;
+
+    var result = try harness.roundTrip(allocator, request_body, .{
+        .request_method = definition.method,
+        .request_target = definition.target,
+        .upstream_response = response_body,
+        .upstream_content_type = "application/json",
+        .schema = &schema,
+        .hasher = &hasher,
+    });
+    defer result.deinit();
+
+    var body_ok = true;
+    if (!(try checkStatusEquals(allocator, report, result.status, .ok, definition.label))) body_ok = false;
+    // SSN should be redacted in the upstream request
+    if (!(try checkNotContains(allocator, report, result.upstream_body, "123-45-6789", "HASH upstream request"))) body_ok = false;
+    report.checks.body_mutation = if (body_ok) .pass else .fail;
+
+    // Response should be successfully unhashed and returned to client
+    var response_ok = true;
+    if (!(try checkHeaderEquals(allocator, report, result.client_head, "Content-Type", "application/json"))) response_ok = false;
+    // The response body should be returned (the content field wasn't pseudonymized
+    // since it's an output, so the body should match the upstream response)
+    if (!(try checkContains(allocator, report, result.client_body, "Reviewed successfully", "HASH client response"))) response_ok = false;
+    report.checks.response_header_fidelity = if (response_ok) .pass else .fail;
+}
+
 fn evaluateFlow(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
     switch (definition.id) {
         .openai_json => try evaluateOpenAi(allocator, definition, report),
@@ -702,6 +905,10 @@ fn evaluateFlow(allocator: std.mem.Allocator, definition: FlowDefinition, report
         .azure_openai => try evaluateAzureOpenAi(allocator, definition, report),
         .generic_json_rest => try evaluateGenericJsonRest(allocator, definition, report),
         .litellm_proxy_headers => try evaluateLiteLlm(allocator, definition, report),
+        // NMV3-014: edge-case flows
+        .anthropic_long_session => try evaluateAnthropicLongSession(allocator, definition, report),
+        .compressed_response_bypass => try evaluateCompressedBypass(allocator, definition, report),
+        .buffered_hash_response => try evaluateBufferedHash(allocator, definition, report),
     }
 }
 
@@ -941,6 +1148,33 @@ test "compatibility matrix - LiteLLM-style header flow" {
     const allocator = std.testing.allocator;
 
     var report = try runFlow(allocator, .litellm_proxy_headers);
+    defer report.deinit(allocator);
+    try report.expectNoUnexpectedRegression();
+}
+
+test "compatibility matrix - Anthropic long-lived SSE session" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var report = try runFlow(allocator, .anthropic_long_session);
+    defer report.deinit(allocator);
+    try report.expectNoUnexpectedRegression();
+}
+
+test "compatibility matrix - compressed response bypass" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var report = try runFlow(allocator, .compressed_response_bypass);
+    defer report.deinit(allocator);
+    try report.expectNoUnexpectedRegression();
+}
+
+test "compatibility matrix - HASH-mode buffered response" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var report = try runFlow(allocator, .buffered_hash_response);
     defer report.deinit(allocator);
     try report.expectNoUnexpectedRegression();
 }

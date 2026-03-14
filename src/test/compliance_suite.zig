@@ -414,7 +414,7 @@ test "e2e compliance - unsupported response rejected when configured" {
 
     var result = try harness.roundTrip(allocator, "{\"patient\":\"Jane Smith\"}", .{
         .entity_names = &names,
-        .upstream_response = "<patient>Entity_A</patient>",
+        .upstream_response = "<patient>Entity_1</patient>",
         .upstream_content_type = "application/xml",
         .unsupported_response_body_behavior = body_policy.UnsupportedBodyBehavior.reject,
     });

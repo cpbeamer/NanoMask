@@ -139,6 +139,9 @@ pub const ProxyServer = struct {
                 .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
                 .{ .key = "active_connections", .value = .{ .uint = self.active_connections.load(.acquire) } },
             });
+            self.logger.log(.info, "shutdown_draining", null, &.{
+                .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
+            });
         }
 
         self.closeListener();
@@ -149,7 +152,7 @@ pub const ProxyServer = struct {
     }
 
     fn initRuntime(self: *ProxyServer) !void {
-        if (self.runtime_model != .worker_pool) return;
+        if (self.runtime_model.effectiveModel() != .worker_pool) return;
 
         // Worker thread count must be resolved by the caller before starting.
         // A zero value here indicates a configuration bug — fail explicitly.
@@ -170,13 +173,6 @@ pub const ProxyServer = struct {
     }
 
     fn finishShutdown(self: *ProxyServer) void {
-        if (self.shutdown_state.beginDraining()) {
-            self.observability.markShutdownDraining();
-            self.logger.log(.info, "shutdown_draining", null, &.{
-                .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
-            });
-        }
-
         const drain_result = shutdown_mod.waitForDrain(self.active_connections, self.drain_timeout_ms);
         if (drain_result.completed) {
             self.logger.log(.info, "shutdown_complete", null, &.{
@@ -200,7 +196,7 @@ pub const ProxyServer = struct {
     }
 
     fn dispatchConnection(self: *ProxyServer, connection: std.net.Server.Connection) !void {
-        switch (self.runtime_model) {
+        switch (self.runtime_model.effectiveModel()) {
             .thread_per_connection => {
                 const thread = try std.Thread.spawn(.{}, dispatchOwnedConnection, .{
                     &self.handler,
@@ -215,6 +211,7 @@ pub const ProxyServer = struct {
                     connection,
                 });
             },
+            .io_uring => unreachable, // effectiveModel() never returns io_uring while unimplemented
         }
     }
 };

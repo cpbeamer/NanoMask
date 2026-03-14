@@ -63,6 +63,41 @@ flow. In loopback tests, first-token latency is typically under 10 ms.
 | Field | Values | Meaning |
 |---|---|---|
 | `response_mode` | `stream_passthrough`, `stream_unmask`, `buffered`, `no_body` | Which forwarding path was used |
-| `buffer_reason` | `json_unhash`, absent | Why buffering was forced |
+| `buffer_reason` | `json_unhash`, `-` | Why buffering was forced |
 | `flush_per_chunk` | `true`, `false` | Whether per-chunk flushing was active |
+| `stream_event_count` | integer (only present when > 0) | Number of SSE events (`\n\n` delimiters) forwarded |
 | `response_body_bytes` | integer | Total bytes forwarded to the client |
+
+## Edge Cases (NMV3-014)
+
+### Compressed Response Bypass
+
+When the upstream returns a response with `Content-Encoding: gzip` (or any non-identity
+encoding), the proxy **bypasses** the body untouched. The compressed bytes are forwarded
+to the client as-is, and the `Content-Encoding` header is preserved. The proxy logs
+`body_policy=bypass` for these responses.
+
+### HASH-Mode Buffering Under SSE
+
+If the request used schema `HASH` pseudonymisation AND the upstream returns
+`text/event-stream`, the proxy must still buffer the full response for JSON unhashing.
+Streaming is disabled and `response_mode=buffered` is logged. Operators who need both
+SSE and HASH should be aware of the latency impact.
+
+### Long-Lived SSE Sessions
+
+For Anthropic-style multi-event streams (10+ events with mixed types like
+`message_start`, `content_block_delta`, `content_block_stop`, `message_stop`), the
+proxy flushes per raw chunk when `flush_per_chunk=true`. Each SSE event delimiter
+(`\n\n`) is counted and logged as `stream_event_count`.
+
+### Diagnosing Collapsed Events
+
+If the client observes fewer chunks than expected, check:
+
+1. **`flush_per_chunk`** — should be `true` for SSE/NDJSON
+2. **`stream_event_count`** — should match the expected event count
+3. **`response_mode`** — should be `stream_passthrough` or `stream_unmask` (not `buffered`)
+4. **Transfer Protocol** — upstream should use `Transfer-Encoding: chunked` (HTTP/1.1) or the response should have
+   `text/event-stream` Content-Type (HTTP/1.1, HTTP/2, HTTP/3)
+

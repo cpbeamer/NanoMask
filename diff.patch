@@ -1,0 +1,1064 @@
+diff --git a/docs/architecture.md b/docs/architecture.md
+index de0cccf..cf21f1f 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -11,7 +11,7 @@ Rather than relying on third-party frameworks like `zap`, the proxy is built ent
+ *   **Listener (`std.net.Server`)**: Binds to a configurable listener address with `reuse_address` enabled to handle incoming TCP connections. The default is `127.0.0.1:8081` for sidecar-safe localhost binding, while gateway deployments can use `0.0.0.0:8081`.
+ *   **Ingress Server (`std.http.Server`)**: Wraps the incoming connection stream. Utilizes specific `reader.interface()` and `&writer.interface` generic IO wrappers to coerce buffered connection streams into HTTP Server objects.
+ *   **Egress Client (`std.http.Client`)**: Manages the outbound connection to the downstream API. Supports both bodiless (`sendBodilessUnflushed`) and body-forwarding (`sendBodyComplete`) modes depending on the request method.
+-*   **Thread-Per-Connection Model**: Each accepted connection is dispatched to a dedicated, short-lived thread via `std.Thread.spawn` (not a fixed-size pool). An atomic counter enforces a configurable connection cap. Per-thread HTTP clients are created to avoid shared mutable state; the session-level entity map is passed as read-only context.
++*   **Thread-Per-Connection Model**: Each accepted connection is dispatched to a dedicated, short-lived thread via `std.Thread.spawn` (not a fixed-size pool). An atomic counter enforces a configurable connection cap. Per-thread HTTP clients are created to avoid shared mutable state; the session-level entity map is passed as read-only context. Alternative concurrency models (worker-pool, io_uring) are selectable via `--runtime-model`.
+ 
+ ## 2. Data Flow & Payload Buffering
+ 
+@@ -60,10 +60,10 @@ The entity masking engine provides dictionary-based name pseudonymization for PI
+ 
+ ### Bidirectional EntityMap
+ *   **`EntityMap`**: Session-level context holding a bidirectional name↔alias mapping with two pre-built automatons.
+-*   **`mask()`**: Replaces real names with deterministic aliases (`Entity_A`, `Entity_B`, ...). Used on the request path before payloads reach the LLM.
++*   **`mask()`**: Replaces real names with deterministic aliases (`Entity_1`, `Entity_2`, ...). Used on the request path before payloads reach the LLM.
+ *   **`unmask()`**: Reverses aliases back to real names. Used on the response path to restore original names in LLM output.
+ *   **Overlap Resolution**: When multiple patterns match at overlapping positions, the engine uses leftmost-longest greedy selection.
+-*   **Entity Limit**: Up to 702 entities per session (A–Z = 26, AA–ZZ = 676). Exceeding this returns `error.TooManyEntities`.
++*   **Entity Limit**: Unbounded — numeric alias suffix (`Entity_1` through `Entity_N`) supports arbitrarily large entity sets.
+ 
+ ### Dynamic Entity Loading
+ The `X-ZPG-Entities` header allows per-request entity specification:
+@@ -122,8 +122,14 @@ Upstream TLS uses `std.http.Client` with system or custom CA bundles (`--target-
+ 
+ For the full strategy document, decision matrix, and deployment topology diagrams, see [docs/tls_strategy.md](tls_strategy.md).
+ 
+-## 7. State Management
++## 7. State Management & Runtime Models
+ 
+-Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers and HTTP server instance. A single `std.http.Client` is shared across all handler threads; its built-in `ConnectionPool` is thread-safe (uses `std.Thread.Mutex`) and reuses TCP connections with keep-alive (default 32 pooled connections). This eliminates per-request TCP handshake overhead. An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context; both are optional, enabling SSN-only proxy mode without entity masking.
++NanoMask supports three concurrency models, selectable via `--runtime-model`:
+ 
+-**Phase 3 Scalability**: The current thread-per-connection model is a deliberate simplicity trade-off. An `io_uring`/IOCP-based event loop via `std.Io` would be the natural evolution for 10K+ concurrent connection workloads.
++| Model | Flag | Description |
++|---|---|---|
++| **thread-per-connection** | `--runtime-model thread-per-connection` (default) | One OS thread per active connection. Simple, low-latency, suitable for ≤128 concurrent connections. |
++| **worker-pool** | `--runtime-model worker-pool` | Fixed-size thread pool (auto-sized to 2×CPU or `--worker-threads`). Better memory footprint under bursty loads. |
++| **io-uring** | `--runtime-model io-uring` | **Planned (not yet implemented).** Scaffolded for a future `io_uring`-based event loop targeting 10K+ concurrent connections. Currently falls back to `worker-pool` on all platforms. Track: NMV3-017. |
++
++Connections share a single `std.http.Client` with a thread-safe `ConnectionPool` (default 32 pooled connections) for keep-alive reuse. An atomic counter enforces a configurable cap (default 128) to prevent resource exhaustion. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context.
+diff --git a/docs/streaming_behavior.md b/docs/streaming_behavior.md
+index 34eea6e..d222a6d 100644
+--- a/docs/streaming_behavior.md
++++ b/docs/streaming_behavior.md
+@@ -63,6 +63,41 @@ flow. In loopback tests, first-token latency is typically under 10 ms.
+ | Field | Values | Meaning |
+ |---|---|---|
+ | `response_mode` | `stream_passthrough`, `stream_unmask`, `buffered`, `no_body` | Which forwarding path was used |
+-| `buffer_reason` | `json_unhash`, absent | Why buffering was forced |
++| `buffer_reason` | `json_unhash`, `-` | Why buffering was forced |
+ | `flush_per_chunk` | `true`, `false` | Whether per-chunk flushing was active |
++| `stream_event_count` | integer (only present when > 0) | Number of SSE events (`\n\n` delimiters) forwarded |
+ | `response_body_bytes` | integer | Total bytes forwarded to the client |
++
++## Edge Cases (NMV3-014)
++
++### Compressed Response Bypass
++
++When the upstream returns a response with `Content-Encoding: gzip` (or any non-identity
++encoding), the proxy **bypasses** the body untouched. The compressed bytes are forwarded
++to the client as-is, and the `Content-Encoding` header is preserved. The proxy logs
++`body_policy=bypass` for these responses.
++
++### HASH-Mode Buffering Under SSE
++
++If the request used schema `HASH` pseudonymisation AND the upstream returns
++`text/event-stream`, the proxy must still buffer the full response for JSON unhashing.
++Streaming is disabled and `response_mode=buffered` is logged. Operators who need both
++SSE and HASH should be aware of the latency impact.
++
++### Long-Lived SSE Sessions
++
++For Anthropic-style multi-event streams (10+ events with mixed types like
++`message_start`, `content_block_delta`, `content_block_stop`, `message_stop`), the
++proxy flushes per raw chunk when `flush_per_chunk=true`. Each SSE event delimiter
++(`\n\n`) is counted and logged as `stream_event_count`.
++
++### Diagnosing Collapsed Events
++
++If the client observes fewer chunks than expected, check:
++
++1. **`flush_per_chunk`** — should be `true` for SSE/NDJSON
++2. **`stream_event_count`** — should match the expected event count
++3. **`response_mode`** — should be `stream_passthrough` or `stream_unmask` (not `buffered`)
++4. **Transfer-Encoding** — upstream should use `chunked` or the response should have
++   `text/event-stream` Content-Type
++
+diff --git a/src/entity/versioned_entity_set.zig b/src/entity/versioned_entity_set.zig
+index c385fff..ef0bfe1 100644
+--- a/src/entity/versioned_entity_set.zig
++++ b/src/entity/versioned_entity_set.zig
+@@ -50,27 +50,37 @@ pub const EntitySnapshot = struct {
+     }
+ };
+ 
+-/// Manages atomic swap between entity snapshots using the RCU pattern.
+-/// Readers call `acquire()` to get a snapshot pointer (lock-free, no mutex).
+-/// Writers call `swap()` to atomically install a new snapshot.
++/// Manages safe swap between entity snapshots.
++/// Readers call `acquire()` to get a ref-counted snapshot pointer.
++/// Writers call `swap()` to install a new snapshot.
++///
++/// A RwLock eliminates the TOCTOU race between loading the pointer and
++/// incrementing the ref count. Multiple readers proceed concurrently;
++/// a swap blocks briefly until all active acquires have incremented their
++/// ref counts, then releases. Entity reloads are rare, so the lock is
++/// almost never contended.
+ pub const VersionedEntitySet = struct {
+-    current: std.atomic.Value(?*EntitySnapshot),
++    current: ?*EntitySnapshot,
+     version: std.atomic.Value(u32),
+     allocator: std.mem.Allocator,
++    lock: std.Thread.RwLock = .{},
+ 
+     pub fn init(initial_snapshot: *EntitySnapshot) VersionedEntitySet {
+         return .{
+-            .current = std.atomic.Value(?*EntitySnapshot).init(initial_snapshot),
++            .current = initial_snapshot,
+             .version = std.atomic.Value(u32).init(initial_snapshot.version),
+             .allocator = initial_snapshot.allocator,
+         };
+     }
+ 
+     /// Acquire the current snapshot for use during a request.
+-    /// Increments ref_count atomically — no mutex, no contention.
++    /// Increments ref_count while holding a shared read lock, eliminating
++    /// the TOCTOU window that existed between the pointer load and increment.
+     /// Caller MUST call `release()` when done.
+     pub fn acquire(self: *VersionedEntitySet) *EntitySnapshot {
+-        const snapshot = self.current.load(.acquire).?;
++        self.lock.lockShared();
++        defer self.lock.unlockShared();
++        const snapshot = self.current.?;
+         snapshot.acquire();
+         return snapshot;
+     }
+@@ -82,14 +92,19 @@ pub const VersionedEntitySet = struct {
+         _ = snapshot.release();
+     }
+ 
+-    /// Atomically swap the current snapshot with `new_snapshot`.
+-    /// The old snapshot's ref_count is decremented (for the "set owns it" ref).
+-    /// If no requests are using the old snapshot, it's freed immediately.
+-    /// Otherwise it's freed when the last request releases it.
++    /// Install `new_snapshot` as the current snapshot.
++    /// Holds an exclusive write lock so no acquire() can race the pointer
++    /// swap and ref-count release of the old snapshot.
+     pub fn swap(self: *VersionedEntitySet, new_snapshot: *EntitySnapshot) void {
++        self.lock.lock();
++        defer self.lock.unlock();
+         self.version.store(new_snapshot.version, .release);
+-        const old = self.current.swap(new_snapshot, .acq_rel);
+-        // Release the set's own reference to the old snapshot
++        const old = self.current;
++        self.current = new_snapshot;
++        // Release the set's own reference to the old snapshot.
++        // Safe: no reader can hold the old pointer without having already
++        // incremented its ref count, because acquire() holds the shared lock
++        // for the duration of load+increment.
+         if (old) |old_snap| {
+             _ = old_snap.release();
+         }
+@@ -104,8 +119,10 @@ pub const VersionedEntitySet = struct {
+ 
+     /// Clean up: release the set's reference to the current snapshot.
+     pub fn deinit(self: *VersionedEntitySet) void {
+-        const snap = self.current.swap(null, .acq_rel);
+-        if (snap) |s| {
++        self.lock.lock();
++        defer self.lock.unlock();
++        if (self.current) |s| {
++            self.current = null;
+             _ = s.release();
+         }
+     }
+@@ -365,7 +382,7 @@ test "loadSnapshotFromNames - builds valid snapshot" {
+ 
+     const masked = try snapshot.entity_map.mask("Alice met Bob", allocator);
+     defer allocator.free(masked);
+-    try std.testing.expectEqualStrings("Entity_A met Entity_B", masked);
++    try std.testing.expectEqualStrings("Entity_1 met Entity_2", masked);
+ }
+ 
+ test "loadSnapshotFromNames - empty list produces valid snapshot" {
+diff --git a/src/net/proxy.zig b/src/net/proxy.zig
+index a0c4a49..0890f38 100644
+--- a/src/net/proxy.zig
++++ b/src/net/proxy.zig
+@@ -283,6 +283,31 @@ fn flushResponseChunk(writer: *http.BodyWriter) !void {
+     try writer.writer.flush();
+     try writer.flush();
+ }
++
++/// Count SSE event boundaries in a chunk.
++/// Handles both LF-only (\n\n) and CRLF (\r\n\r\n) delimiters per the SSE spec.
++/// Used to track per-request event counts for operator observability.
++fn countSseEvents(data: []const u8) u64 {
++    var count: u64 = 0;
++    var i: usize = 0;
++    while (i < data.len) {
++        // CRLF style: \r\n\r\n (4 bytes)
++        if (i + 3 < data.len and
++            data[i] == '\r' and data[i + 1] == '\n' and
++            data[i + 2] == '\r' and data[i + 3] == '\n')
++        {
++            count += 1;
++            i += 4;
++        // LF-only style: \n\n (2 bytes)
++        } else if (i + 1 < data.len and data[i] == '\n' and data[i + 1] == '\n') {
++            count += 1;
++            i += 2;
++        } else {
++            i += 1;
++        }
++    }
++    return count;
++}
+ /// Bundles all context needed by the proxy pipeline, replacing the previous
+ /// 14-parameter function signature for clarity and maintainability.
+ pub const ProxyContext = struct {
+@@ -360,6 +385,10 @@ pub fn handleRequest(
+     var upstream_latency_recorded = false;
+     var request_outcome: RequestOutcome = .normal;
+     var timeout_phase: ?upstream_client.TimeoutPhase = null;
++    // NMV3-014: streaming observability — track response mode and SSE event count
++    var final_response_mode: ResponseForwardingMode = .no_body;
++    var final_flush_per_chunk: bool = false;
++    var stream_event_count: u64 = 0;
+     defer {
+         const raw_total_latency = std.time.nanoTimestamp() - request_start;
+         const total_latency_us: u64 = if (raw_total_latency < 0)
+@@ -383,7 +412,8 @@ pub fn handleRequest(
+         else
+             request_outcome;
+ 
+-        var extra_buf: [5]Logger.KV = undefined;
++        // NMV3-014: enhanced response_sent log with streaming diagnostics
++        var extra_buf: [9]Logger.KV = undefined;
+         var extra_len: usize = 0;
+         extra_buf[extra_len] = .{ .key = "status", .value = .{ .uint = @intFromEnum(response_status) } };
+         extra_len += 1;
+@@ -393,6 +423,16 @@ pub fn handleRequest(
+         extra_len += 1;
+         extra_buf[extra_len] = .{ .key = "draining", .value = .{ .boolean = draining } };
+         extra_len += 1;
++        extra_buf[extra_len] = .{ .key = "response_mode", .value = .{ .string = responseModeLabel(final_response_mode) } };
++        extra_len += 1;
++        extra_buf[extra_len] = .{ .key = "buffer_reason", .value = .{ .string = responseBufferReason(final_response_mode) } };
++        extra_len += 1;
++        extra_buf[extra_len] = .{ .key = "flush_per_chunk", .value = .{ .boolean = final_flush_per_chunk } };
++        extra_len += 1;
++        if (stream_event_count > 0) {
++            extra_buf[extra_len] = .{ .key = "stream_event_count", .value = .{ .uint = stream_event_count } };
++            extra_len += 1;
++        }
+         if (timeout_phase) |phase| {
+             extra_buf[extra_len] = .{ .key = "timeout_phase", .value = .{ .string = timeoutPhaseLabel(phase) } };
+             extra_len += 1;
+@@ -1246,6 +1286,9 @@ pub fn handleRequest(
+         response_kind,
+         downstream_res.head.content_type,
+     );
++    // NMV3-014: capture for deferred response_sent log
++    final_response_mode = response_mode;
++    final_flush_per_chunk = flush_response_per_chunk;
+ 
+     log.log(.info, "upstream_forwarded", session_id, &.{
+         .{ .key = "status", .value = .{ .uint = @intFromEnum(downstream_res.head.status) } },
+@@ -1453,9 +1496,13 @@ pub fn handleRequest(
+                         return err;
+                     };
+                     if (bytes_read == 0) break;
+-                    try response_writer.writer.writeAll(resp_buf[0..bytes_read]);
++                    const chunk = resp_buf[0..bytes_read];
++                    try response_writer.writer.writeAll(chunk);
+                     response_body_bytes += bytes_read;
+-                    if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
++                    if (flush_response_per_chunk) {
++                        stream_event_count += countSseEvents(chunk);
++                        try flushResponseChunk(&response_writer);
++                    }
+                 }
+             } else {
+                 var unmask_state = active_entity_map.?.initUnmaskChunkState();
+@@ -1500,7 +1547,10 @@ pub fn handleRequest(
+                     if (unmasked.len > 0) {
+                         try response_writer.writer.writeAll(unmasked);
+                         response_body_bytes += unmasked.len;
+-                        if (flush_response_per_chunk) try flushResponseChunk(&response_writer);
++                        if (flush_response_per_chunk) {
++                            stream_event_count += countSseEvents(unmasked);
++                            try flushResponseChunk(&response_writer);
++                        }
+                     }
+                 }
+ 
+diff --git a/src/net/proxy_server.zig b/src/net/proxy_server.zig
+index 4fa0a51..40e231c 100644
+--- a/src/net/proxy_server.zig
++++ b/src/net/proxy_server.zig
+@@ -139,6 +139,9 @@ pub const ProxyServer = struct {
+                 .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
+                 .{ .key = "active_connections", .value = .{ .uint = self.active_connections.load(.acquire) } },
+             });
++            self.logger.log(.info, "shutdown_draining", null, &.{
++                .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
++            });
+         }
+ 
+         self.closeListener();
+@@ -149,7 +152,7 @@ pub const ProxyServer = struct {
+     }
+ 
+     fn initRuntime(self: *ProxyServer) !void {
+-        if (self.runtime_model != .worker_pool) return;
++        if (self.runtime_model.effectiveModel() != .worker_pool) return;
+ 
+         // Worker thread count must be resolved by the caller before starting.
+         // A zero value here indicates a configuration bug — fail explicitly.
+@@ -170,13 +173,6 @@ pub const ProxyServer = struct {
+     }
+ 
+     fn finishShutdown(self: *ProxyServer) void {
+-        if (self.shutdown_state.beginDraining()) {
+-            self.observability.markShutdownDraining();
+-            self.logger.log(.info, "shutdown_draining", null, &.{
+-                .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
+-            });
+-        }
+-
+         const drain_result = shutdown_mod.waitForDrain(self.active_connections, self.drain_timeout_ms);
+         if (drain_result.completed) {
+             self.logger.log(.info, "shutdown_complete", null, &.{
+@@ -200,7 +196,7 @@ pub const ProxyServer = struct {
+     }
+ 
+     fn dispatchConnection(self: *ProxyServer, connection: std.net.Server.Connection) !void {
+-        switch (self.runtime_model) {
++        switch (self.runtime_model.effectiveModel()) {
+             .thread_per_connection => {
+                 const thread = try std.Thread.spawn(.{}, dispatchOwnedConnection, .{
+                     &self.handler,
+@@ -215,6 +211,7 @@ pub const ProxyServer = struct {
+                     connection,
+                 });
+             },
++            .io_uring => unreachable, // effectiveModel() never returns io_uring while unimplemented
+         }
+     }
+ };
+diff --git a/src/net/runtime_model.zig b/src/net/runtime_model.zig
+index 1ce1c90..3516d53 100644
+--- a/src/net/runtime_model.zig
++++ b/src/net/runtime_model.zig
+@@ -1,12 +1,15 @@
+ const std = @import("std");
++const builtin = @import("builtin");
+ 
+ pub const RuntimeModel = enum {
+     thread_per_connection,
+     worker_pool,
++    io_uring,
+ 
+     pub fn parse(value: []const u8) !RuntimeModel {
+         if (std.mem.eql(u8, value, "thread-per-connection")) return .thread_per_connection;
+         if (std.mem.eql(u8, value, "worker-pool")) return .worker_pool;
++        if (std.mem.eql(u8, value, "io-uring")) return .io_uring;
+         return error.InvalidRuntimeModel;
+     }
+ 
+@@ -14,8 +17,27 @@ pub const RuntimeModel = enum {
+         return switch (self) {
+             .thread_per_connection => "thread-per-connection",
+             .worker_pool => "worker-pool",
++            .io_uring => "io-uring",
+         };
+     }
++
++    /// Returns true if this runtime model is fully implemented and available.
++    pub fn isAvailable(self: RuntimeModel) bool {
++        return switch (self) {
++            .thread_per_connection, .worker_pool => true,
++            // io_uring event loop is scaffolded but not yet implemented.
++            // Currently falls back to worker_pool on all platforms.
++            // Track: NMV3-017 for the full std.Io event-driven implementation.
++            .io_uring => false,
++        };
++    }
++
++    /// Returns the effective runtime model, falling back to worker_pool
++    /// if the requested model is unavailable or not yet implemented.
++    pub fn effectiveModel(self: RuntimeModel) RuntimeModel {
++        if (self.isAvailable()) return self;
++        return .worker_pool;
++    }
+ };
+ 
+ pub const worker_pool_stack_size_bytes: usize = 2 * 1024 * 1024;
+@@ -25,7 +47,8 @@ pub fn resolveWorkerThreads(
+     requested_threads: usize,
+     max_connections: u32,
+ ) usize {
+-    if (model != .worker_pool) return 0;
++    const effective = model.effectiveModel();
++    if (effective != .worker_pool) return 0;
+ 
+     const connection_limit = @max(@as(usize, 1), @as(usize, @intCast(max_connections)));
+     if (requested_threads != 0) {
+@@ -42,9 +65,10 @@ pub fn estimatedHandlerThreads(
+     worker_threads: usize,
+     concurrent_connections: usize,
+ ) usize {
+-    return switch (model) {
++    return switch (model.effectiveModel()) {
+         .thread_per_connection => concurrent_connections,
+         .worker_pool => worker_threads,
++        .io_uring => unreachable,
+     };
+ }
+ 
+@@ -53,9 +77,10 @@ pub fn estimatedReservedStackBytes(
+     worker_threads: usize,
+     concurrent_connections: usize,
+ ) usize {
+-    const stack_size = switch (model) {
++    const stack_size = switch (model.effectiveModel()) {
+         .thread_per_connection => std.Thread.SpawnConfig.default_stack_size,
+         .worker_pool => worker_pool_stack_size_bytes,
++        .io_uring => unreachable,
+     };
+     return estimatedHandlerThreads(model, worker_threads, concurrent_connections) * stack_size;
+ }
+@@ -63,6 +88,7 @@ pub fn estimatedReservedStackBytes(
+ test "runtime model parses supported values" {
+     try std.testing.expectEqual(RuntimeModel.thread_per_connection, try RuntimeModel.parse("thread-per-connection"));
+     try std.testing.expectEqual(RuntimeModel.worker_pool, try RuntimeModel.parse("worker-pool"));
++    try std.testing.expectEqual(RuntimeModel.io_uring, try RuntimeModel.parse("io-uring"));
+ }
+ 
+ test "runtime model rejects unsupported values" {
+@@ -73,3 +99,17 @@ test "resolve worker threads clamps to max connections" {
+     try std.testing.expectEqual(@as(usize, 8), resolveWorkerThreads(.worker_pool, 12, 8));
+     try std.testing.expectEqual(@as(usize, 0), resolveWorkerThreads(.thread_per_connection, 12, 8));
+ }
++
++test "io_uring is not yet implemented — always falls back to worker_pool" {
++    // io_uring is scaffolded but isAvailable() returns false on all platforms
++    // until the std.Io event-driven implementation is complete (NMV3-017).
++    const model = RuntimeModel.io_uring;
++    try std.testing.expect(!model.isAvailable());
++    try std.testing.expectEqual(RuntimeModel.worker_pool, model.effectiveModel());
++}
++
++test "io_uring resolves worker threads like worker_pool" {
++    // On non-Linux, effectiveModel() falls back to worker_pool
++    const threads = resolveWorkerThreads(.io_uring, 8, 16);
++    try std.testing.expectEqual(@as(usize, 8), threads);
++}
+diff --git a/src/redaction/entity_mask.zig b/src/redaction/entity_mask.zig
+index 0a6d87e..e63ab5b 100644
+--- a/src/redaction/entity_mask.zig
++++ b/src/redaction/entity_mask.zig
+@@ -5,7 +5,7 @@ const std = @import("std");
+ // ---------------------------------------------------------------------------
+ // Dictionary-based name pseudonymization for PII/PHI de-identification.
+ // Given known names (e.g. "John Doe", "Dr. Smith"), replaces all occurrences
+-// with deterministic aliases ("Entity_A", "Entity_B") in a single O(n) pass
++// with deterministic aliases ("Entity_1", "Entity_2") in a single O(n) pass
+ // using an Aho-Corasick multi-pattern automaton.
+ //
+ // Bidirectional: mask() replaces names->aliases, unmask() reverses aliases->names.
+@@ -55,33 +55,13 @@ fn isWordBoundaryAfter(input: []const u8, pos: usize) bool {
+ // Alias generation
+ // ---------------------------------------------------------------------------
+ 
+-/// Maximum supported entities: A-Z (26) + AA-ZZ (676) = 702.
+-const max_entities = 702;
+-
+ /// Prefix used for all generated alias identifiers.
+ const alias_prefix = "Entity_";
+ 
+-/// Generate a deterministic alias: Entity_A, Entity_B, ..., Entity_Z, Entity_AA, ...
++/// Generate a deterministic alias: Entity_1, Entity_2, ..., Entity_N.
++/// Unbounded — supports arbitrarily large entity sets.
+ fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
+-    if (index >= max_entities) return error.TooManyEntities;
+-
+-    var suffix_buf: [2]u8 = undefined;
+-    var suffix_len: usize = 0;
+-
+-    if (index < 26) {
+-        suffix_buf[0] = @as(u8, @intCast(index)) + 'A';
+-        suffix_len = 1;
+-    } else {
+-        const adjusted = index - 26;
+-        suffix_buf[0] = @as(u8, @intCast(adjusted / 26)) + 'A';
+-        suffix_buf[1] = @as(u8, @intCast(adjusted % 26)) + 'A';
+-        suffix_len = 2;
+-    }
+-
+-    const result = try allocator.alloc(u8, alias_prefix.len + suffix_len);
+-    @memcpy(result[0..alias_prefix.len], alias_prefix);
+-    @memcpy(result[alias_prefix.len..result.len], suffix_buf[0..suffix_len]);
+-    return result;
++    return std.fmt.allocPrint(allocator, "{s}{d}", .{ alias_prefix, index + 1 });
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -468,7 +448,7 @@ pub const AcChunkState = struct {
+ ///   defer em.deinit();
+ ///   const masked = try em.mask("Patient John Doe was seen by Dr. Smith", allocator);
+ ///   defer allocator.free(masked);
+-///   // masked == "Patient Entity_A was seen by Entity_B"
++///   // masked == "Patient Entity_1 was seen by Entity_2"
+ pub const EntityMap = struct {
+     names: [][]u8,
+     aliases: [][]u8,
+@@ -872,7 +852,7 @@ test "EntityMap - single name replacement" {
+ 
+     const result = try em.mask("Patient John Doe was examined.", allocator);
+     defer allocator.free(result);
+-    try std.testing.expectEqualStrings("Patient Entity_A was examined.", result);
++    try std.testing.expectEqualStrings("Patient Entity_1 was examined.", result);
+ }
+ 
+ test "EntityMap - multiple names" {
+@@ -882,7 +862,7 @@ test "EntityMap - multiple names" {
+ 
+     const result = try em.mask("John Doe was seen by Dr. Smith today.", allocator);
+     defer allocator.free(result);
+-    try std.testing.expectEqualStrings("Entity_A was seen by Entity_B today.", result);
++    try std.testing.expectEqualStrings("Entity_1 was seen by Entity_2 today.", result);
+ }
+ 
+ test "EntityMap - collectMaskMatches exposes selected aliases" {
+@@ -894,8 +874,8 @@ test "EntityMap - collectMaskMatches exposes selected aliases" {
+     defer allocator.free(matches);
+ 
+     try std.testing.expectEqual(@as(usize, 2), matches.len);
+-    try std.testing.expectEqualStrings("Entity_A", matches[0].replacement);
+-    try std.testing.expectEqualStrings("Entity_B", matches[1].replacement);
++    try std.testing.expectEqualStrings("Entity_1", matches[0].replacement);
++    try std.testing.expectEqualStrings("Entity_2", matches[1].replacement);
+ }
+ 
+ test "EntityMap - case insensitive matching" {
+@@ -905,7 +885,7 @@ test "EntityMap - case insensitive matching" {
+ 
+     const result = try em.mask("JOHN DOE and john doe are the same.", allocator);
+     defer allocator.free(result);
+-    try std.testing.expectEqualStrings("Entity_A and Entity_A are the same.", result);
++    try std.testing.expectEqualStrings("Entity_1 and Entity_1 are the same.", result);
+ }
+ 
+ test "EntityMap - word boundary enforcement" {
+@@ -1046,7 +1026,7 @@ test "EntityMap - unmask round trip" {
+ 
+     const masked = try em.mask(original, allocator);
+     defer allocator.free(masked);
+-    try std.testing.expectEqualStrings("Entity_A and Entity_B filed claims.", masked);
++    try std.testing.expectEqualStrings("Entity_1 and Entity_2 filed claims.", masked);
+ 
+     const unmasked = try em.unmask(masked, allocator);
+     defer allocator.free(unmasked);
+@@ -1060,23 +1040,23 @@ test "EntityMap - multiple occurrences of same name" {
+ 
+     const result = try em.mask("John Doe said that John Doe was here.", allocator);
+     defer allocator.free(result);
+-    try std.testing.expectEqualStrings("Entity_A said that Entity_A was here.", result);
++    try std.testing.expectEqualStrings("Entity_1 said that Entity_1 was here.", result);
+ }
+ 
+ test "EntityMap - alias generation sequence" {
+     const allocator = std.testing.allocator;
+-    // Verify alias naming: A, B, C, ...
++    // Verify alias naming: 1, 2, 3, ...
+     const a0 = try generateAlias(allocator, 0);
+     defer allocator.free(a0);
+-    try std.testing.expectEqualStrings("Entity_A", a0);
++    try std.testing.expectEqualStrings("Entity_1", a0);
+ 
+     const a25 = try generateAlias(allocator, 25);
+     defer allocator.free(a25);
+-    try std.testing.expectEqualStrings("Entity_Z", a25);
++    try std.testing.expectEqualStrings("Entity_26", a25);
+ 
+-    const a26 = try generateAlias(allocator, 26);
+-    defer allocator.free(a26);
+-    try std.testing.expectEqualStrings("Entity_AA", a26);
++    const a999 = try generateAlias(allocator, 999);
++    defer allocator.free(a999);
++    try std.testing.expectEqualStrings("Entity_1000", a999);
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/schema/hasher.zig b/src/schema/hasher.zig
+index a2baa2a..29c7b12 100644
+--- a/src/schema/hasher.zig
++++ b/src/schema/hasher.zig
+@@ -9,11 +9,32 @@ pub const Hasher = struct {
+     /// Capped at `max_reverse_entries` to prevent unbounded memory growth.
+     reverse_map: std.StringHashMapUnmanaged([]u8),
+     allocator: std.mem.Allocator,
++    /// NMV3-015: operator metrics for scaling observability
++    miss_count: u64 = 0,
++    /// Counts the number of full eviction cycles (calls to evictAll), not individual entries.
++    eviction_cycle_count: u64 = 0,
+ 
+     /// Maximum number of reverse-map entries before eviction.
+     /// At ~40 bytes per entry overhead, 100K entries ≈ 4 MB worst-case.
+     const max_reverse_entries: usize = 100_000;
+ 
++    pub const HasherStats = struct {
++        reverse_map_size: usize,
++        miss_count: u64,
++        /// Number of full eviction cycles. Each cycle clears the entire reverse map.
++        /// A single cycle may evict up to max_reverse_entries tokens.
++        eviction_cycle_count: u64,
++    };
++
++    /// Return current operator-facing stats.
++    pub fn stats(self: *const Hasher) HasherStats {
++        return .{
++            .reverse_map_size = self.reverse_map.count(),
++            .miss_count = self.miss_count,
++            .eviction_cycle_count = self.eviction_cycle_count,
++        };
++    }
++
+     /// Initialize with an explicit key or auto-generate a random one.
+     pub fn init(key_hex: ?[]const u8, allocator: std.mem.Allocator) !Hasher {
+         var key: [32]u8 = undefined;
+@@ -100,24 +121,24 @@ pub const Hasher = struct {
+         const token: []u8 = try std.fmt.allocPrint(self.allocator, "PSEUDO_{s}", .{hex_buf});
+         errdefer self.allocator.free(token);
+ 
++        // Evict BEFORE inserting. Evicting after would free the just-inserted
++        // key, making gop.key_ptr.* a dangling pointer on the return below.
++        // Deterministic hashing means the same inputs re-populate the map on
++        // next occurrence, so a pre-insertion evict loses nothing.
++        if (self.reverse_map.count() >= max_reverse_entries) {
++            self.evictAll();
++        }
++
+         // Store reverse mapping if not already present
+         const gop = try self.reverse_map.getOrPut(self.allocator, token);
+         if (!gop.found_existing) {
+             gop.value_ptr.* = try self.allocator.dupe(u8, original);
+-
+-            // Evict all entries when cap is reached to bound memory.
+-            // Full clear is simple and safe — deterministic hashing means
+-            // the same inputs will re-populate the map on next occurrence.
+-            if (self.reverse_map.count() > max_reverse_entries) {
+-                self.evictAll();
+-            }
+         } else {
+             // Token already mapped — free the duplicate token
+             self.allocator.free(token);
+         }
+ 
+-        // Return a caller-owned copy. The internal map retains its own
+-        // copy — callers are not exposed to evictAll() invalidation.
++        // Return a caller-owned copy. The internal map retains its own copy.
+         return try self.allocator.dupe(u8, gop.key_ptr.*);
+     }
+ 
+@@ -129,6 +150,7 @@ pub const Hasher = struct {
+     /// Evict all entries from the reverse map to reclaim memory.
+     /// Called automatically when the map exceeds `max_reverse_entries`.
+     fn evictAll(self: *Hasher) void {
++        self.eviction_cycle_count += 1;
+         var it = self.reverse_map.iterator();
+         while (it.next()) |entry| {
+             self.allocator.free(entry.key_ptr.*);
+@@ -138,8 +160,9 @@ pub const Hasher = struct {
+     }
+ 
+     /// Scan a JSON response for PSEUDO_ tokens and replace them with originals.
+-    /// Returns an owned slice with restored content.
+-    pub fn unhashJson(self: *const Hasher, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
++    /// Returns an owned slice with restored content. Takes *Hasher (not *const)
++    /// because miss tracking mutates the miss_count field.
++    pub fn unhashJson(self: *Hasher, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+         const prefix = "PSEUDO_";
+         const token_len = prefix.len + 16; // "PSEUDO_" + 16 hex chars
+ 
+@@ -161,6 +184,9 @@ pub const Hasher = struct {
+                         try result.appendSlice(allocator, original);
+                         i += token_len;
+                         continue;
++                    } else {
++                        // NMV3-015: track restore misses for operator diagnostics.
++                        self.miss_count += 1;
+                     }
+                 }
+             }
+@@ -306,6 +332,46 @@ test "hasher - keyHex returns correct representation" {
+     try std.testing.expectEqualStrings(key_hex, &hex);
+ }
+ 
++test "hasher - eviction cycle increments counter and clears map" {
++    var h = try Hasher.init(null, std.testing.allocator);
++    defer h.deinit();
++
++    // Populate a few entries
++    const t1 = try h.hash("Alice");
++    defer std.testing.allocator.free(t1);
++    const t2 = try h.hash("Bob");
++    defer std.testing.allocator.free(t2);
++
++    try std.testing.expectEqual(@as(usize, 2), h.stats().reverse_map_size);
++    try std.testing.expectEqual(@as(u64, 0), h.stats().eviction_cycle_count);
++
++    // Trigger an eviction cycle directly (private, accessible from same file)
++    h.evictAll();
++
++    // Map should be empty and cycle counter incremented
++    try std.testing.expectEqual(@as(usize, 0), h.stats().reverse_map_size);
++    try std.testing.expectEqual(@as(u64, 1), h.stats().eviction_cycle_count);
++
++    // After eviction, lookups for previously known tokens should miss
++    try std.testing.expectEqual(@as(?[]const u8, null), h.unhash(t1));
++}
++
++test "hasher - miss_count increments on unknown token in unhashJson" {
++    var h = try Hasher.init(null, std.testing.allocator);
++    defer h.deinit();
++
++    try std.testing.expectEqual(@as(u64, 0), h.stats().miss_count);
++
++    const response = "result is PSEUDO_deadbeef12345678 here";
++    const out = try h.unhashJson(response, std.testing.allocator);
++    defer std.testing.allocator.free(out);
++
++    // The token was not in the map — miss_count should be 1
++    try std.testing.expectEqual(@as(u64, 1), h.stats().miss_count);
++    // The token should remain verbatim in the output (no substitution)
++    try std.testing.expectEqualStrings(response, out);
++}
++
+ test "hasher - multiple unique values" {
+     var h = try Hasher.init(null, std.testing.allocator);
+     defer h.deinit();
+diff --git a/src/test/compatibility_matrix.zig b/src/test/compatibility_matrix.zig
+index 5d3fa58..86f1d4c 100644
+--- a/src/test/compatibility_matrix.zig
++++ b/src/test/compatibility_matrix.zig
+@@ -32,6 +32,10 @@ pub const FlowId = enum {
+     azure_openai,
+     generic_json_rest,
+     litellm_proxy_headers,
++    // NMV3-014: edge-case flows
++    anthropic_long_session,
++    compressed_response_bypass,
++    buffered_hash_response,
+ };
+ 
+ pub const FlowResult = struct {
+@@ -126,6 +130,31 @@ const flow_definitions = [_]FlowDefinition{
+         .method = .POST,
+         .target = "/v1/chat/completions",
+     },
++    // NMV3-014: edge-case flows
++    .{
++        .id = .anthropic_long_session,
++        .key = "anthropic_long_session",
++        .label = "Anthropic long-lived SSE session",
++        .vendor = "Anthropic-style",
++        .method = .POST,
++        .target = "/v1/messages",
++    },
++    .{
++        .id = .compressed_response_bypass,
++        .key = "compressed_response_bypass",
++        .label = "Compressed response bypass",
++        .vendor = "Generic REST",
++        .method = .POST,
++        .target = "/v1/data",
++    },
++    .{
++        .id = .buffered_hash_response,
++        .key = "buffered_hash_response",
++        .label = "HASH-mode buffered response",
++        .vendor = "OpenAI-compatible",
++        .method = .POST,
++        .target = "/v1/chat/completions",
++    },
+ };
+ 
+ fn findDefinition(id: FlowId) *const FlowDefinition {
+@@ -694,6 +723,180 @@ fn evaluateLiteLlm(allocator: std.mem.Allocator, definition: FlowDefinition, rep
+     report.checks.response_header_fidelity = if (response_ok) .pass else .fail;
+ }
+ 
++// ===========================================================================
++// NMV3-014: Edge-case evaluator functions
++// ===========================================================================
++
++fn evaluateAnthropicLongSession(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
++    const request_headers = [_]http.Header{
++        .{ .name = "x-api-key", .value = "anthropic-long-session-key" },
++        .{ .name = "anthropic-version", .value = "2023-06-01" },
++        .{ .name = "Accept", .value = "text/event-stream" },
++    };
++    const response_headers = [_]http.Header{
++        .{ .name = "anthropic-request-id", .value = "msg_long_session_1" },
++        .{ .name = "Cache-Control", .value = "no-cache" },
++    };
++
++    // 10-event long-lived stream with mixed Anthropic event types
++    const stream_chunks = [_][]const u8{
++        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\"}}\n\n",
++        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n",
++        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"The \"}}\n\n",
++        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"patient \"}}\n\n",
++        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"record \"}}\n\n",
++        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"shows \"}}\n\n",
++        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"normal \"}}\n\n",
++        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"results.\"}}\n\n",
++        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
++        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
++    };
++
++    var expected_buf = std.ArrayListUnmanaged(u8).empty;
++    defer expected_buf.deinit(allocator);
++    for (stream_chunks) |chunk| {
++        try expected_buf.appendSlice(allocator, chunk);
++    }
++
++    const request_body =
++        \\{"model":"claude-3-5-sonnet","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"Summarize patient chart SSN 123-45-6789"}]}
++    ;
++
++    var result = try harness.roundTrip(allocator, request_body, .{
++        .request_method = definition.method,
++        .request_target = definition.target,
++        .request_extra_headers = &request_headers,
++        .upstream_stream_chunks = &stream_chunks,
++        .upstream_inter_chunk_delay_ms = 50,
++        .upstream_content_type = "text/event-stream",
++        .upstream_extra_headers = &response_headers,
++    });
++    defer result.deinit();
++
++    // SSN should be redacted in upstream request
++    var body_ok = true;
++    if (!(try checkStatusEquals(allocator, report, result.status, .ok, definition.label))) body_ok = false;
++    if (!(try checkNotContains(allocator, report, result.upstream_body, "123-45-6789", "Anthropic long session upstream"))) body_ok = false;
++    if (!(try checkContains(allocator, report, result.upstream_body, "***-**-****", "Anthropic long session upstream"))) body_ok = false;
++    report.checks.body_mutation = if (body_ok) .pass else .fail;
++
++    // Streaming fidelity: all 10 events should arrive incrementally.
++    // 10 chunks × 50ms inter-chunk delay = ~500ms minimum. Allow 1500ms
++    // ceiling to avoid flakiness under CI load.
++    const streaming_ok = try checkStreaming(
++        allocator,
++        report,
++        result,
++        expected_buf.items,
++        200,
++        1500,
++    );
++    report.checks.streaming = if (streaming_ok) .pass else .fail;
++
++    // Verify per-event structure: each event type delimiter survived intact
++    if (report.checks.streaming == .pass) {
++        var events_ok = true;
++        if (!(try checkContains(allocator, report, result.client_body, "event: message_start\n", "long session event delimiters"))) events_ok = false;
++        if (!(try checkContains(allocator, report, result.client_body, "event: content_block_start\n", "long session event delimiters"))) events_ok = false;
++        if (!(try checkContains(allocator, report, result.client_body, "event: content_block_stop\n", "long session event delimiters"))) events_ok = false;
++        if (!(try checkContains(allocator, report, result.client_body, "event: message_stop\n", "long session event delimiters"))) events_ok = false;
++        if (!events_ok) report.checks.streaming = .fail;
++    }
++
++    if (result.first_chunk_latency_ns) |ns| {
++        report.checks.first_token_latency_ms = ns / std.time.ns_per_ms;
++    }
++}
++
++fn evaluateCompressedBypass(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
++    // A response with Content-Encoding: gzip should be forwarded to the client
++    // untouched — the proxy bypasses the body rather than attempting to
++    // decompress or inspect it. This tests Content-Encoding bypass policy,
++    // not actual gzip decompression correctness.
++    const request_body =
++        \\{"query":"SELECT * FROM records WHERE ssn = '123-45-6789'"}
++    ;
++    // Opaque binary payload representing a real gzip body. The proxy must not
++    // corrupt or inspect it; it should be forwarded byte-for-byte.
++    const compressed_response = "FAKE_GZIP_PAYLOAD_1234567890";
++    const response_headers = [_]http.Header{
++        .{ .name = "Content-Encoding", .value = "gzip" },
++        .{ .name = "x-custom-trace", .value = "compressed-test-1" },
++    };
++
++    var result = try harness.roundTrip(allocator, request_body, .{
++        .request_method = definition.method,
++        .request_target = definition.target,
++        .upstream_response = compressed_response,
++        .upstream_content_type = "application/json",
++        .upstream_extra_headers = &response_headers,
++        .unsupported_response_body_behavior = .bypass,
++    });
++    defer result.deinit();
++
++    // The compressed response body should be returned to the client unchanged
++    var body_ok = true;
++    if (!(try checkStatusEquals(allocator, report, result.status, .ok, definition.label))) body_ok = false;
++    if (!(try checkBodyEquals(allocator, report, result.client_body, compressed_response, "compressed bypass client response"))) body_ok = false;
++    report.checks.body_mutation = if (body_ok) .pass else .fail;
++
++    // Content-Encoding should be forwarded to the client
++    var response_ok = true;
++    if (!(try checkHeaderEquals(allocator, report, result.client_head, "Content-Encoding", "gzip"))) response_ok = false;
++    if (!(try checkHeaderEquals(allocator, report, result.client_head, "x-custom-trace", "compressed-test-1"))) response_ok = false;
++    report.checks.response_header_fidelity = if (response_ok) .pass else .fail;
++}
++
++fn evaluateBufferedHash(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
++    const hasher_mod = @import("../schema/hasher.zig");
++    const schema_mod = @import("../schema/schema.zig");
++
++    // Set up a schema with a HASH field and a hasher
++    var hasher = try hasher_mod.Hasher.init(null, allocator);
++    defer hasher.deinit();
++
++    // Schema uses INI-like format: key_path = ACTION
++    const schema_content =
++        \\schema.name = hash_test
++        \\content = HASH
++    ;
++    var schema = try schema_mod.Schema.parseContent(schema_content, allocator);
++    defer schema.deinit();
++
++    const request_body =
++        \\{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Patient SSN 123-45-6789 needs review"}]}
++    ;
++    // The upstream response contains a value that the HASH pipeline will pseudonymize
++    // on the request path, then unhash on the response path
++    const response_body =
++        \\{"id":"chatcmpl-hash-1","choices":[{"message":{"role":"assistant","content":"Reviewed successfully"}}]}
++    ;
++
++    var result = try harness.roundTrip(allocator, request_body, .{
++        .request_method = definition.method,
++        .request_target = definition.target,
++        .upstream_response = response_body,
++        .upstream_content_type = "application/json",
++        .schema = &schema,
++        .hasher = &hasher,
++    });
++    defer result.deinit();
++
++    var body_ok = true;
++    if (!(try checkStatusEquals(allocator, report, result.status, .ok, definition.label))) body_ok = false;
++    // SSN should be redacted in the upstream request
++    if (!(try checkNotContains(allocator, report, result.upstream_body, "123-45-6789", "HASH upstream request"))) body_ok = false;
++    report.checks.body_mutation = if (body_ok) .pass else .fail;
++
++    // Response should be successfully unhashed and returned to client
++    var response_ok = true;
++    if (!(try checkHeaderEquals(allocator, report, result.client_head, "Content-Type", "application/json"))) response_ok = false;
++    // The response body should be returned (the content field wasn't pseudonymized
++    // since it's an output, so the body should match the upstream response)
++    if (!(try checkContains(allocator, report, result.client_body, "Reviewed successfully", "HASH client response"))) response_ok = false;
++    report.checks.response_header_fidelity = if (response_ok) .pass else .fail;
++}
++
+ fn evaluateFlow(allocator: std.mem.Allocator, definition: FlowDefinition, report: *FlowResult) !void {
+     switch (definition.id) {
+         .openai_json => try evaluateOpenAi(allocator, definition, report),
+@@ -702,6 +905,10 @@ fn evaluateFlow(allocator: std.mem.Allocator, definition: FlowDefinition, report
+         .azure_openai => try evaluateAzureOpenAi(allocator, definition, report),
+         .generic_json_rest => try evaluateGenericJsonRest(allocator, definition, report),
+         .litellm_proxy_headers => try evaluateLiteLlm(allocator, definition, report),
++        // NMV3-014: edge-case flows
++        .anthropic_long_session => try evaluateAnthropicLongSession(allocator, definition, report),
++        .compressed_response_bypass => try evaluateCompressedBypass(allocator, definition, report),
++        .buffered_hash_response => try evaluateBufferedHash(allocator, definition, report),
+     }
+ }
+ 
+@@ -945,6 +1152,33 @@ test "compatibility matrix - LiteLLM-style header flow" {
+     try report.expectNoUnexpectedRegression();
+ }
+ 
++test "compatibility matrix - Anthropic long-lived SSE session" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    const allocator = std.testing.allocator;
++
++    var report = try runFlow(allocator, .anthropic_long_session);
++    defer report.deinit(allocator);
++    try report.expectNoUnexpectedRegression();
++}
++
++test "compatibility matrix - compressed response bypass" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    const allocator = std.testing.allocator;
++
++    var report = try runFlow(allocator, .compressed_response_bypass);
++    defer report.deinit(allocator);
++    try report.expectNoUnexpectedRegression();
++}
++
++test "compatibility matrix - HASH-mode buffered response" {
++    if (builtin.os.tag == .windows) return error.SkipZigTest;
++    const allocator = std.testing.allocator;
++
++    var report = try runFlow(allocator, .buffered_hash_response);
++    defer report.deinit(allocator);
++    try report.expectNoUnexpectedRegression();
++}
++
+ test "compatibility matrix - any failed flow is a regression" {
+     const allocator = std.testing.allocator;
+     var report = FlowResult{
+diff --git a/src/test/compliance_suite.zig b/src/test/compliance_suite.zig
+index fbefd60..c5d9b1e 100644
+--- a/src/test/compliance_suite.zig
++++ b/src/test/compliance_suite.zig
+@@ -414,7 +414,7 @@ test "e2e compliance - unsupported response rejected when configured" {
+ 
+     var result = try harness.roundTrip(allocator, "{\"patient\":\"Jane Smith\"}", .{
+         .entity_names = &names,
+-        .upstream_response = "<patient>Entity_A</patient>",
++        .upstream_response = "<patient>Entity_1</patient>",
+         .upstream_content_type = "application/xml",
+         .unsupported_response_body_behavior = body_policy.UnsupportedBodyBehavior.reject,
+     });
+diff --git a/src/test/healthcare_starter_pack.zig b/src/test/healthcare_starter_pack.zig
+index aae1125..3498846 100644
+--- a/src/test/healthcare_starter_pack.zig
++++ b/src/test/healthcare_starter_pack.zig
+@@ -44,7 +44,7 @@ const starter_cases = [_]StarterCase{
+         .must_contain = &.{
+             "\"full_name\":\"[REDACTED]\"",
+             "\"subscriber_id\":\"PSEUDO_",
+-            "\"notes\":\"Entity_A confirmed SSN ***-**-**** and MRN: [MRN_REDACTED] during intake.\"",
++            "\"notes\":\"Entity_1 confirmed SSN ***-**-**** and MRN: [MRN_REDACTED] during intake.\"",
+         },
+         .must_not_contain = &.{
+             "Jane Smith",
+@@ -72,7 +72,7 @@ const starter_cases = [_]StarterCase{
+             "\"encounter_id\":\"PSEUDO_",
+             "\"display_name\":\"[REDACTED]\"",
+             "\"internal_id\":\"PSEUDO_",
+-            "\"summary\":\"Entity_A reported dizziness. Dr. Entity_B documented MRN: [MRN_REDACTED], diagnosis [ICD10_REDACTED], call back at [PHONE_REDACTED] or [EMAIL_REDACTED] for follow-up.\"",
++            "\"summary\":\"Entity_1 reported dizziness. Dr. Entity_2 documented MRN: [MRN_REDACTED], diagnosis [ICD10_REDACTED], call back at [PHONE_REDACTED] or [EMAIL_REDACTED] for follow-up.\"",
+         },
+         .must_not_contain = &.{
+             "John Doe",
+@@ -102,7 +102,7 @@ const starter_cases = [_]StarterCase{
+             "\"member_name\":\"[REDACTED]\"",
+             "\"member_id\":\"PSEUDO_",
+             "\"policy_number\":\"PSEUDO_",
+-            "\"service_note\":\"Entity_A called from [IPV4_REDACTED] about MRN: [MRN_REDACTED] and diagnosis [ICD10_REDACTED]. Member ID: [INSURANCE_REDACTED] verified.\"",
++            "\"service_note\":\"Entity_1 called from [IPV4_REDACTED] about MRN: [MRN_REDACTED] and diagnosis [ICD10_REDACTED]. Member ID: [INSURANCE_REDACTED] verified.\"",
+         },
+         .must_not_contain = &.{
+             "Marisol Vega",

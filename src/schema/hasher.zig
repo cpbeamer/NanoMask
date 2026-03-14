@@ -9,10 +9,31 @@ pub const Hasher = struct {
     /// Capped at `max_reverse_entries` to prevent unbounded memory growth.
     reverse_map: std.StringHashMapUnmanaged([]u8),
     allocator: std.mem.Allocator,
+    /// NMV3-015: operator metrics for scaling observability
+    miss_count: u64 = 0,
+    /// Counts the number of full eviction cycles (calls to evictAll), not individual entries.
+    eviction_cycle_count: u64 = 0,
 
     /// Maximum number of reverse-map entries before eviction.
     /// At ~40 bytes per entry overhead, 100K entries ≈ 4 MB worst-case.
     const max_reverse_entries: usize = 100_000;
+
+    pub const HasherStats = struct {
+        reverse_map_size: usize,
+        miss_count: u64,
+        /// Number of full eviction cycles. Each cycle clears the entire reverse map.
+        /// A single cycle may evict up to max_reverse_entries tokens.
+        eviction_cycle_count: u64,
+    };
+
+    /// Return current operator-facing stats.
+    pub fn stats(self: *const Hasher) HasherStats {
+        return .{
+            .reverse_map_size = self.reverse_map.count(),
+            .miss_count = self.miss_count,
+            .eviction_cycle_count = self.eviction_cycle_count,
+        };
+    }
 
     /// Initialize with an explicit key or auto-generate a random one.
     pub fn init(key_hex: ?[]const u8, allocator: std.mem.Allocator) !Hasher {
@@ -100,24 +121,24 @@ pub const Hasher = struct {
         const token: []u8 = try std.fmt.allocPrint(self.allocator, "PSEUDO_{s}", .{hex_buf});
         errdefer self.allocator.free(token);
 
+        // Evict BEFORE inserting. Evicting after would free the just-inserted
+        // key, making gop.key_ptr.* a dangling pointer on the return below.
+        // Deterministic hashing means the same inputs re-populate the map on
+        // next occurrence, so a pre-insertion evict loses nothing.
+        if (self.reverse_map.count() >= max_reverse_entries) {
+            self.evictAll();
+        }
+
         // Store reverse mapping if not already present
         const gop = try self.reverse_map.getOrPut(self.allocator, token);
         if (!gop.found_existing) {
             gop.value_ptr.* = try self.allocator.dupe(u8, original);
-
-            // Evict all entries when cap is reached to bound memory.
-            // Full clear is simple and safe — deterministic hashing means
-            // the same inputs will re-populate the map on next occurrence.
-            if (self.reverse_map.count() > max_reverse_entries) {
-                self.evictAll();
-            }
         } else {
             // Token already mapped — free the duplicate token
             self.allocator.free(token);
         }
 
-        // Return a caller-owned copy. The internal map retains its own
-        // copy — callers are not exposed to evictAll() invalidation.
+        // Return a caller-owned copy. The internal map retains its own copy.
         return try self.allocator.dupe(u8, gop.key_ptr.*);
     }
 
@@ -129,6 +150,7 @@ pub const Hasher = struct {
     /// Evict all entries from the reverse map to reclaim memory.
     /// Called automatically when the map exceeds `max_reverse_entries`.
     fn evictAll(self: *Hasher) void {
+        self.eviction_cycle_count += 1;
         var it = self.reverse_map.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -138,8 +160,9 @@ pub const Hasher = struct {
     }
 
     /// Scan a JSON response for PSEUDO_ tokens and replace them with originals.
-    /// Returns an owned slice with restored content.
-    pub fn unhashJson(self: *const Hasher, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    /// Returns an owned slice with restored content. Takes *Hasher (not *const)
+    /// because miss tracking mutates the miss_count field.
+    pub fn unhashJson(self: *Hasher, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         const prefix = "PSEUDO_";
         const token_len = prefix.len + 16; // "PSEUDO_" + 16 hex chars
 
@@ -161,6 +184,9 @@ pub const Hasher = struct {
                         try result.appendSlice(allocator, original);
                         i += token_len;
                         continue;
+                    } else {
+                        // NMV3-015: track restore misses for operator diagnostics.
+                        self.miss_count += 1;
                     }
                 }
             }
@@ -304,6 +330,46 @@ test "hasher - keyHex returns correct representation" {
 
     const hex = h.keyHex();
     try std.testing.expectEqualStrings(key_hex, &hex);
+}
+
+test "hasher - eviction cycle increments counter and clears map" {
+    var h = try Hasher.init(null, std.testing.allocator);
+    defer h.deinit();
+
+    // Populate a few entries
+    const t1 = try h.hash("Alice");
+    defer std.testing.allocator.free(t1);
+    const t2 = try h.hash("Bob");
+    defer std.testing.allocator.free(t2);
+
+    try std.testing.expectEqual(@as(usize, 2), h.stats().reverse_map_size);
+    try std.testing.expectEqual(@as(u64, 0), h.stats().eviction_cycle_count);
+
+    // Trigger an eviction cycle directly (private, accessible from same file)
+    h.evictAll();
+
+    // Map should be empty and cycle counter incremented
+    try std.testing.expectEqual(@as(usize, 0), h.stats().reverse_map_size);
+    try std.testing.expectEqual(@as(u64, 1), h.stats().eviction_cycle_count);
+
+    // After eviction, lookups for previously known tokens should miss
+    try std.testing.expectEqual(@as(?[]const u8, null), h.unhash(t1));
+}
+
+test "hasher - miss_count increments on unknown token in unhashJson" {
+    var h = try Hasher.init(null, std.testing.allocator);
+    defer h.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), h.stats().miss_count);
+
+    const response = "result is PSEUDO_deadbeef12345678 here";
+    const out = try h.unhashJson(response, std.testing.allocator);
+    defer std.testing.allocator.free(out);
+
+    // The token was not in the map — miss_count should be 1
+    try std.testing.expectEqual(@as(u64, 1), h.stats().miss_count);
+    // The token should remain verbatim in the output (no substitution)
+    try std.testing.expectEqualStrings(response, out);
 }
 
 test "hasher - multiple unique values" {

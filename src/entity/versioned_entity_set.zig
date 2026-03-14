@@ -50,27 +50,37 @@ pub const EntitySnapshot = struct {
     }
 };
 
-/// Manages atomic swap between entity snapshots using the RCU pattern.
-/// Readers call `acquire()` to get a snapshot pointer (lock-free, no mutex).
-/// Writers call `swap()` to atomically install a new snapshot.
+/// Manages safe swap between entity snapshots.
+/// Readers call `acquire()` to get a ref-counted snapshot pointer.
+/// Writers call `swap()` to install a new snapshot.
+///
+/// A RwLock eliminates the TOCTOU race between loading the pointer and
+/// incrementing the ref count. Multiple readers proceed concurrently;
+/// a swap blocks briefly until all active acquires have incremented their
+/// ref counts, then releases. Entity reloads are rare, so the lock is
+/// almost never contended.
 pub const VersionedEntitySet = struct {
-    current: std.atomic.Value(?*EntitySnapshot),
+    current: ?*EntitySnapshot,
     version: std.atomic.Value(u32),
     allocator: std.mem.Allocator,
+    lock: std.Thread.RwLock = .{},
 
     pub fn init(initial_snapshot: *EntitySnapshot) VersionedEntitySet {
         return .{
-            .current = std.atomic.Value(?*EntitySnapshot).init(initial_snapshot),
+            .current = initial_snapshot,
             .version = std.atomic.Value(u32).init(initial_snapshot.version),
             .allocator = initial_snapshot.allocator,
         };
     }
 
     /// Acquire the current snapshot for use during a request.
-    /// Increments ref_count atomically — no mutex, no contention.
+    /// Increments ref_count while holding a shared read lock, eliminating
+    /// the TOCTOU window that existed between the pointer load and increment.
     /// Caller MUST call `release()` when done.
     pub fn acquire(self: *VersionedEntitySet) *EntitySnapshot {
-        const snapshot = self.current.load(.acquire).?;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const snapshot = self.current.?;
         snapshot.acquire();
         return snapshot;
     }
@@ -82,14 +92,19 @@ pub const VersionedEntitySet = struct {
         _ = snapshot.release();
     }
 
-    /// Atomically swap the current snapshot with `new_snapshot`.
-    /// The old snapshot's ref_count is decremented (for the "set owns it" ref).
-    /// If no requests are using the old snapshot, it's freed immediately.
-    /// Otherwise it's freed when the last request releases it.
+    /// Install `new_snapshot` as the current snapshot.
+    /// Holds an exclusive write lock so no acquire() can race the pointer
+    /// swap and ref-count release of the old snapshot.
     pub fn swap(self: *VersionedEntitySet, new_snapshot: *EntitySnapshot) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         self.version.store(new_snapshot.version, .release);
-        const old = self.current.swap(new_snapshot, .acq_rel);
-        // Release the set's own reference to the old snapshot
+        const old = self.current;
+        self.current = new_snapshot;
+        // Release the set's own reference to the old snapshot.
+        // Safe: no reader can hold the old pointer without having already
+        // incremented its ref count, because acquire() holds the shared lock
+        // for the duration of load+increment.
         if (old) |old_snap| {
             _ = old_snap.release();
         }
@@ -104,8 +119,10 @@ pub const VersionedEntitySet = struct {
 
     /// Clean up: release the set's reference to the current snapshot.
     pub fn deinit(self: *VersionedEntitySet) void {
-        const snap = self.current.swap(null, .acq_rel);
-        if (snap) |s| {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.current) |s| {
+            self.current = null;
             _ = s.release();
         }
     }
@@ -365,7 +382,7 @@ test "loadSnapshotFromNames - builds valid snapshot" {
 
     const masked = try snapshot.entity_map.mask("Alice met Bob", allocator);
     defer allocator.free(masked);
-    try std.testing.expectEqualStrings("Entity_A met Entity_B", masked);
+    try std.testing.expectEqualStrings("Entity_1 met Entity_2", masked);
 }
 
 test "loadSnapshotFromNames - empty list produces valid snapshot" {

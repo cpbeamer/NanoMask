@@ -1,0 +1,41 @@
+# Document Pipeline Reference: PDF → Extract → Redact → LLM
+#
+# Usage:
+#   docker compose up -d
+#
+# Then:
+#   1. Send a PDF to Tika for text extraction: localhost:9998
+#   2. Send extracted text through NanoMask: localhost:8080
+
+services:
+  # Apache Tika: extracts text from PDF, DOCX, images, etc.
+  tika:
+    image: apache/tika:latest
+    ports:
+      - "9998:9998"
+    restart: unless-stopped
+
+  # NanoMask: PII redaction proxy
+  # Use the published image once NMV3-006 ships:
+  #   image: ghcr.io/cpbeamer/nanomask:latest
+  # Until then, build locally from the repo root:
+  nanomask:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      NANOMASK_LISTEN_HOST: "0.0.0.0"
+      NANOMASK_LISTEN_PORT: "8080"
+      NANOMASK_TARGET_HOST: "${UPSTREAM_HOST:-api.openai.com}"
+      NANOMASK_TARGET_PORT: "${UPSTREAM_PORT:-443}"
+      NANOMASK_TARGET_TLS: "true"
+      NANOMASK_ENTITY_FILE: "/config/entities.txt"
+      NANOMASK_SCHEMA_FILE: "/config/schema.nmschema"
+      NANOMASK_AUDIT_LOG: "true"
+    volumes:
+      - ./config:/config:ro
+    restart: unless-stopped
+    depends_on:
+      - tika
