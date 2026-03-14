@@ -18,6 +18,11 @@ pub const runtime_model = @import("net/runtime_model.zig");
 pub const upstream_client = @import("net/upstream_client.zig");
 pub const proxy_server = @import("net/proxy_server.zig");
 
+// Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013)
+pub const rbac = @import("admin/rbac.zig");
+pub const audit_store = @import("infra/audit_store.zig");
+pub const key_manager = @import("crypto/key_manager.zig");
+
 // Pattern library (Phase 5 / Epic 7)
 pub const email = @import("patterns/email.zig");
 pub const phone = @import("patterns/phone.zig");
@@ -95,4 +100,8 @@ test {
     _ = fuzz_schema_parser;
     _ = fuzz_redaction;
     _ = security_http_tests;
+    // Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013)
+    _ = rbac;
+    _ = audit_store;
+    _ = key_manager;
 }

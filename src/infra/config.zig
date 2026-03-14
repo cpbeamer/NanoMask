@@ -124,6 +124,23 @@ pub const Config = struct {
     // --- Report-only mode (Phase 2 / NMV3-007) ---
     report_only: bool = false,
     report_only_src: ConfigSource = .default,
+    // --- Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013) ---
+    admin_api_key_file: ?[]const u8 = null,
+    admin_api_key_file_src: ConfigSource = .default,
+    audit_buffer_size: u32 = 1000,
+    audit_buffer_size_src: ConfigSource = .default,
+    otel_service_name: ?[]const u8 = null,
+    otel_service_name_src: ConfigSource = .default,
+    syslog_address: ?[]const u8 = null,
+    syslog_address_src: ConfigSource = .default,
+    hash_key_exec: ?[]const u8 = null,
+    hash_key_exec_src: ConfigSource = .default,
+    mtls_ca: ?[]const u8 = null,
+    mtls_ca_src: ConfigSource = .default,
+    mtls_cert: ?[]const u8 = null,
+    mtls_cert_src: ConfigSource = .default,
+    mtls_key: ?[]const u8 = null,
+    mtls_key_src: ConfigSource = .default,
 
     /// When true, perform a health check probe against the listener and exit.
     /// Wildcard binds probe loopback so container HEALTHCHECK still works.
@@ -168,6 +185,10 @@ pub const Config = struct {
         InvalidHashKey,
         HashKeyFileNotFound,
         InvalidReportOnlyFlag,
+        InvalidApiKeyFile,
+        InvalidAuditBufferSize,
+        InvalidMtlsConfig,
+        InvalidMtlsPemFormat,
         UnknownFlag,
         OutOfMemory,
     };
@@ -215,6 +236,27 @@ pub const Config = struct {
         if (self.schema_default) |sd| {
             self.allocator.free(sd);
         }
+        if (self.admin_api_key_file != null and self.admin_api_key_file_src == .env_var) {
+            self.allocator.free(self.admin_api_key_file.?);
+        }
+        if (self.otel_service_name != null and self.otel_service_name_src == .env_var) {
+            self.allocator.free(self.otel_service_name.?);
+        }
+        if (self.syslog_address != null and self.syslog_address_src == .env_var) {
+            self.allocator.free(self.syslog_address.?);
+        }
+        if (self.hash_key_exec != null and self.hash_key_exec_src == .env_var) {
+            self.allocator.free(self.hash_key_exec.?);
+        }
+        if (self.mtls_ca != null and self.mtls_ca_src == .env_var) {
+            self.allocator.free(self.mtls_ca.?);
+        }
+        if (self.mtls_cert != null and self.mtls_cert_src == .env_var) {
+            self.allocator.free(self.mtls_cert.?);
+        }
+        if (self.mtls_key != null and self.mtls_key_src == .env_var) {
+            self.allocator.free(self.mtls_key.?);
+        }
     }
 
     pub const help_text =
@@ -257,6 +299,7 @@ pub const Config = struct {
         \\  --admin-read-only                   Allow admin visibility but reject runtime entity mutations
         \\  --admin-mutation-rate-limit <n>     Maximum entity mutations per minute (0 disables, default: 60)
         \\  --entity-file-sync                  Write API entity changes back to entity file
+        \\  --admin-api-key-file <path>         Bootstrap API keys from JSON file for RBAC (Phase 3)
         \\  --report-only                       Detect PII without modifying payloads (evaluation mode, default: disabled)
         \\  --healthcheck                       Probe /healthz on the local listener and exit
         \\  --validate-config                   Validate configuration and print summary without starting the server
@@ -272,6 +315,18 @@ pub const Config = struct {
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
         \\  --hash-key-file <path>              File containing the 64-char hex HMAC key
+        \\  --hash-key-exec <command>           Shell command that outputs the HMAC key on stdout (Phase 3)
+        \\                                      WARNING: command is executed as a shell; only use with trusted config sources
+        \\
+        \\Enterprise observability (Phase 3):
+        \\  --audit-buffer-size <n>              In-memory audit ring buffer size (default: 1000)
+        \\  --otel-service-name <name>          Add OTel-compatible fields to structured logs
+        \\  --syslog-address <host:port>        Duplicate log lines to UDP syslog target (RFC 5424)
+        \\
+        \\Mutual TLS (Phase 3):
+        \\  --mtls-ca <path>                    Client CA bundle PEM for mutual TLS verification
+        \\  --mtls-cert <path>                  Client certificate PEM for mTLS
+        \\  --mtls-key <path>                   Client private key PEM for mTLS
         \\
     ;
 
@@ -574,6 +629,43 @@ pub const Config = struct {
                 return error.InvalidReportOnlyFlag;
             };
             config.report_only_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_API_KEY_FILE")) {
+            config.admin_api_key_file = try allocator.dupe(u8, value);
+            config.admin_api_key_file_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open API key file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.InvalidApiKeyFile;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_AUDIT_BUFFER_SIZE")) {
+            config.audit_buffer_size = std.fmt.parseInt(u32, value, 10) catch {
+                std.debug.print("error: NANOMASK_AUDIT_BUFFER_SIZE must be a positive integer, got '{s}'\n", .{value});
+                return error.InvalidAuditBufferSize;
+            };
+            if (config.audit_buffer_size == 0) return error.InvalidAuditBufferSize;
+            config.audit_buffer_size_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_OTEL_SERVICE_NAME")) {
+            config.otel_service_name = try allocator.dupe(u8, value);
+            config.otel_service_name_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SYSLOG_ADDRESS")) {
+            config.syslog_address = try allocator.dupe(u8, value);
+            config.syslog_address_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY_EXEC")) {
+            config.hash_key_exec = try allocator.dupe(u8, value);
+            config.hash_key_exec_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_CA")) {
+            try checkPemFile(value, "mTLS CA");
+            config.mtls_ca = try allocator.dupe(u8, value);
+            config.mtls_ca_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_CERT")) {
+            try checkPemFile(value, "mTLS cert");
+            config.mtls_cert = try allocator.dupe(u8, value);
+            config.mtls_cert_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_KEY")) {
+            try checkPemFile(value, "mTLS key");
+            config.mtls_key = try allocator.dupe(u8, value);
+            config.mtls_key_src = .env_var;
         }
     }
 
@@ -673,6 +765,14 @@ pub const Config = struct {
             "NANOMASK_HASH_KEY",
             "NANOMASK_HASH_KEY_FILE",
             "NANOMASK_REPORT_ONLY",
+            "NANOMASK_ADMIN_API_KEY_FILE",
+            "NANOMASK_AUDIT_BUFFER_SIZE",
+            "NANOMASK_OTEL_SERVICE_NAME",
+            "NANOMASK_SYSLOG_ADDRESS",
+            "NANOMASK_HASH_KEY_EXEC",
+            "NANOMASK_MTLS_CA",
+            "NANOMASK_MTLS_CERT",
+            "NANOMASK_MTLS_KEY",
         };
 
         for (env_keys) |key| {
@@ -1108,6 +1208,107 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--report-only")) {
                 config.report_only = true;
                 config.report_only_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-api-key-file")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --admin-api-key-file\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.admin_api_key_file != null and config.admin_api_key_file_src == .env_var) {
+                    allocator.free(config.admin_api_key_file.?);
+                }
+                config.admin_api_key_file = args[i];
+                config.admin_api_key_file_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open API key file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.InvalidApiKeyFile;
+                }
+            } else if (std.mem.eql(u8, arg, "--audit-buffer-size")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --audit-buffer-size\n", .{});
+                    return error.MissingValue;
+                }
+                config.audit_buffer_size = std.fmt.parseInt(u32, args[i], 10) catch {
+                    std.debug.print("error: --audit-buffer-size must be a positive integer, got '{s}'\n", .{args[i]});
+                    return error.InvalidAuditBufferSize;
+                };
+                if (config.audit_buffer_size == 0) {
+                    std.debug.print("error: --audit-buffer-size must be > 0\n", .{});
+                    return error.InvalidAuditBufferSize;
+                }
+                config.audit_buffer_size_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--otel-service-name")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --otel-service-name\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.otel_service_name != null and config.otel_service_name_src == .env_var) {
+                    allocator.free(config.otel_service_name.?);
+                }
+                config.otel_service_name = args[i];
+                config.otel_service_name_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--syslog-address")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --syslog-address\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.syslog_address != null and config.syslog_address_src == .env_var) {
+                    allocator.free(config.syslog_address.?);
+                }
+                config.syslog_address = args[i];
+                config.syslog_address_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--hash-key-exec")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --hash-key-exec\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.hash_key_exec != null and config.hash_key_exec_src == .env_var) {
+                    allocator.free(config.hash_key_exec.?);
+                }
+                config.hash_key_exec = args[i];
+                config.hash_key_exec_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--mtls-ca")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --mtls-ca\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.mtls_ca != null and config.mtls_ca_src == .env_var) {
+                    allocator.free(config.mtls_ca.?);
+                }
+                try checkPemFile(args[i], "mTLS CA");
+                config.mtls_ca = args[i];
+                config.mtls_ca_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--mtls-cert")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --mtls-cert\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.mtls_cert != null and config.mtls_cert_src == .env_var) {
+                    allocator.free(config.mtls_cert.?);
+                }
+                try checkPemFile(args[i], "mTLS cert");
+                config.mtls_cert = args[i];
+                config.mtls_cert_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--mtls-key")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --mtls-key\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.mtls_key != null and config.mtls_key_src == .env_var) {
+                    allocator.free(config.mtls_key.?);
+                }
+                try checkPemFile(args[i], "mTLS key");
+                config.mtls_key = args[i];
+                config.mtls_key_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
             } else if (std.mem.eql(u8, arg, "--validate-config")) {
@@ -1147,10 +1348,10 @@ pub const Config = struct {
             std.debug.print("  hint: use --ca-file <path> to provide your self-signed CA bundle\n", .{});
         }
 
-        // Require --admin-token when --admin-api is enabled to prevent
-        // unauthenticated access to entity management endpoints.
-        if (config.admin_api and config.admin_token == null) {
-            std.debug.print("error: --admin-api requires --admin-token <secret> for authentication\n", .{});
+        // Require --admin-token or --admin-api-key-file when --admin-api is enabled
+        // to prevent unauthenticated access to entity management endpoints.
+        if (config.admin_api and config.admin_token == null and config.admin_api_key_file == null) {
+            std.debug.print("error: --admin-api requires --admin-token <secret> or --admin-api-key-file <path> for authentication\n", .{});
             return error.MissingAdminToken;
         }
 
@@ -1178,9 +1379,35 @@ pub const Config = struct {
             std.debug.print("WARNING: --admin-mutation-rate-limit has no effect without --admin-api\n", .{});
         }
 
+        // mTLS: all three files must be provided together
+        const mtls_count: u8 = @as(u8, if (config.mtls_ca != null) 1 else 0) +
+            @as(u8, if (config.mtls_cert != null) 1 else 0) +
+            @as(u8, if (config.mtls_key != null) 1 else 0);
+        if (mtls_count > 0 and mtls_count < 3) {
+            std.debug.print("error: --mtls-ca, --mtls-cert, and --mtls-key must all be specified together\n", .{});
+            return error.InvalidMtlsConfig;
+        }
+
         return config;
     }
 };
+
+/// Verify that a file exists and starts with a PEM header ("-----BEGIN").
+/// Used to catch obviously wrong file paths or non-PEM content at startup
+/// rather than at connection time.
+fn checkPemFile(path: []const u8, label: []const u8) Config.ParseError!void {
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        std.debug.print("error: cannot open {s} PEM file '{s}'\n", .{ label, path });
+        return error.InvalidMtlsPemFormat;
+    };
+    defer file.close();
+    var hdr: [16]u8 = undefined;
+    const n = file.readAll(&hdr) catch 0;
+    if (n < 10 or !std.mem.startsWith(u8, hdr[0..n], "-----BEGIN")) {
+        std.debug.print("error: {s} file '{s}' is not a valid PEM file (missing '-----BEGIN' header)\n", .{ label, path });
+        return error.InvalidMtlsPemFormat;
+    }
+}
 
 const testing = std.testing;
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const audit_store_mod = @import("audit_store.zig");
 
 /// Thread-safe structured JSON logger for compliance-grade audit logging.
 /// Outputs newline-delimited JSON (NDJSON) to stderr or a file.
@@ -17,6 +18,12 @@ pub const Logger = struct {
     /// Counts log lines that could not be written due to I/O errors.
     /// Surfaced via /healthz so operators can detect silent log loss.
     dropped_lines: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Optional OTel-compatible service name. When set, every log line
+    /// includes a "service" field for downstream correlation.
+    service_name: ?[]const u8 = null,
+    /// Optional audit ring buffer. When set, auditRedaction and auditAdmin
+    /// events are also appended here for querying via /_admin/audit.
+    audit_store: ?*audit_store_mod.AuditStore = null,
 
     pub const OutputWriter = std.io.AnyWriter;
 
@@ -151,7 +158,7 @@ pub const Logger = struct {
 
         // Build the full JSON line into a stack buffer, then write atomically.
         var buf: [8192]u8 = undefined;
-        const line = formatLine(&buf, level, msg, session_id, extra) catch {
+        const line = formatLine(&buf, level, msg, session_id, extra, self.service_name) catch {
             // Overflow or formatting failure — emit a minimal fallback so
             // operators know something was dropped rather than silent loss.
             var fallback: [128]u8 = undefined;
@@ -214,6 +221,11 @@ pub const Logger = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.writeOutput(line);
+        // Also push to the in-memory ring buffer (without trailing newline).
+        if (self.audit_store) |store| {
+            const json = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
+            store.append("redaction", session_id, json);
+        }
     }
 
     pub fn auditAdmin(
@@ -267,6 +279,11 @@ pub const Logger = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.writeOutput(line);
+        // Also push to the in-memory ring buffer (without trailing newline).
+        if (self.audit_store) |store| {
+            const json = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
+            store.append("admin", session_id orelse "-", json);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -279,6 +296,7 @@ pub const Logger = struct {
         msg: []const u8,
         session_id: ?[]const u8,
         extra: []const KV,
+        service_name: ?[]const u8,
     ) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
@@ -287,6 +305,10 @@ pub const Logger = struct {
         try writeTimestamp(w);
         try w.writeAll("\",\"level\":\"");
         try w.writeAll(levelStr(level));
+        if (service_name) |svc| {
+            try w.writeAll("\",\"service\":\"");
+            try writeJsonEscaped(w, svc);
+        }
         try w.writeAll("\",\"session_id\":\"");
         if (session_id) |sid| {
             try w.writeAll(sid);

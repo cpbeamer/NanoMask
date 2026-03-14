@@ -25,6 +25,10 @@ const runtime_model_mod = @import("net/runtime_model.zig");
 const upstream_client = @import("net/upstream_client.zig");
 const evaluation_report_mod = @import("infra/evaluation_report.zig");
 const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const rbac = @import("admin/rbac.zig");
+const ApiKeyStore = rbac.ApiKeyStore;
+const audit_store_mod = @import("infra/audit_store.zig");
+const AuditStore = audit_store_mod.AuditStore;
 
 var termination_signal_requested = std.atomic.Value(bool).init(false);
 
@@ -152,6 +156,38 @@ pub fn main() !void {
         std.process.exit(1);
     };
     defer log.deinit();
+
+    // --- OTel service name (Phase 3 / NMV3-013) ---
+    if (cfg.otel_service_name) |svc| {
+        log.service_name = svc;
+    }
+
+    // --- Syslog forwarding (Phase 3 / NMV3-013) ---
+    // UDP syslog output is not yet implemented. Warn the operator rather than
+    // silently ignoring the flag so they know it has no effect.
+    if (cfg.syslog_address != null) {
+        log.log(.warn, "syslog_not_implemented", null, &.{
+            .{ .key = "note", .value = .{ .string = "--syslog-address is accepted but UDP syslog forwarding is not yet implemented in this build" } },
+        });
+    }
+
+    // --- mTLS (Phase 3 / NMV3-011) ---
+    // PEM files are validated at startup (see config.zig checkPemFile) but
+    // mTLS enforcement is not yet wired into the TLS stack. Warn the operator.
+    if (cfg.mtls_ca != null or cfg.mtls_cert != null or cfg.mtls_key != null) {
+        log.log(.warn, "mtls_not_implemented", null, &.{
+            .{ .key = "note", .value = .{ .string = "--mtls-* flags are accepted but mTLS enforcement is not yet implemented in this build" } },
+        });
+    }
+
+    // --- Audit ring buffer (Phase 3 / NMV3-012) ---
+    var audit_store_instance = AuditStore.init(cfg.audit_buffer_size, allocator) catch |err| {
+        std.debug.print("error: failed to initialise audit store: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer audit_store_instance.deinit();
+    // Wire audit events from the logger into the ring buffer.
+    log.audit_store = &audit_store_instance;
 
     var active_connections = std.atomic.Value(u32).init(0);
     var connections_total = std.atomic.Value(u64).init(0);
@@ -297,25 +333,60 @@ pub fn main() !void {
     // actually contains HASH-action fields. This avoids unnecessary
     // crypto-random key generation for schemas with no HASH rules.
     const needs_hasher = cfg.hash_key != null or cfg.hash_key_file != null or
+        cfg.hash_key_exec != null or
         (if (schema_instance) |*s| s.hasHashFields() else false);
 
     if (needs_hasher) {
-        if (cfg.hash_key_file) |kf| {
+        if (cfg.hash_key_exec) |cmd| {
+            // --- hash-key-exec: run a shell command to obtain the HMAC key ---
+            // SECURITY: only use with trusted, operator-controlled config sources.
+            const argv = if (builtin.os.tag == .windows)
+                &[_][]const u8{ "cmd.exe", "/c", cmd }
+            else
+                &[_][]const u8{ "/bin/sh", "-c", cmd };
+
+            var child = std.process.Child.init(argv, allocator);
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Inherit; // surface command errors to the operator
+            child.spawn() catch |err| {
+                std.debug.print("error: failed to spawn hash-key-exec command '{s}': {}\n", .{ cmd, err });
+                std.process.exit(1);
+            };
+            const exec_output = child.stdout.?.readToEndAlloc(allocator, 256) catch |err| {
+                std.debug.print("error: failed to read hash-key-exec output: {}\n", .{err});
+                std.process.exit(1);
+            };
+            defer allocator.free(exec_output);
+            _ = child.wait() catch {};
+
+            const key_hex = std.mem.trim(u8, exec_output, " \t\r\n");
+            hasher_instance = hasher_mod.Hasher.init(key_hex, allocator) catch |err| {
+                std.debug.print("error: hash-key-exec output is not a valid 64-char hex key: {}\n", .{err});
+                std.process.exit(1);
+            };
+            log.log(.info, "hasher_initialized", null, &.{
+                .{ .key = "key_source", .value = .{ .string = "exec" } },
+                .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
+            });
+        } else if (cfg.hash_key_file) |kf| {
             hasher_instance = hasher_mod.Hasher.initFromFile(kf, allocator) catch |err| {
                 std.debug.print("error: failed to load hash key file: {}\n", .{err});
                 std.process.exit(1);
             };
+            log.log(.info, "hasher_initialized", null, &.{
+                .{ .key = "key_source", .value = .{ .string = "file" } },
+                .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
+            });
         } else {
             hasher_instance = hasher_mod.Hasher.init(cfg.hash_key, allocator) catch |err| {
                 std.debug.print("error: failed to initialise hasher: {}\n", .{err});
                 std.process.exit(1);
             };
+            log.log(.info, "hasher_initialized", null, &.{
+                .{ .key = "key_source", .value = .{ .string = if (cfg.hash_key != null) "cli" else "auto" } },
+                .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
+            });
         }
-        const hex = hasher_instance.?.keyHex();
-        log.log(.info, "hasher_initialized", null, &.{
-            .{ .key = "key_source", .value = .{ .string = if (cfg.hash_key != null) "cli" else if (cfg.hash_key_file != null) "file" else "auto" } },
-            .{ .key = "key_prefix", .value = .{ .string = hex[0..8] } },
-        });
     }
 
     // --- TLS setup ---
@@ -448,6 +519,22 @@ pub fn main() !void {
         // When neither flag is set, the default system CA scan applies.
     }
 
+    // --- RBAC API key store (Phase 3 / NMV3-011) ---
+    var api_key_store: ?ApiKeyStore = if (cfg.admin_api_key_file) |key_file| blk: {
+        var store = ApiKeyStore.loadFromFile(key_file, allocator) catch |err| {
+            std.debug.print("error: failed to load API key file '{s}': {}\n", .{ key_file, err });
+            std.process.exit(1);
+        };
+        // Suppress "unused variable" warning; store is read below via .count().
+        _ = &store;
+        log.log(.info, "api_key_store_loaded", null, &.{
+            .{ .key = "file", .value = .{ .string = key_file } },
+            .{ .key = "key_count", .value = .{ .uint = store.count() } },
+        });
+        break :blk store;
+    } else null;
+    defer if (api_key_store) |*aks| aks.deinit();
+
     const admin_config = admin.AdminConfig{
         .enabled = cfg.admin_api,
         .token = cfg.admin_token,
@@ -459,6 +546,8 @@ pub fn main() !void {
         .entity_file_sync = cfg.entity_file_sync,
         .entity_file = cfg.entity_file,
         .fuzzy_threshold = cfg.fuzzy_threshold,
+        .api_key_store = if (api_key_store) |*aks| aks else null,
+        .audit_store = &audit_store_instance,
     };
 
     var shutdown_state = shutdown_mod.ShutdownState{};

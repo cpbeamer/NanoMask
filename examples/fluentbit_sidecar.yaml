@@ -1,0 +1,102 @@
+# Fluent Bit Sidecar for NanoMask Audit Log Forwarding
+#
+# Deploys Fluent Bit as a sidecar container reading NanoMask's structured
+# JSON log file and forwarding audit events to Elasticsearch, Loki, or any
+# supported output plugin.
+#
+# Usage: add this container block to your NanoMask Deployment spec.
+# Ensure NanoMask writes logs to --log-file /var/log/nanomask/audit.log
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush        1
+        Log_Level    info
+        Parsers_File parsers.conf
+
+    [INPUT]
+        Name         tail
+        Path         /var/log/nanomask/audit.log
+        Parser       json
+        Tag          nanomask.*
+        Refresh_Interval  5
+        Rotate_Wait  30
+
+    [FILTER]
+        Name         modify
+        Match        nanomask.*
+        Add          cluster ${CLUSTER_NAME}
+        Add          namespace ${POD_NAMESPACE}
+        Add          pod ${POD_NAME}
+
+    [OUTPUT]
+        Name         es
+        Match        nanomask.*
+        Host         ${ELASTICSEARCH_HOST}
+        Port         9200
+        Index        nanomask-audit
+        Type         _doc
+        Logstash_Format On
+        Logstash_Prefix nanomask
+
+    # Alternative: forward to Grafana Loki
+    # [OUTPUT]
+    #     Name         loki
+    #     Match        nanomask.*
+    #     Host         ${LOKI_HOST}
+    #     Port         3100
+    #     Labels       job=nanomask, env=${ENVIRONMENT}
+
+  parsers.conf: |
+    [PARSER]
+        Name         json
+        Format       json
+        Time_Key     ts
+        Time_Format  %Y-%m-%dT%H:%M:%S
+
+---
+# Example sidecar container spec (add to your NanoMask Deployment)
+# spec:
+#   containers:
+#     - name: nanomask
+#       image: ghcr.io/cpbeamer/nanomask:latest
+#       args:
+#         - --log-file
+#         - /var/log/nanomask/audit.log
+#         - --audit-log
+#       volumeMounts:
+#         - name: log-volume
+#           mountPath: /var/log/nanomask
+#
+#     - name: fluent-bit
+#       image: fluent/fluent-bit:latest
+#       volumeMounts:
+#         - name: log-volume
+#           mountPath: /var/log/nanomask
+#           readOnly: true
+#         - name: fluent-bit-config
+#           mountPath: /fluent-bit/etc
+#       env:
+#         - name: CLUSTER_NAME
+#           value: "production"
+#         - name: POD_NAMESPACE
+#           valueFrom:
+#             fieldRef:
+#               fieldPath: metadata.namespace
+#         - name: POD_NAME
+#           valueFrom:
+#             fieldRef:
+#               fieldPath: metadata.name
+#         - name: ELASTICSEARCH_HOST
+#           value: "elasticsearch.monitoring.svc.cluster.local"
+#
+#   volumes:
+#     - name: log-volume
+#       emptyDir: {}
+#     - name: fluent-bit-config
+#       configMap:
+#         name: fluent-bit-config
