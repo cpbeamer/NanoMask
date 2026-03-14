@@ -42,6 +42,63 @@ pub const VaultBackend = enum {
     }
 };
 
+pub const Profile = enum {
+    hipaa_safe_harbor,
+    healthcare_lite,
+    llm_basic,
+    custom,
+
+    pub fn parse(s: []const u8) !Profile {
+        if (std.mem.eql(u8, s, "hipaa-safe-harbor")) return .hipaa_safe_harbor;
+        if (std.mem.eql(u8, s, "healthcare-lite")) return .healthcare_lite;
+        if (std.mem.eql(u8, s, "llm-basic")) return .llm_basic;
+        if (std.mem.eql(u8, s, "custom")) return .custom;
+        return error.InvalidProfile;
+    }
+
+    pub fn asStr(self: Profile) []const u8 {
+        return switch (self) {
+            .hipaa_safe_harbor => "hipaa-safe-harbor",
+            .healthcare_lite => "healthcare-lite",
+            .llm_basic => "llm-basic",
+            .custom => "custom",
+        };
+    }
+
+    pub fn apply(self: Profile, config: *Config) void {
+        switch (self) {
+            .hipaa_safe_harbor => {
+                config.enable_email = true;
+                config.enable_phone = true;
+                config.enable_ip = true;
+                config.enable_healthcare = true;
+                config.enable_dates = true;
+                config.enable_addresses = true;
+                config.enable_fax = true;
+                config.enable_accounts = true;
+                config.enable_licenses = true;
+                config.enable_urls = true;
+                config.enable_vehicle_ids = true;
+                config.enable_context_rules = true;
+            },
+            .healthcare_lite => {
+                config.enable_email = true;
+                config.enable_phone = true;
+                config.enable_healthcare = true;
+                config.enable_dates = true;
+            },
+            .llm_basic => {
+                config.enable_email = true;
+                config.enable_credit_card = true;
+                config.enable_ip = true;
+            },
+            .custom => {
+                // Do nothing; relies entirely on individual flags
+            },
+        }
+    }
+};
+
 pub const ConfigSource = enum {
     default,
     env_var,
@@ -157,6 +214,14 @@ pub const Config = struct {
     enable_urls_src: ConfigSource = .default,
     enable_vehicle_ids: bool = false,
     enable_vehicle_ids_src: ConfigSource = .default,
+    // --- Phase 3 / V4 Context Rules ---
+    enable_context_rules: bool = false,
+    enable_context_rules_src: ConfigSource = .default,
+    context_confidence_threshold: f32 = 0.70,
+    context_confidence_threshold_src: ConfigSource = .default,
+    // --- Detection Profiles ---
+    profile: Profile = .custom,
+    profile_src: ConfigSource = .default,
     // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
     schema_file: ?[]const u8 = null,
     schema_file_src: ConfigSource = .default,
@@ -258,6 +323,8 @@ pub const Config = struct {
         InvalidVaultBackend,
         MissingVaultFilePath,
         VaultFileNotFound,
+        InvalidContextConfidenceThreshold,
+        InvalidProfile,
         UnknownFlag,
         OutOfMemory,
     };
@@ -406,6 +473,10 @@ pub const Config = struct {
         \\  --enable-licenses                   Redact US driver's licenses, DEA, and NPI numbers (default: disabled)
         \\  --enable-urls                       Redact HTTP/HTTPS URLs (default: disabled)
         \\  --enable-vehicle-ids                Redact VINs and heuristic license plates (default: disabled)
+        \\  --enable-context-rules              Redact contextual patterns like Name after 'Patient:' (Stage 4) (default: disabled)
+        \\  --context-confidence-threshold <f>  Threshold for context rules (0.0 - 1.0) (default: 0.70)
+        \\  --profile <name>                    Enable a detection profile preset (hipaa-safe-harbor, healthcare-lite, llm-basic, custom)
+        \\  --list-profiles                     List available detection profiles and exit
         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
@@ -487,6 +558,10 @@ pub const Config = struct {
         "--enable-licenses",
         "--enable-urls",
         "--enable-vehicle-ids",
+        "--enable-context-rules",
+        "--context-confidence-threshold",
+        "--profile",
+        "--list-profiles",
         "--schema-file",
         "--schema-default",
         "--hash-key",
@@ -501,6 +576,28 @@ pub const Config = struct {
         "--mtls-cert",
         "--mtls-key",
     };
+
+    pub fn printProfiles() void {
+        const text =
+            \\Available Detection Profiles:
+            \\
+            \\  hipaa-safe-harbor
+            \\    Enables all HIPAA Safe Harbor identifiers: email, phone, IP, healthcare IDs (MRN, etc.),
+            \\    dates/ages, addresses, fax, accounts, licenses, URLs, vehicle IDs, and context rules.
+            \\
+            \\  healthcare-lite
+            \\    A faster, lower false-positive profile: email, phone, healthcare IDs, and dates/ages.
+            \\    (Excludes context rules, addresses, licenses, etc.)
+            \\
+            \\  llm-basic
+            \\    Fastest baseline protection: email, credit card, IP.
+            \\
+            \\  custom
+            \\    No preset active. Requires individual --enable-* flags. (Default)
+            \\
+        ;
+        std.debug.print("{s}", .{text});
+    }
 
     pub fn printHelp() void {
         std.debug.print("{s}", .{help_text});
@@ -835,6 +932,23 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_VEHICLE_IDS")) {
             config.enable_vehicle_ids = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_vehicle_ids_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_CONTEXT_RULES")) {
+            config.enable_context_rules = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_context_rules_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD")) {
+            config.context_confidence_threshold = std.fmt.parseFloat(f32, value) catch {
+                std.debug.print("error: NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD must be a float between 0.0 and 1.0, got '{s}'\n", .{value});
+                return error.InvalidContextConfidenceThreshold;
+            };
+            if (config.context_confidence_threshold < 0.0 or config.context_confidence_threshold > 1.0) return error.InvalidContextConfidenceThreshold;
+            config.context_confidence_threshold_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_PROFILE")) {
+            config.profile = Profile.parse(value) catch {
+                std.debug.print("error: NANOMASK_PROFILE must be hipaa-safe-harbor, healthcare-lite, llm-basic, or custom, got '{s}'\n", .{value});
+                return error.InvalidProfile;
+            };
+            config.profile_src = .env_var;
+            config.profile.apply(config);
         } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_FILE")) {
             config.schema_file = try allocator.dupe(u8, value);
             config.schema_file_src = .env_var;
@@ -1060,6 +1174,16 @@ pub const Config = struct {
             "NANOMASK_ENABLE_UK_NINO",
             "NANOMASK_ENABLE_PASSPORT",
             "NANOMASK_ENABLE_INTL_PHONE",
+            "NANOMASK_ENABLE_DATES",
+            "NANOMASK_ENABLE_ADDRESSES",
+            "NANOMASK_ENABLE_FAX",
+            "NANOMASK_ENABLE_ACCOUNTS",
+            "NANOMASK_ENABLE_LICENSES",
+            "NANOMASK_ENABLE_URLS",
+            "NANOMASK_ENABLE_VEHICLE_IDS",
+            "NANOMASK_ENABLE_CONTEXT_RULES",
+            "NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD",
+            "NANOMASK_PROFILE",
             "NANOMASK_SCHEMA_FILE",
             "NANOMASK_SCHEMA_DEFAULT",
             "NANOMASK_HASH_KEY",
@@ -1449,6 +1573,40 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-intl-phone")) {
                 config.enable_intl_phone = true;
                 config.enable_intl_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-context-rules")) {
+                config.enable_context_rules = true;
+                config.enable_context_rules_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--context-confidence-threshold")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --context-confidence-threshold\n", .{});
+                    return error.MissingValue;
+                }
+                config.context_confidence_threshold = std.fmt.parseFloat(f32, args[i]) catch {
+                    std.debug.print("error: --context-confidence-threshold must be a float between 0.0 and 1.0, got '{s}'\n", .{args[i]});
+                    return error.InvalidContextConfidenceThreshold;
+                };
+                if (config.context_confidence_threshold < 0.0 or config.context_confidence_threshold > 1.0) {
+                    std.debug.print("error: --context-confidence-threshold must be between 0.0 and 1.0, got '{s}'\n", .{args[i]});
+                    return error.InvalidContextConfidenceThreshold;
+                }
+                config.context_confidence_threshold_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--profile")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --profile\n", .{});
+                    return error.MissingValue;
+                }
+                config.profile = Profile.parse(args[i]) catch {
+                    std.debug.print("error: --profile must be hipaa-safe-harbor, healthcare-lite, llm-basic, or custom, got '{s}'\n", .{args[i]});
+                    return error.InvalidProfile;
+                };
+                config.profile_src = .cli_flag;
+                // Immediately apply profile defaults. Later individual flags in args will correctly override these.
+                config.profile.apply(&config);
+            } else if (std.mem.eql(u8, arg, "--list-profiles")) {
+                printProfiles();
+                std.posix.exit(0);
             } else if (std.mem.eql(u8, arg, "--schema-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -2508,6 +2666,66 @@ test "Config - hash-key invalid hex chars" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidHashKey, res);
+}
+
+// --- Epic 9: NMV4-010 Detection Profiles ---
+
+test "Config - parse valid profile" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+        "hipaa-safe-harbor",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(Profile.hipaa_safe_harbor, cfg.profile);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.profile_src);
+    // Verify some expected profile expansions
+    try testing.expect(cfg.enable_email);
+    try testing.expect(cfg.enable_dates);
+    try testing.expect(cfg.enable_context_rules);
+}
+
+test "Config - invalid profile returns error" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+        "unknown-profile",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidProfile, res);
+}
+
+test "Config - missing profile value returns error" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
+}
+
+test "Config - cli flags override profile defaults" {
+    // We parse 'hipaa-safe-harbor' early in the args list, then specifically
+    // disable dates manually later. Note: Nanomask args parsing currently uses boolean
+    // true-only flags (e.g. --enable-dates). Normally to 'disable' a profile default,
+    // arg parsers need a --disable-* flag, but since Zig config currently only has
+    // --enable-*, we simulate the concept by seeing if an env var config overrides it
+    // since environment variables allow 'false'.
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    // 1. Env sets profile to hipaa-safe-harbor (which enables dates)
+    try Config.applyEnvVar(&cfg, "NANOMASK_PROFILE", "hipaa-safe-harbor", std.testing.allocator);
+    try testing.expect(cfg.enable_dates);
+
+    // 2. Env explicitly disables dates (overriding profile)
+    try Config.applyEnvVar(&cfg, "NANOMASK_ENABLE_DATES", "false", std.testing.allocator);
+    try testing.expect(!cfg.enable_dates);
 }
 
 test "Config - hash-key missing value" {

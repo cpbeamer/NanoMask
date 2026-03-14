@@ -13,6 +13,7 @@ const hasher_mod = @import("../schema/hasher.zig");
 const evaluation_report_mod = @import("evaluation_report.zig");
 const EvaluationReport = evaluation_report_mod.EvaluationReport;
 const PayloadType = evaluation_report_mod.PayloadType;
+const context_rules = @import("../context/rules.zig");
 
 pub const max_events_per_request: usize = 256;
 
@@ -20,7 +21,10 @@ pub const TextStageConfig = struct {
     entity_mask: bool = false,
     ssn: bool = false,
     patterns: bool = false,
+    pattern_flags: scanner.PatternFlags = .{},
     fuzzy: bool = false,
+    context_rules: bool = false,
+    context_confidence_threshold: f32 = 0.70,
 };
 
 pub const AuditEmitter = struct {
@@ -128,7 +132,7 @@ pub fn emitRequestAuditEvents(
     body: []const u8,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
+    cfg: TextStageConfig,
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     observability: ?*Observability,
@@ -145,7 +149,7 @@ pub fn emitRequestAuditEvents(
             body,
             entity_map,
             fuzzy_matcher,
-            pattern_flags,
+            cfg,
             active_schema,
             hasher,
             &emitter,
@@ -154,15 +158,9 @@ pub fn emitRequestAuditEvents(
         const redacted = try runTextStages(
             body,
             null,
-            .{
-                .entity_mask = true,
-                .ssn = true,
-                .patterns = true,
-                .fuzzy = true,
-            },
+            cfg,
             entity_map,
             fuzzy_matcher,
-            pattern_flags,
             &emitter,
             allocator,
         );
@@ -179,7 +177,7 @@ pub fn emitRequestAuditEventsWithReport(
     body: []const u8,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
+    cfg: TextStageConfig,
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     observability: ?*Observability,
@@ -199,7 +197,7 @@ pub fn emitRequestAuditEventsWithReport(
             body,
             entity_map,
             fuzzy_matcher,
-            pattern_flags,
+            cfg,
             active_schema,
             hasher,
             &emitter,
@@ -208,15 +206,9 @@ pub fn emitRequestAuditEventsWithReport(
         const redacted = try runTextStages(
             body,
             null,
-            .{
-                .entity_mask = true,
-                .ssn = true,
-                .patterns = true,
-                .fuzzy = true,
-            },
+            cfg,
             entity_map,
             fuzzy_matcher,
-            pattern_flags,
             &emitter,
             allocator,
         );
@@ -236,7 +228,7 @@ fn emitSchemaAuditEvents(
     body: []const u8,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
+    cfg: TextStageConfig,
     schema: *const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     emitter: *AuditEmitter,
@@ -247,7 +239,6 @@ fn emitSchemaAuditEvents(
         .{ .entity_mask = true },
         entity_map,
         fuzzy_matcher,
-        pattern_flags,
         emitter,
         allocator,
     );
@@ -269,7 +260,7 @@ fn emitSchemaAuditEvents(
         emitter: *AuditEmitter,
         entity_map: ?*const entity_mask.EntityMap,
         fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-        pattern_flags: scanner.PatternFlags,
+        cfg: TextStageConfig,
 
         fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ctx_ptr));
@@ -289,17 +280,14 @@ fn emitSchemaAuditEvents(
 
         fn scanField(input: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
             const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+            var scan_cfg = self.cfg;
+            scan_cfg.entity_mask = false; // Entity mask already ran before schema traversal
             return runTextStages(
                 input,
                 field_path,
-                .{
-                    .ssn = true,
-                    .patterns = true,
-                    .fuzzy = true,
-                },
+                scan_cfg,
                 self.entity_map,
                 self.fuzzy_matcher,
-                self.pattern_flags,
                 self.emitter,
                 alloc,
             );
@@ -310,7 +298,7 @@ fn emitSchemaAuditEvents(
         .emitter = emitter,
         .entity_map = entity_map,
         .fuzzy_matcher = fuzzy_matcher,
-        .pattern_flags = pattern_flags,
+        .cfg = cfg,
     };
 
     const scan_ctx = json_redactor.ScanContext{
@@ -368,7 +356,6 @@ pub fn runTextStages(
     cfg: TextStageConfig,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
     emitter: *AuditEmitter,
     allocator: std.mem.Allocator,
 ) ![]u8 {
@@ -419,8 +406,8 @@ pub fn runTextStages(
         redact.redactSsn(current);
     }
 
-    if (cfg.patterns and pattern_flags.anyEnabled()) {
-        const result = try scanner.redactWithMatches(current, pattern_flags, allocator);
+    if (cfg.patterns and cfg.pattern_flags.anyEnabled()) {
+        const result = try scanner.redactWithMatches(current, cfg.pattern_flags, allocator);
         defer allocator.free(result.matches);
 
         for (result.matches) |match| {
@@ -462,6 +449,27 @@ pub fn runTextStages(
             allocator.free(current);
             current = result.output;
         }
+    }
+
+    if (cfg.context_rules) {
+        const result = try context_rules.redactContext(current, cfg.context_confidence_threshold, allocator);
+        defer allocator.free(result.matches);
+
+        for (result.matches) |match| {
+            emitTextEvent(
+                emitter,
+                "context",
+                "context_rule",
+                field_path,
+                match.redact_start,
+                match.end - match.redact_start,
+                match.replacement,
+                match.confidence,
+            );
+        }
+
+        allocator.free(current);
+        current = result.output;
     }
 
     return current;

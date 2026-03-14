@@ -494,6 +494,9 @@ pub fn main() !void {
         var resolved_key_hex: ?[]const u8 = null;
         var exec_output_owned: ?[]u8 = null;
         defer if (exec_output_owned) |eo| allocator.free(eo);
+        // Holds file contents when --hash-key-file is used; freed after hasher init.
+        var file_key_contents_owned: ?[]u8 = null;
+        defer if (file_key_contents_owned) |fkc| allocator.free(fkc);
 
         if (cfg.hash_key_exec) |cmd| {
             const argv = if (builtin.os.tag == .windows)
@@ -515,35 +518,45 @@ pub fn main() !void {
             _ = child.wait() catch {};
             resolved_key_hex = std.mem.trim(u8, exec_output_owned.?, " \t\r\n");
         } else if (cfg.hash_key_file) |kf| {
-            // Read the key file to get the hex string (reuse Hasher.initFromFile
-            // later, but we need the raw bytes for FileVault too).
-            resolved_key_hex = kf; // sentinal: initFromFile path handled below
+            // Read the key file now so the same hex is used for both FileVault
+            // encryption key derivation and Hasher initialization. Without this,
+            // the FileVault would be encrypted with a random key that is lost on
+            // restart, breaking pseudonymization reversibility.
+            const kf_file = std.fs.cwd().openFile(kf, .{}) catch |err| {
+                std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ kf, @errorName(err) });
+                std.process.exit(1);
+            };
+            defer kf_file.close();
+            file_key_contents_owned = kf_file.readToEndAlloc(allocator, 128) catch {
+                std.debug.print("error: failed to read hash key file '{s}'\n", .{kf});
+                std.process.exit(1);
+            };
+            const trimmed = std.mem.trim(u8, file_key_contents_owned.?, " \t\n\r");
+            if (trimmed.len < 64) {
+                std.debug.print("error: hash key file must contain at least 64 hex characters\n", .{});
+                std.process.exit(1);
+            }
+            resolved_key_hex = trimmed[0..64];
         } else {
             resolved_key_hex = cfg.hash_key; // may be null → auto-generated
         }
 
         // Parse or auto-generate the 32-byte key for vault encryption.
-        // The Hasher parses the same hex string internally, so we derive
-        // the raw bytes here for the FileVault encryption key.
         var vault_key: [32]u8 = undefined;
-        const have_hex = resolved_key_hex != null and cfg.hash_key_file == null;
         var vault_key_from_hex = false;
 
-        if (have_hex) {
-            if (resolved_key_hex) |hex| {
-                if (hex.len == 64) {
-                    if (std.fmt.hexToBytes(&vault_key, hex)) |_| {
-                        vault_key_from_hex = true;
-                    } else |_| {
-                        // Invalid hex chars — Hasher.init will also reject this
-                    }
+        if (resolved_key_hex) |hex| {
+            if (hex.len >= 64) {
+                if (std.fmt.hexToBytes(&vault_key, hex[0..64])) |_| {
+                    vault_key_from_hex = true;
+                } else |_| {
+                    // Invalid hex chars — Hasher.init will also reject this
                 }
             }
         }
 
         if (!vault_key_from_hex) {
-            // Auto-generate — either no hex key provided, key-file path
-            // (Hasher reads it internally), or hex decode failed.
+            // Auto-generate — no hex key provided or hex decode failed.
             std.crypto.random.bytes(&vault_key);
         }
 
@@ -562,10 +575,8 @@ pub fn main() !void {
                 } };
             },
             .external => {
-                vault_instance = .{ .external = external_vault_mod.ExternalVault.init(allocator) catch |err| {
-                    std.debug.print("error: failed to initialize external vault: {}\n", .{err});
-                    std.process.exit(1);
-                } };
+                std.debug.print("error: the 'external' vault backend is not yet implemented. Use --vault-backend memory or --vault-backend file.\n", .{});
+                std.process.exit(1);
             },
         }
 
@@ -575,25 +586,15 @@ pub fn main() !void {
             .external => |e| e.vaultInterface(),
         };
 
-        // 3. Initialize the Hasher with the resolved key and vault interface
+        // 3. Initialize the Hasher with the resolved key and vault interface.
+        // All key sources now have resolved_key_hex set (or null for auto-generated),
+        // so we use Hasher.init uniformly instead of branching on the key source.
         const key_source: []const u8 = if (cfg.hash_key_exec != null) "exec" else if (cfg.hash_key_file != null) "file" else if (cfg.hash_key != null) "cli" else "auto";
 
-        if (cfg.hash_key_exec != null) {
-            hasher_instance = hasher_mod.Hasher.init(resolved_key_hex, vault_iface, allocator) catch |err| {
-                std.debug.print("error: hash-key-exec output is not a valid 64-char hex key: {}\n", .{err});
-                std.process.exit(1);
-            };
-        } else if (cfg.hash_key_file) |kf| {
-            hasher_instance = hasher_mod.Hasher.initFromFile(kf, vault_iface, allocator) catch |err| {
-                std.debug.print("error: failed to load hash key file: {}\n", .{err});
-                std.process.exit(1);
-            };
-        } else {
-            hasher_instance = hasher_mod.Hasher.init(cfg.hash_key, vault_iface, allocator) catch |err| {
-                std.debug.print("error: failed to initialise hasher: {}\n", .{err});
-                std.process.exit(1);
-            };
-        }
+        hasher_instance = hasher_mod.Hasher.init(resolved_key_hex, vault_iface, allocator) catch |err| {
+            std.debug.print("error: failed to initialise hasher ({s}): {}\n", .{ key_source, err });
+            std.process.exit(1);
+        };
 
         log.log(.info, "hasher_initialized", null, &.{
             .{ .key = "key_source", .value = .{ .string = key_source } },

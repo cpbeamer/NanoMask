@@ -37,6 +37,9 @@ pub const pattern_scanner = @import("patterns/scanner.zig");
 pub const guardrails = @import("ai/guardrails.zig");
 pub const semantic_cache = @import("infra/semantic_cache.zig");
 
+// Context Rules (Phase 3 / Epic 9)
+pub const context_rules = @import("context/rules.zig");
+
 // Schema-aware redaction (Phase 5 / Epic 8)
 pub const schema = @import("schema/schema.zig");
 pub const json_redactor = @import("schema/json_redactor.zig");
@@ -92,6 +95,7 @@ test {
     _ = pattern_scanner;
     _ = guardrails;
     _ = semantic_cache;
+    _ = context_rules;
     // Schema-aware redaction
     _ = schema;
     _ = json_redactor;

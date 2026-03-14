@@ -212,7 +212,6 @@ fn redactBufferedRequestBody(
             .{ .entity_mask = true },
             active_entity_map,
             session_fuzzy_matcher,
-            ctx.patternFlags(),
             &emitter,
             ctx.allocator,
         );
@@ -228,17 +227,14 @@ fn redactBufferedRequestBody(
 
             fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
                 const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+                var scan_cfg = self.proxy_ctx.textStageConfig();
+                scan_cfg.entity_mask = false;
                 return redaction_audit.runTextStages(
                     input_val,
                     field_path,
-                    .{
-                        .ssn = true,
-                        .patterns = true,
-                        .fuzzy = true,
-                    },
+                    scan_cfg,
                     self.entity_map,
                     self.fuzzy_matcher,
-                    self.proxy_ctx.patternFlags(),
                     self.emitter,
                     alloc,
                 );
@@ -287,15 +283,9 @@ fn redactBufferedRequestBody(
     return redaction_audit.runTextStages(
         body,
         null,
-        .{
-            .entity_mask = true,
-            .ssn = true,
-            .patterns = true,
-            .fuzzy = true,
-        },
+        ctx.textStageConfig(),
         active_entity_map,
         session_fuzzy_matcher,
-        ctx.patternFlags(),
         &emitter,
         ctx.allocator,
     );
@@ -565,6 +555,8 @@ pub const ProxyContext = struct {
     enable_licenses: bool = false,
     enable_urls: bool = false,
     enable_vehicle_ids: bool = false,
+    enable_context_rules: bool = false,
+    context_confidence_threshold: f32 = 0.70,
     guardrail_settings: guardrails_mod.Settings = .{},
     semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
     semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
@@ -597,6 +589,19 @@ pub const ProxyContext = struct {
             .licenses = self.enable_licenses,
             .urls = self.enable_urls,
             .vehicle_ids = self.enable_vehicle_ids,
+        };
+    }
+
+    /// Build text stage config including context rules toggle.
+    pub fn textStageConfig(self: ProxyContext) redaction_audit.TextStageConfig {
+        return .{
+            .entity_mask = true,
+            .ssn = true,
+            .patterns = true,
+            .pattern_flags = self.patternFlags(),
+            .fuzzy = true,
+            .context_rules = self.enable_context_rules,
+            .context_confidence_threshold = self.context_confidence_threshold,
         };
     }
 };
@@ -1065,7 +1070,7 @@ pub fn handleRequest(
                 report_body.items,
                 active_entity_map,
                 session_fuzzy_matcher,
-                ctx.patternFlags(),
+                ctx.textStageConfig(),
                 active_schema_for_audit,
                 ctx.hasher,
                 ctx.observability,
@@ -1181,17 +1186,14 @@ pub fn handleRequest(
                     fn doScan(input_val: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
                         const self: *Self = @ptrCast(@alignCast(ctx_ptr));
 
+                        var scan_cfg = self.proxy_ctx.textStageConfig();
+                        scan_cfg.entity_mask = false;
                         return redaction_audit.runTextStages(
                             input_val,
                             field_path,
-                            .{
-                                .ssn = true,
-                                .patterns = true,
-                                .fuzzy = true,
-                            },
+                            scan_cfg,
                             self.proxy_ctx.session_entity_map,
                             self.proxy_ctx.session_fuzzy_matcher,
-                            self.proxy_ctx.patternFlags(),
                             self.emitter,
                             alloc,
                         );
@@ -1500,7 +1502,7 @@ pub fn handleRequest(
                     audit_body.items,
                     active_entity_map,
                     session_fuzzy_matcher,
-                    ctx.patternFlags(),
+                    ctx.textStageConfig(),
                     null,
                     null,
                     ctx.observability,
