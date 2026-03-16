@@ -201,7 +201,7 @@ pub fn loadSnapshotFromFile(
             });
             continue;
         }
-        
+
         try names_list.append(allocator, try allocator.dupe(u8, entity_value));
         try group_ids.append(allocator, current_group_id);
 
@@ -224,11 +224,11 @@ pub fn loadSnapshotFromFile(
 
     var em = try entity_mask.EntityMap.initGrouped(allocator, loaded_names, loaded_group_ids);
     errdefer em.deinit();
-    
+
     // Calculate approximate memory used by the automatons
     const node_size = @sizeOf(entity_mask.AhoCorasick.Node);
-    const automaton_memory_bytes = 
-        (em.forward_ac.nodes.capacity * node_size) + 
+    const automaton_memory_bytes =
+        (em.forward_ac.nodes.capacity * node_size) +
         (em.reverse_ac.nodes.capacity * node_size);
 
     var fm = try fuzzy_match.FuzzyMatcher.init(
@@ -291,11 +291,11 @@ pub fn loadSnapshotFromNames(
 
     var em = try entity_mask.EntityMap.init(allocator, loaded_names);
     errdefer em.deinit();
-    
+
     // Calculate approximate memory used by the automatons
     const node_size = @sizeOf(entity_mask.AhoCorasick.Node);
-    const automaton_memory_bytes = 
-        (em.forward_ac.nodes.capacity * node_size) + 
+    const automaton_memory_bytes =
+        (em.forward_ac.nodes.capacity * node_size) +
         (em.reverse_ac.nodes.capacity * node_size);
 
     var fm = try fuzzy_match.FuzzyMatcher.init(

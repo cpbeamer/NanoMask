@@ -42,7 +42,7 @@ pub const FileVault = struct {
 
     pub fn deinit(ctx: *anyopaque) void {
         const self: *FileVault = @ptrCast(@alignCast(ctx));
-        
+
         // Wait for pending operations
         self.lock.lock();
         defer self.lock.unlock();
@@ -70,7 +70,7 @@ pub const FileVault = struct {
     // Entry format: [u32 EntryLength] [12B Nonce] [16B Tag] [Ciphertext containing JSON or structured data]
     fn store(ctx: *anyopaque, token: []const u8, original: []const u8) VaultError!void {
         const self: *FileVault = @ptrCast(@alignCast(ctx));
-        
+
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -81,7 +81,7 @@ pub const FileVault = struct {
         // Format payload: {"t":"TOKEN","o":"ORIGINAL"}
         var payload_buf = std.ArrayList(u8).init(self.allocator);
         defer payload_buf.deinit();
-        
+
         const writer = payload_buf.writer();
         try writer.writeByte('{');
         try writer.writeAll("\"t\":\"");
@@ -102,16 +102,10 @@ pub const FileVault = struct {
 
         const ciphertext = try self.allocator.alloc(u8, plaintext.len);
         defer self.allocator.free(ciphertext);
-        
+
         var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(
-            ciphertext, 
-            &tag, 
-            plaintext, 
-            &"", // aad
-            nonce,
-            self.key
-        );
+        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(ciphertext, &tag, plaintext, &"", // aad
+            nonce, self.key);
 
         // 4. Write to disk
         // Format: [Length u32 LE] [Nonce 12B] [Tag 16B] [Ciphertext]
@@ -123,18 +117,18 @@ pub const FileVault = struct {
         try self.file.writeAll(&nonce);
         try self.file.writeAll(&tag);
         try self.file.writeAll(ciphertext);
-        
+
         // Ensure durability
         try self.file.sync();
     }
 
     fn lookup(ctx: *anyopaque, token: []const u8) VaultError!?[]const u8 {
         const self: *FileVault = @ptrCast(@alignCast(ctx));
-        
+
         // Pass to memory vault since it holds the exact same data
         self.lock.lockShared();
         defer self.lock.unlockShared();
-        
+
         return self.memory_vault.vaultInterface().lookup(token);
     }
 
@@ -221,7 +215,7 @@ pub const FileVault = struct {
                 var i: usize = 0;
                 while (i < o_val.len) {
                     if (o_val[i] == '\\' and i + 1 < o_val.len) {
-                        clean_o[j] = o_val[i+1];
+                        clean_o[j] = o_val[i + 1];
                         i += 2;
                         j += 1;
                     } else {
@@ -254,7 +248,7 @@ test "FileVault - basic store and lookup" {
     defer iface.deinit();
 
     try iface.store("PT-001", "John Doe");
-    
+
     const lookup1 = try iface.lookup("PT-001");
     try testing.expect(lookup1 != null);
     try testing.expectEqualStrings("John Doe", lookup1.?);

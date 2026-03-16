@@ -382,7 +382,7 @@ fn handleApiKeyRequest(
                 .source = "admin_api",
                 .result = "success",
                 .version = 0,
-                                .entity_count_after = key_store.count(),
+                .entity_count_after = key_store.count(),
             });
         }
 

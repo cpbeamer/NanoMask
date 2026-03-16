@@ -19,7 +19,7 @@ fn isValidSin(digits: []const u8) bool {
     for (digits, 0..) |d, i| {
         if (!std.ascii.isDigit(d)) return false;
         const val: u32 = d - '0';
-        
+
         if (i % 2 == 1) { // Every second digit (1, 3, 5, 7) is doubled
             const doubled = val * 2;
             sum += if (doubled > 9) doubled - 9 else doubled;
@@ -36,7 +36,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
     if (pos > 0 and !isBoundary(buf[pos - 1])) return null;
 
     const c = buf[pos];
-    
+
     // Check for SIN (9 digits, often 999 999 999 or 999-999-999)
     if (std.ascii.isDigit(c)) {
         var digits: [9]u8 = undefined;
@@ -44,7 +44,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
         var i = pos;
         var last_was_sep = false;
         var invalid = false;
-        
+
         while (i < buf.len and digit_count < 9) {
             const b = buf[i];
             if (std.ascii.isDigit(b)) {
@@ -66,7 +66,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
             }
             i += 1;
         }
-        
+
         if (!invalid and digit_count == 9 and !last_was_sep) {
             if (i >= buf.len or isBoundary(buf[i])) {
                 if (isValidSin(digits[0..9])) {
@@ -80,7 +80,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
             }
         }
     }
-    
+
     // Check for provincial health card formats, e.g. OHIP (10 digits)
     if (std.ascii.isDigit(c)) {
         var digits: [10]u8 = undefined;
@@ -88,7 +88,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
         var i = pos;
         var last_was_sep = false;
         var invalid = false;
-        
+
         while (i < buf.len and digit_count < 10) {
             const b = buf[i];
             if (std.ascii.isDigit(b)) {
@@ -110,7 +110,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
             }
             i += 1;
         }
-        
+
         if (!invalid and digit_count == 10 and !last_was_sep) {
             if (i >= buf.len or isBoundary(buf[i])) {
                 return .{

@@ -7,7 +7,7 @@ const VaultError = vault.VaultError;
 /// It uses an ArrayHashMap to store the original values associated with tokens.
 pub const MemoryVault = struct {
     allocator: std.mem.Allocator,
-    
+
     /// Map from string token (e.g. "PSEUDO_ABCD") to string original.
     /// MemoryVault owns the memory for both keys and values.
     map: std.StringArrayHashMap([]const u8),
@@ -50,16 +50,16 @@ pub const MemoryVault = struct {
 
     fn store(ctx: *anyopaque, token: []const u8, original: []const u8) VaultError!void {
         const self: *MemoryVault = @ptrCast(@alignCast(ctx));
-        
+
         const token_dupe = self.allocator.dupe(u8, token) catch return VaultError.StoreFailed;
         errdefer self.allocator.free(token_dupe);
-        
+
         const original_dupe = self.allocator.dupe(u8, original) catch return VaultError.StoreFailed;
         errdefer self.allocator.free(original_dupe);
 
         self.lock.lock();
         defer self.lock.unlock();
-        
+
         // If it already exists, free the old dupes and the new dupes we just made.
         // ArrayHashMap.put() overwrites the value but not the key ptr if it exists,
         // so it's safer to check first.
@@ -83,7 +83,7 @@ pub const MemoryVault = struct {
         const self: *MemoryVault = @ptrCast(@alignCast(ctx));
         self.lock.lock();
         defer self.lock.unlock();
-        
+
         var it = self.map.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);

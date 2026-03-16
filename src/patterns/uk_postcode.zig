@@ -17,7 +17,7 @@ fn isBoundary(byte: u8) bool {
 /// A = Alphabetic character, 9 = Numeric digit.
 pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
     if (pos + 5 > buf.len) return null;
-    
+
     // Must start on a boundary
     if (pos > 0 and !isBoundary(buf[pos - 1])) return null;
 
@@ -26,7 +26,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
 
     var i = pos;
     var outward_len: usize = 0;
-    
+
     // Scan up to 4 characters for the outward code
     while (i < buf.len and outward_len < 4) {
         if (buf[i] == ' ') break;
@@ -61,13 +61,13 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
     // Must have a space divider
     if (i >= buf.len or buf[i] != ' ') return null;
     i += 1;
-    
+
     // Inward code is strict 3 chars: 9AA
     if (i + 3 > buf.len) return null;
     if (!std.ascii.isDigit(buf[i])) return null;
     if (!std.ascii.isAlphabetic(buf[i + 1])) return null;
     if (!std.ascii.isAlphabetic(buf[i + 2])) return null;
-    
+
     i += 3;
 
     // Must end on a boundary

@@ -12,26 +12,26 @@ pub const VaultError = error{
     IntegrityCheckFailed,
 } || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.WriteError || std.fs.File.ReadError;
 
-/// The Vault abstraction provides a durable or in-memory key-value store 
-/// for mapping pseudonymized HASH tokens back to their original values 
+/// The Vault abstraction provides a durable or in-memory key-value store
+/// for mapping pseudonymized HASH tokens back to their original values
 /// for the reverse unmasking process.
 pub const Vault = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Store a new token mapping. The vault implementation takes ownership 
+        /// Store a new token mapping. The vault implementation takes ownership
         /// of copying the strings if it needs to retain them in memory.
         store: *const fn (ctx: *anyopaque, token: []const u8, original: []const u8) VaultError!void,
 
         /// Look up an original value by its token. Returns null if not found.
-        /// The returned slice is owned by the vault and valid until `evictAll()` 
+        /// The returned slice is owned by the vault and valid until `evictAll()`
         /// is called or the vault is destroyed.
         lookup: *const fn (ctx: *anyopaque, token: []const u8) VaultError!?[]const u8,
 
         /// Evict all items from the vault (e.g., when keys rotate).
         evictAll: *const fn (ctx: *anyopaque) VaultError!void,
-        
+
         /// Free all resources associated with the vault.
         deinit: *const fn (ctx: *anyopaque) void,
     };

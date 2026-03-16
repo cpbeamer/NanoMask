@@ -222,7 +222,7 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
                 continue;
             }
         }
-        
+
         if (flags.uk_phone and (input[cursor] == '(' or input[cursor] == '+')) {
             if (uk_phone_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));

@@ -3,11 +3,11 @@ const std = @import("std");
 const replacement = "[INTL_PHONE_REDACTED]";
 
 const supported_country_codes = [_][]const u8{
-    "44",  // UK
-    "33",  // France
-    "49",  // Germany
-    "34",  // Spain
-    "31",  // Netherlands
+    "44", // UK
+    "33", // France
+    "49", // Germany
+    "34", // Spain
+    "31", // Netherlands
     "353", // Ireland
 };
 

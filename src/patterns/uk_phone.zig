@@ -99,7 +99,7 @@ fn isValidUkPhone(digits: []const u8, count: u8) bool {
 
     // National format must start with 0 and be exactly 10 or 11 digits long.
     if (digits[0] != '0') return false;
-    
+
     // Normal length is 11. Some specific areas use 10.
     if (count != 10 and count != 11) return false;
 
@@ -112,7 +112,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
     if (!std.ascii.isDigit(c) and c != '(' and c != '+') return null;
     if (pos > 0 and std.ascii.isDigit(buf[pos - 1])) return null;
     const candidate = extractPhoneCandidate(buf, pos) orelse return null;
-    
+
     if (!isValidUkPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;
 
     if (candidate.end < buf.len and std.ascii.isDigit(buf[candidate.end])) return null;

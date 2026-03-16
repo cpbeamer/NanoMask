@@ -527,13 +527,13 @@ pub const EntityMap = struct {
             names[i] = try allocator.dupe(u8, name);
             names_initialized = i + 1;
             name_lengths[i] = name.len;
-            
+
             const group_id = group_ids[i];
 
             // Generate the primary (new) numeric alias based on the group ID, not the row index
             aliases[i] = try generateAlias(allocator, group_id);
             aliases_initialized = i + 1;
-            
+
             // Add primary alias to reverse mapping
             try reverse_aliases.append(allocator, try allocator.dupe(u8, aliases[i]));
             try reverse_alias_lengths.append(allocator, aliases[i].len);

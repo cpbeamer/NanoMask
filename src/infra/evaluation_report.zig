@@ -169,7 +169,8 @@ pub const EvaluationSnapshot = struct {
         try writer.writeAll("{");
 
         // Top-level summary
-        try std.fmt.format(writer,
+        try std.fmt.format(
+            writer,
             "\"requests_evaluated\":{d},\"bytes_scanned\":{d},\"total_matches\":{d},",
             .{ self.requests_evaluated, self.bytes_scanned, self.totalMatches() },
         );

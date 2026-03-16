@@ -1869,9 +1869,9 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-context-rules")) {
                 config.enable_context_rules = true;
                 config.enable_context_rules_src = .cli_flag;
-            // --disable-* override flags (NMV4-010)
-            // These allow operators to selectively turn off pattern detectors
-            // that were enabled by a profile preset.
+                // --disable-* override flags (NMV4-010)
+                // These allow operators to selectively turn off pattern detectors
+                // that were enabled by a profile preset.
             } else if (std.mem.eql(u8, arg, "--disable-email")) {
                 config.enable_email = false;
                 config.enable_email_src = .cli_flag;
@@ -3335,4 +3335,3 @@ test "Config - vault-backend invalid type" {
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidVaultBackend, res);
 }
-

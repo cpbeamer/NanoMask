@@ -14,10 +14,10 @@ fn computeNhsCheckDigit(digits: [9]u8) ?u8 {
     for (digits, 0..) |d, i| {
         sum += d * @as(u32, 10 - @as(u32, @intCast(i)));
     }
-    
+
     const rem = sum % 11;
     const check = 11 - rem;
-    
+
     if (check == 11) return 0;
     if (check == 10) return null; // Invalid NHS number
     return @intCast(check);
@@ -26,7 +26,7 @@ fn computeNhsCheckDigit(digits: [9]u8) ?u8 {
 pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
     // Need at least 10 digits
     if (pos + 10 > buf.len) return null;
-    
+
     // Must be preceded by boundary
     if (pos > 0 and !isBoundary(buf[pos - 1])) return null;
 
@@ -40,7 +40,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
 
     var digits: [10]u8 = undefined;
     var digit_count: usize = 0;
-    
+
     var i: usize = pos;
     var last_was_sep = false;
 
@@ -63,7 +63,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
     }
 
     if (digit_count != 10) return null;
-    
+
     // Cannot end with a separator
     if (last_was_sep) return null;
 

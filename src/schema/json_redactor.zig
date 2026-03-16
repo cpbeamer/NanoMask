@@ -1155,7 +1155,7 @@ test "json_redactor - streaming matches buffered output across chunk sizes" {
     defer mem_vault1.vaultInterface().deinit();
     var buffered_hasher = try @import("hasher.zig").Hasher.init(key_hex, mem_vault1.vaultInterface(), std.testing.allocator);
     defer buffered_hasher.deinit();
-    
+
     const mem_vault2 = try @import("../vault/memory_vault.zig").MemoryVault.init(std.testing.allocator);
     defer mem_vault2.vaultInterface().deinit();
     var streaming_hasher = try @import("hasher.zig").Hasher.init(key_hex, mem_vault2.vaultInterface(), std.testing.allocator);

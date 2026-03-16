@@ -1997,15 +1997,15 @@ test "parseEntityHeader - trailing and leading commas with whitespace" {
 
 test "SseCounter - tracks events across chunk boundaries" {
     var counter = SseCounter{};
-    
+
     // Chunk 1 has part of the CRLF sequence
     const c1 = counter.countEvents("data: hello\r\n\r");
     try std.testing.expectEqual(@as(u64, 0), c1);
-    
+
     // Chunk 2 finishes the boundary
     const c2 = counter.countEvents("\n");
     try std.testing.expectEqual(@as(u64, 1), c2);
-    
+
     // Chunk 3 has an LF-only sequence
     const c3 = counter.countEvents("data: another\n\n");
     try std.testing.expectEqual(@as(u64, 1), c3);

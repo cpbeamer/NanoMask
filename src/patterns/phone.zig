@@ -141,7 +141,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize, allow_us: bool) ?struct { start: 
     // Skip if preceded by a digit (part of a longer number)
     if (pos > 0 and std.ascii.isDigit(buf[pos - 1])) return null;
     const candidate = extractPhoneCandidate(buf, pos) orelse return null;
-    
+
     // Default phone scanning is currently strictly US-formatting
     if (allow_us) {
         if (!isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;

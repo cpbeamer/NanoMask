@@ -47,15 +47,12 @@ const built_in_rules: []const ContextRule = &.{
         // E.g. "member " would shadow "member id " in the number rule because
         // the scanner iterates name rules first and "ID" passes the uppercase check.
         .prefixes = &.{
-            "patient is ",  "patient: ",    "patient ",
-            "member name: ", "member name ",
-            "subscriber: ", "subscriber ",
-            "guarantor: ",  "guarantor ",
-            "resident ",
-            "dr. ",         "dr ",
-            "mr. ",         "mr ",
-            "mrs. ",        "mrs ",
-            "ms. ",         "ms ",
+            "patient is ",   "patient: ",    "patient ",
+            "member name: ", "member name ", "subscriber: ",
+            "subscriber ",   "guarantor: ",  "guarantor ",
+            "resident ",     "dr. ",         "dr ",
+            "mr. ",          "mr ",          "mrs. ",
+            "mrs ",          "ms. ",         "ms ",
             "provider ",
         },
         .regex_match = null,
@@ -78,12 +75,11 @@ const built_in_rules: []const ContextRule = &.{
         // Single-word prefixes like "born " and "admitted " are omitted because
         // they cause false positives (e.g. "born in Texas" → [DATE_REDACTED]).
         .prefixes = &.{
-            "date of birth: ", "date of birth ",
+            "date of birth: ",  "date of birth ",
             "discharge date: ", "discharge date ",
-            "dob is ",         "dob: ",           "dob ",
-            "born on ",
-            "admitted: ",
-            "deceased: ",
+            "dob is ",          "dob: ",
+            "dob ",             "born on ",
+            "admitted: ",       "deceased: ",
         },
         .regex_match = null,
         .redact_tag = "[DATE_REDACTED]",
@@ -94,12 +90,13 @@ const built_in_rules: []const ContextRule = &.{
         .kind = .number,
         // "file " is omitted (too generic); "file # " requires the hash qualifier.
         .prefixes = &.{
-            "account: ",     "account ",
-            "acct: ",        "acct ",
-            "policy # ",     "policy: ",     "policy ",
-            "member id: ",   "member id ",
-            "case number: ", "case number ",
-            "claim # ",      "claim: ",      "claim ",
+            "account: ",    "account ",
+            "acct: ",       "acct ",
+            "policy # ",    "policy: ",
+            "policy ",      "member id: ",
+            "member id ",   "case number: ",
+            "case number ", "claim # ",
+            "claim: ",      "claim ",
             "file # ",
         },
         .regex_match = null,
@@ -130,7 +127,7 @@ fn skipBoundary(text: []const u8) usize {
 /// Helper: Finds the end of the next `max_words` starting from `text`
 fn scanWords(text: []const u8, max_words: usize, kind: RuleKind) usize {
     if (text.len == 0 or max_words == 0) return 0;
-    
+
     var pos: usize = 0;
     var words_found: usize = 0;
     var in_word = false;
@@ -145,23 +142,23 @@ fn scanWords(text: []const u8, max_words: usize, kind: RuleKind) usize {
         if (is_boundary) {
             if (in_word) {
                 in_word = false;
-                
+
                 if (kind == .name) {
                     const first_char = text[word_start_idx];
                     if (first_char < 'A' or first_char > 'Z') {
                         return last_word_end; // Reject word, return previous bounds
                     }
                 }
-                
+
                 words_found += 1;
                 last_word_end = pos;
-                
+
                 // If we've hit our max words, we stop exactly at this boundary
                 if (words_found >= max_words) {
                     return pos;
                 }
             }
-            
+
             // If we hit hard punctuation, we stop here
             if (is_hard_stop) {
                 return pos;
@@ -172,7 +169,7 @@ fn scanWords(text: []const u8, max_words: usize, kind: RuleKind) usize {
                 word_start_idx = pos;
             }
         }
-        
+
         pos += 1;
     }
 
@@ -187,7 +184,7 @@ fn scanWords(text: []const u8, max_words: usize, kind: RuleKind) usize {
         words_found += 1;
         last_word_end = pos;
     }
-    
+
     return last_word_end;
 }
 

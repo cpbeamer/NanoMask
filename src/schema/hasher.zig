@@ -10,7 +10,7 @@ pub const Hasher = struct {
     vault_inst: vault.Vault,
     allocator: std.mem.Allocator,
     observability: ?*@import("../infra/observability.zig").Observability = null,
-    
+
     /// Metrics for observability
     store_count: u64 = 0,
     lookup_count: u64 = 0,
@@ -189,7 +189,7 @@ pub const Hasher = struct {
                         try result.appendSlice(allocator, original);
                         i += token_len;
                         continue;
-                    } 
+                    }
                     // miss_count is now incremented inside unhash()
                 }
             }
