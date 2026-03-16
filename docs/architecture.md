@@ -11,7 +11,7 @@ Rather than relying on third-party frameworks like `zap`, the proxy is built ent
 *   **Listener (`std.net.Server`)**: Binds to a configurable listener address with `reuse_address` enabled to handle incoming TCP connections. The default is `127.0.0.1:8081` for sidecar-safe localhost binding, while gateway deployments can use `0.0.0.0:8081`.
 *   **Ingress Server (`std.http.Server`)**: Wraps the incoming connection stream. Utilizes specific `reader.interface()` and `&writer.interface` generic IO wrappers to coerce buffered connection streams into HTTP Server objects.
 *   **Egress Client (`std.http.Client`)**: Manages the outbound connection to the downstream API. Supports both bodiless (`sendBodilessUnflushed`) and body-forwarding (`sendBodyComplete`) modes depending on the request method.
-*   **Thread-Per-Connection Model**: Each accepted connection is dispatched to a dedicated, short-lived thread via `std.Thread.spawn` (not a fixed-size pool). An atomic counter enforces a configurable connection cap. Per-thread HTTP clients are created to avoid shared mutable state; the session-level entity map is passed as read-only context.
+*   **Thread-Per-Connection Model**: Each accepted connection is dispatched to a dedicated, short-lived thread via `std.Thread.spawn` (not a fixed-size pool). An atomic counter enforces a configurable connection cap. Per-thread HTTP clients are created to avoid shared mutable state; the session-level entity map is passed as read-only context. Alternative concurrency models (worker-pool, io_uring) are selectable via `--runtime-model`.
 
 ## 2. Data Flow & Payload Buffering
 
@@ -60,10 +60,10 @@ The entity masking engine provides dictionary-based name pseudonymization for PI
 
 ### Bidirectional EntityMap
 *   **`EntityMap`**: Session-level context holding a bidirectional name↔alias mapping with two pre-built automatons.
-*   **`mask()`**: Replaces real names with deterministic aliases (`Entity_A`, `Entity_B`, ...). Used on the request path before payloads reach the LLM.
+*   **`mask()`**: Replaces real names with deterministic aliases (`Entity_1`, `Entity_2`, ...). Used on the request path before payloads reach the LLM.
 *   **`unmask()`**: Reverses aliases back to real names. Used on the response path to restore original names in LLM output.
 *   **Overlap Resolution**: When multiple patterns match at overlapping positions, the engine uses leftmost-longest greedy selection.
-*   **Entity Limit**: Up to 702 entities per session (A–Z = 26, AA–ZZ = 676). Exceeding this returns `error.TooManyEntities`.
+*   **Entity Limit**: Unbounded — numeric alias suffix (`Entity_1` through `Entity_N`) supports arbitrarily large entity sets.
 
 ### Dynamic Entity Loading
 The `X-ZPG-Entities` header allows per-request entity specification:
@@ -104,9 +104,32 @@ The proxy applies redaction rules in sequence on the request path:
 On the response path:
 1.  **Entity Unmasking** (aliases → names) — Aho-Corasick reverse scan
 
-## 6. State Management
+## 6. TLS Architecture
 
-Connections are handled concurrently via `std.Thread.spawn` — each connection runs in its own thread with dedicated read/write buffers and HTTP server instance. A single `std.http.Client` is shared across all handler threads; its built-in `ConnectionPool` is thread-safe (uses `std.Thread.Mutex`) and reuses TCP connections with keep-alive (default 32 pooled connections). This eliminates per-request TCP handshake overhead. An atomic connection counter enforces a configurable cap (default 128) to prevent thread exhaustion under load. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context; both are optional, enabling SSN-only proxy mode without entity masking.
+NanoMask supports TLS on both the **listener** (client → NanoMask) and **upstream** (NanoMask → API) legs.
 
-**Phase 3 Scalability**: The current thread-per-connection model is a deliberate simplicity trade-off. An `io_uring`/IOCP-based event loop via `std.Io` would be the natural evolution for 10K+ concurrent connection workloads.
+### Recommended Production Architecture
 
+Terminate listener-side TLS at a **hardened ingress tier** (NGINX Ingress, Envoy, AWS ALB, Traefik) and run NanoMask as a plaintext HTTP service behind it. This provides full cipher suite coverage, automated certificate management via cert-manager, OCSP/CRL support, and a security posture that buyers recognize without additional review.
+
+### Supported Alternative
+
+NanoMask includes a built-in TLS 1.3 server (`src/crypto/tls.zig`) for development, testing, edge, and air-gapped environments. It implements X25519 key exchange, AES-128-GCM-SHA256, and ECDSA P-256 / Ed25519 signing. Enable via `--tls-cert` and `--tls-key`.
+
+### Upstream TLS
+
+Upstream TLS uses `std.http.Client` with system or custom CA bundles (`--target-tls`, `--ca-file`, `--tls-no-system-ca`). This leg operates independently of the listener TLS strategy.
+
+For the full strategy document, decision matrix, and deployment topology diagrams, see [docs/tls_strategy.md](tls_strategy.md).
+
+## 7. State Management & Runtime Models
+
+NanoMask supports three concurrency models, selectable via `--runtime-model`:
+
+| Model | Flag | Description |
+|---|---|---|
+| **thread-per-connection** | `--runtime-model thread-per-connection` (default) | One OS thread per active connection. Simple, low-latency, suitable for ≤128 concurrent connections. |
+| **worker-pool** | `--runtime-model worker-pool` | Fixed-size thread pool (auto-sized to 2×CPU or `--worker-threads`). Better memory footprint under bursty loads. |
+| **io-uring** | `--runtime-model io-uring` | **Planned (not yet implemented).** Scaffolded for a future `io_uring`-based event loop targeting 10K+ concurrent connections. Currently falls back to `worker-pool` on all platforms. Track: NMV3-017. |
+
+Connections share a single `std.http.Client` with a thread-safe `ConnectionPool` (default 32 pooled connections) for keep-alive reuse. An atomic counter enforces a configurable cap (default 128) to prevent resource exhaustion. The session-level EntityMap and FuzzyMatcher are passed as read-only thread context.

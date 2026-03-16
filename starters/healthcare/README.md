@@ -32,9 +32,7 @@ zig build run -- \
   --schema-file starters/healthcare/schemas/patient-demographics.nmschema \
   --schema-default KEEP \
   --hash-key-file starters/healthcare/hash-key.example.txt \
-  --enable-email \
-  --enable-phone \
-  --enable-healthcare
+  --profile hipaa-safe-harbor
 
 curl -X POST http://localhost:8081/post \
   -H "Content-Type: application/json" \
@@ -88,3 +86,4 @@ kubectl apply -f starters/healthcare/deployments/claims-gateway.yaml
 - NanoMask schema files use the line-based `field.path = ACTION` format, not a JSON object.
 - Keep `schema.name` and `schema.version` in your derived schemas so change-control reviews can track which starter revision you began from.
 - The sample hash key is only for local testing. Generate a new key for every real environment.
+- The `--profile hipaa-safe-harbor` flag expands to enable all default 18 identifiers required for safe-harbor de-identification. You can review presets via `zig build run -- --list-profiles`

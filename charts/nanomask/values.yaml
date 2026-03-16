@@ -94,6 +94,9 @@ features:
   ipAddress: false
   # -- Redact healthcare identifiers such as MRN, ICD-10, and insurance IDs.
   healthcarePatterns: false
+  # -- Run in report-only mode: detect PII without modifying payloads.
+  # Useful for baseline evaluation against live traffic.
+  reportOnly: false
 
 # -- Optional schema-aware JSON redaction.
 schema:
@@ -117,8 +120,14 @@ hashing:
   fileData: ""
 
 # ── Listener TLS (client → NanoMask) ─────────────────────────────────
+# Recommended production architecture: terminate TLS at the ingress tier
+# (NGINX Ingress, Envoy, ALB, Traefik) and run NanoMask as plaintext HTTP
+# behind it. Enable tls.enabled only for edge, air-gapped, or dev
+# deployments without an ingress controller.
+# See docs/tls_strategy.md for the full strategy document.
 tls:
-  # -- Enable TLS termination on the listener.
+  # -- Enable NanoMask's built-in TLS 1.3 termination on the listener.
+  # For production, prefer ingress-terminated TLS instead.
   enabled: false
   # -- Base64-encoded PEM certificate.
   certData: ""
@@ -127,6 +136,7 @@ tls:
   # -- Base64-encoded custom CA bundle PEM for upstream verification.
   # When set, also enable proxy.tlsNoSystemCa to suppress the default CA bundle.
   caData: ""
+
 
 # ── Kubernetes resources ─────────────────────────────────────────────
 resources:

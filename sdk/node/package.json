@@ -1,0 +1,25 @@
+{
+  "name": "@nanomask/openai",
+  "version": "0.1.0",
+  "description": "Thin NanoMask helpers for OpenAI-compatible Node clients",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "openai": "^4.0.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

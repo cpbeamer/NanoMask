@@ -14,7 +14,7 @@
       "kind": "positive",
       "entities": ["Jane Smith"],
       "input": "Jane Smith approved the discharge summary.",
-      "expected": "Entity_A approved the discharge summary."
+      "expected": "Entity_1 approved the discharge summary."
     },
     {
       "id": "two_names",
@@ -22,7 +22,7 @@
       "kind": "positive",
       "entities": ["Jane Smith", "Robert Brown"],
       "input": "Robert Brown reviewed the chart with Jane Smith.",
-      "expected": "Entity_B reviewed the chart with Entity_A."
+      "expected": "Entity_2 reviewed the chart with Entity_1."
     },
     {
       "id": "embedded_name",

@@ -12,10 +12,16 @@ pub const logger = @import("infra/logger.zig");
 pub const observability = @import("infra/observability.zig");
 pub const shutdown = @import("infra/shutdown.zig");
 pub const redaction_audit = @import("infra/redaction_audit.zig");
+pub const evaluation_report = @import("infra/evaluation_report.zig");
 pub const body_policy = @import("net/body_policy.zig");
 pub const runtime_model = @import("net/runtime_model.zig");
 pub const upstream_client = @import("net/upstream_client.zig");
 pub const proxy_server = @import("net/proxy_server.zig");
+
+// Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013)
+pub const rbac = @import("admin/rbac.zig");
+pub const audit_store = @import("infra/audit_store.zig");
+pub const key_manager = @import("crypto/key_manager.zig");
 
 // Pattern library (Phase 5 / Epic 7)
 pub const email = @import("patterns/email.zig");
@@ -23,7 +29,16 @@ pub const phone = @import("patterns/phone.zig");
 pub const credit_card = @import("patterns/credit_card.zig");
 pub const ip_address = @import("patterns/ip_address.zig");
 pub const healthcare = @import("patterns/healthcare.zig");
+pub const iban = @import("patterns/iban.zig");
+pub const uk_nino = @import("patterns/uk_nino.zig");
+pub const passport = @import("patterns/passport.zig");
+pub const intl_phone = @import("patterns/intl_phone.zig");
 pub const pattern_scanner = @import("patterns/scanner.zig");
+pub const guardrails = @import("ai/guardrails.zig");
+pub const semantic_cache = @import("infra/semantic_cache.zig");
+
+// Context Rules (Phase 3 / Epic 9)
+pub const context_rules = @import("context/rules.zig");
 
 // Schema-aware redaction (Phase 5 / Epic 8)
 pub const schema = @import("schema/schema.zig");
@@ -40,6 +55,12 @@ const integration_kits = if (@import("builtin").is_test) @import("test/integrati
 const proof_harness = if (@import("builtin").is_test) @import("proof/harness.zig") else @compileError("test-only");
 const runtime_bench_harness = if (@import("builtin").is_test) @import("test/runtime_bench_harness.zig") else @compileError("test-only");
 const bench_util = if (@import("builtin").is_test) @import("test/bench_util.zig") else @compileError("test-only");
+const tls_smoke_test = if (@import("builtin").is_test) @import("test/tls_smoke_test.zig") else @compileError("test-only");
+// Security testing (NMV3-004)
+const fuzz_json_parser = if (@import("builtin").is_test) @import("test/fuzz_json_parser.zig") else @compileError("test-only");
+const fuzz_schema_parser = if (@import("builtin").is_test) @import("test/fuzz_schema_parser.zig") else @compileError("test-only");
+const fuzz_redaction = if (@import("builtin").is_test) @import("test/fuzz_redaction.zig") else @compileError("test-only");
+const security_http_tests = if (@import("builtin").is_test) @import("test/security_http_tests.zig") else @compileError("test-only");
 
 test {
     // Ensure all tests in re-exported modules are discovered by `zig build test`.
@@ -57,6 +78,7 @@ test {
     _ = body_policy;
     _ = runtime_model;
     _ = redaction_audit;
+    _ = evaluation_report;
     _ = upstream_client;
     _ = proxy_server;
     _ = @import("net/http_util.zig");
@@ -66,7 +88,14 @@ test {
     _ = credit_card;
     _ = ip_address;
     _ = healthcare;
+    _ = iban;
+    _ = uk_nino;
+    _ = passport;
+    _ = intl_phone;
     _ = pattern_scanner;
+    _ = guardrails;
+    _ = semantic_cache;
+    _ = context_rules;
     // Schema-aware redaction
     _ = schema;
     _ = json_redactor;
@@ -81,4 +110,14 @@ test {
     _ = proof_harness;
     _ = runtime_bench_harness;
     _ = bench_util;
+    _ = tls_smoke_test;
+    // Security tests (NMV3-004)
+    _ = fuzz_json_parser;
+    _ = fuzz_schema_parser;
+    _ = fuzz_redaction;
+    _ = security_http_tests;
+    // Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013)
+    _ = rbac;
+    _ = audit_store;
+    _ = key_manager;
 }

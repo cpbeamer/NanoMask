@@ -2,6 +2,10 @@
   <h1 align="center">🛡️ NanoMask</h1>
   <p align="center"><strong>Wire-speed PII/PHI redaction proxy — pure Zig, zero dependencies</strong></p>
   <p align="center">
+    <a href="https://github.com/cpbeamer/NanoMask/actions/workflows/zig-ci.yml"><img src="https://github.com/cpbeamer/NanoMask/actions/workflows/zig-ci.yml/badge.svg" alt="Zig CI"></a>
+    <a href="https://github.com/cpbeamer/NanoMask/actions/workflows/compatibility.yml"><img src="https://github.com/cpbeamer/NanoMask/actions/workflows/compatibility.yml/badge.svg" alt="Compatibility"></a>
+  </p>
+  <p align="center">
     <a href="#benchmarks">16+ GB/s SSN redaction</a> · <a href="#algorithms">3-stage privacy pipeline</a> · <a href="#quick-start">Single binary deploy</a>
   </p>
 </p>
@@ -25,6 +29,37 @@ NanoMask currently operates on HTTP text and JSON payloads. It does not perform 
 | Need Python/Java/Go runtime | **Single static binary**, zero runtime dependencies |
 
 ## Quick Start
+
+### Docker (Recommended)
+
+```bash
+# Pull the image
+docker pull ghcr.io/cpbeamer/nanomask:latest
+
+# Run NanoMask (forwards to httpbin.org for demo)
+docker run --rm -p 8081:8081 \
+  ghcr.io/cpbeamer/nanomask:latest \
+  --listen-host 0.0.0.0 --target-host httpbin.org --target-port 80
+
+# In another terminal — send a request with PII:
+curl -s -X POST http://localhost:8081/post \
+  -H "Content-Type: application/json" \
+  -H "X-ZPG-Entities: John Doe, Jane Smith" \
+  -d '{"note": "Patient John Doe SSN 123-45-6789 was referred by Jane Smith"}'
+```
+
+**Expected output** — names replaced with aliases, SSN masked:
+
+```json
+{"note": "Patient Entity_A SSN ***-**-**** was referred by Entity_B"}
+```
+
+Validate your deployment config without starting the server:
+
+```bash
+docker run --rm ghcr.io/cpbeamer/nanomask:latest \
+  --validate-config --target-host api.openai.com --target-port 443 --target-tls
+```
 
 ### Prerequisites
 
@@ -142,14 +177,45 @@ NanoMask now includes packaged integration recipes under `examples/integrations/
 
 The sidecar, gateway, and LiteLLM recipes each include smoke-test commands plus operator notes for auth, TLS, streaming, and health checks. The OpenAI-compatible kit includes reusable client environment settings and streaming client samples.
 
+### SDK Wrappers
+
+Phase 5 adds lightweight SDK wrappers under `sdk/` so teams can point official OpenAI clients at NanoMask without hand-assembling `base_url` and entity headers every time.
+
+- `sdk/python`: installable `nanomask-openai` package, imported as `nanomask`
+- `sdk/node`: installable `@nanomask/openai` package
+- both packages default the client endpoint to `http://127.0.0.1:8081/v1`
+- both packages expose `verify()` helpers for CI and readiness checks
+
+Quick local install:
+
+```bash
+pip install ./sdk/python
+npm install openai ./sdk/node
+```
+
+See `sdk/README.md` plus each package README for examples.
+
+### Buyer Evaluation Kit
+
+Phase 5 also packages the buyer-facing evaluation assets:
+
+- `evaluation/README.md`: evaluation kit entry point
+- `evaluation/report-only-workflow.md`: first-pass rollout workflow
+- `evaluation/benchmark-card.md`: short proof artifact
+- `evaluation/pilot-runbook.md`: pilot onboarding flow
+- `evaluation/pilot-success-criteria.md`: scorecard template
+- `docs/commercial_offers.md`: pilot, sidecar, and gateway offer ladder
+- `site/index.html`: single-page landing site with positioning, quick start, and competitor framing
+
 ### Supported Features
 
 Core redaction and restore surface:
 - SSN redaction is always available for supported text and JSON bodies.
 - Entity masking and response unmasking can be driven from `--entity-file` / `NANOMASK_ENTITY_FILE` or per-request `X-ZPG-Entities`.
 - Fuzzy matching targets OCR-style name drift in text that has already been extracted into the HTTP payload.
-- Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, and healthcare identifiers.
+- Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, healthcare identifiers, IBANs, UK National Insurance numbers, passport values, and common international phone formats.
 - Optional schema-aware JSON mode exposes `KEEP`, `REDACT`, `SCAN`, and `HASH` actions through `--schema-file`, `--schema-default`, `--hash-key`, and `--hash-key-file`.
+- Optional AI control-plane features expose request guardrails (`--enable-guardrails`) and tenant-aware semantic caching (`--enable-semantic-cache`).
 - Schema-aware request redaction now streams JSON bodies with bounded parser memory instead of buffering the full request body first.
 
 Current limits:
@@ -191,8 +257,9 @@ NanoMask now preserves end-to-end response headers by default and only strips ho
 - Response unmasking for alias restoration stays incremental when the payload is inline-transformable and identity-encoded.
 - HASH restore (`unhashJson`) still requires full JSON buffering. When that happens the proxy logs `response_mode="buffered"` with `buffer_reason="json_unhash"` so operators can see why streaming was disabled for that response.
 
-The local mock-upstream compliance suite includes streamed SSE and NDJSON flows with inter-chunk delays and asserts that the first downstream chunk arrives before the full upstream response completes. That gives NanoMask a regression check for first-token latency on loopback without relying on an external vendor.
-**Known limitation**: The compatibility matrix currently reports that Anthropic-style SSE streaming is collapsed into a single client chunk. The proxy forwards the data correctly, but incremental per-chunk flushing is not yet verified as arriving in separate reads for the SSE flow. Improving incremental flush fidelity is tracked as part of the NMV2-003 streaming follow-up.
+The compatibility matrix includes OpenAI-style and Anthropic-style SSE streaming flows that validate per-event structure fidelity, incremental chunk delivery, and first-token latency. NDJSON streaming is separately verified. First-token latency is measured and included in the compatibility matrix JSON artifact.
+
+For a full reference of forwarding modes, flushing behavior, operator log fields, and HASH-mode buffering impact, see [`docs/streaming_behavior.md`](docs/streaming_behavior.md).
 
 ### Graceful Shutdown and Upstream Timeouts
 
@@ -349,6 +416,27 @@ Client ◄──── Response with real names restored
 **Threading model**: Thread-per-connection with atomic connection counter (default cap: 128). All handler threads share a single `std.http.Client` with a thread-safe, built-in connection pool (keep-alive, default 32 upstream connections).
 
 See [`architecture.md`](architecture.md) for the full technical design and [`backlog.md`](backlog.md) for planned improvements.
+
+## TLS & Production Deployment
+
+**Recommended**: Terminate listener-side TLS at a hardened ingress tier (NGINX Ingress, Envoy, AWS ALB, Traefik) and run NanoMask as plaintext HTTP behind it. This provides full cipher suite coverage, automated cert management, OCSP/CRL, and a security posture buyers recognize.
+
+**Alternative**: NanoMask includes a built-in TLS 1.3 server for dev, testing, edge, and air-gapped environments. Enable via `--tls-cert` and `--tls-key`.
+
+```bash
+# Minimal TLS Ingress + NanoMask (Kubernetes)
+# 1. NanoMask runs HTTP on :8081 behind a ClusterIP Service
+# 2. Ingress terminates TLS and forwards to the Service
+# See examples/standalone-deployment.yaml for the full manifest
+```
+
+| Topology | Listener TLS | How |
+|---|---|---|
+| **Gateway** (shared) | Ingress tier | `Ingress (TLS) → Service → NanoMask (HTTP) → Upstream (TLS)` |
+| **Sidecar** (per-pod) | Not needed | `Pod [ App → localhost:8081 → NanoMask ] → Upstream (TLS)` |
+| **Edge / Air-gapped** | Built-in TLS 1.3 | `--tls-cert cert.pem --tls-key key.pem` |
+
+For the full strategy, decision matrix, cipher details, and known limitations see [`docs/tls_strategy.md`](docs/tls_strategy.md).
 
 ## Project Structure
 
@@ -534,6 +622,19 @@ metrics:
 ```
 
 Health endpoints are logged at `DEBUG` level only to avoid log noise.
+
+## Security
+
+NanoMask ships with a complete security evidence package for enterprise evaluators:
+
+- **[Customer Security Packet](docs/security_packet.md)** — architecture summary, hardening guidance, network boundaries, audit behavior, secrets handling, known limitations
+- **[Threat Model](docs/threat_model.md)** — STRIDE-based analysis covering ingress, egress, admin API, and filesystem boundaries
+- **[Pentest Findings](docs/pentest_findings.md)** — assessment plan, findings tracker, and TLS interoperability results
+- **[TLS Strategy](docs/tls_strategy.md)** — production TLS decision, deployment topologies, and cipher details
+- **[Release Signing](docs/release_signing.md)** — SBOM generation and binary/image signing workflow
+- **[Security Review Checklist](docs/security_review_checklist.md)** — per-release verification checklist
+- **[HIPAA BAA Template](docs/hipaa_baa_template.md)** — draft Business Associate Agreement for healthcare buyers
+- **[FedRAMP Readiness](docs/fedramp_readiness.md)** — NIST SP 800-53 control mapping and gap analysis
 
 ## License
 

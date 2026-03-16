@@ -1,4 +1,5 @@
 const std = @import("std");
+const guardrails_mod = @import("../ai/guardrails.zig");
 const proxy = @import("proxy.zig");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
@@ -17,6 +18,9 @@ const body_policy = @import("body_policy.zig");
 const shutdown_mod = @import("../infra/shutdown.zig");
 const upstream_client = @import("upstream_client.zig");
 const runtime_model_mod = @import("runtime_model.zig");
+const evaluation_report_mod = @import("../infra/evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const semantic_cache_mod = @import("../infra/semantic_cache.zig");
 
 pub const RuntimeModel = runtime_model_mod.RuntimeModel;
 
@@ -42,11 +46,26 @@ pub const ConnectionContext = struct {
     enable_credit_card: bool,
     enable_ip: bool,
     enable_healthcare: bool,
+    enable_iban: bool,
+    enable_uk_nino: bool,
+    enable_passport: bool,
+    enable_intl_phone: bool,
+    enable_dates: bool,
+    enable_addresses: bool,
+    enable_accounts: bool,
+    enable_licenses: bool,
+    enable_urls: bool,
+    enable_vehicle_ids: bool,
+    guardrail_settings: guardrails_mod.Settings = .{},
+    semantic_cache: ?*semantic_cache_mod.SemanticCache = null,
+    semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     shutdown_state: *shutdown_mod.ShutdownState,
     listener_mode: admin.ListenerMode,
     upstream_timeouts: upstream_client.UpstreamTimeouts,
+    report_only: bool = false,
+    evaluation_report: ?*EvaluationReport = null,
 };
 
 pub const ConnectionHandler = struct {
@@ -135,6 +154,9 @@ pub const ProxyServer = struct {
                 .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
                 .{ .key = "active_connections", .value = .{ .uint = self.active_connections.load(.acquire) } },
             });
+            self.logger.log(.info, "shutdown_draining", null, &.{
+                .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
+            });
         }
 
         self.closeListener();
@@ -145,7 +167,7 @@ pub const ProxyServer = struct {
     }
 
     fn initRuntime(self: *ProxyServer) !void {
-        if (self.runtime_model != .worker_pool) return;
+        if (self.runtime_model.effectiveModel() != .worker_pool) return;
 
         // Worker thread count must be resolved by the caller before starting.
         // A zero value here indicates a configuration bug — fail explicitly.
@@ -166,13 +188,6 @@ pub const ProxyServer = struct {
     }
 
     fn finishShutdown(self: *ProxyServer) void {
-        if (self.shutdown_state.beginDraining()) {
-            self.observability.markShutdownDraining();
-            self.logger.log(.info, "shutdown_draining", null, &.{
-                .{ .key = "drain_timeout_ms", .value = .{ .uint = self.drain_timeout_ms } },
-            });
-        }
-
         const drain_result = shutdown_mod.waitForDrain(self.active_connections, self.drain_timeout_ms);
         if (drain_result.completed) {
             self.logger.log(.info, "shutdown_complete", null, &.{
@@ -196,7 +211,7 @@ pub const ProxyServer = struct {
     }
 
     fn dispatchConnection(self: *ProxyServer, connection: std.net.Server.Connection) !void {
-        switch (self.runtime_model) {
+        switch (self.runtime_model.effectiveModel()) {
             .thread_per_connection => {
                 const thread = try std.Thread.spawn(.{}, dispatchOwnedConnection, .{
                     &self.handler,
@@ -211,6 +226,7 @@ pub const ProxyServer = struct {
                     connection,
                 });
             },
+            .io_uring => unreachable, // effectiveModel() never returns io_uring while unimplemented
         }
     }
 };
@@ -292,12 +308,27 @@ fn handleConnection(connection: std.net.Server.Connection, ctx: ConnectionContex
             .enable_credit_card = ctx.enable_credit_card,
             .enable_ip = ctx.enable_ip,
             .enable_healthcare = ctx.enable_healthcare,
+            .enable_iban = ctx.enable_iban,
+            .enable_uk_nino = ctx.enable_uk_nino,
+            .enable_passport = ctx.enable_passport,
+            .enable_intl_phone = ctx.enable_intl_phone,
+            .enable_dates = ctx.enable_dates,
+            .enable_addresses = ctx.enable_addresses,
+            .enable_accounts = ctx.enable_accounts,
+            .enable_licenses = ctx.enable_licenses,
+            .enable_urls = ctx.enable_urls,
+            .enable_vehicle_ids = ctx.enable_vehicle_ids,
+            .guardrail_settings = ctx.guardrail_settings,
+            .semantic_cache = ctx.semantic_cache,
+            .semantic_cache_tenant_header = ctx.semantic_cache_tenant_header,
             .schema = ctx.schema,
             .hasher = ctx.hasher,
             .shutdown_state = ctx.shutdown_state,
             .client_address = connection.address,
             .listener_mode = ctx.listener_mode,
             .upstream_timeouts = ctx.upstream_timeouts,
+            .report_only = ctx.report_only,
+            .evaluation_report = ctx.evaluation_report,
         },
     ) catch |err| {
         ctx.logger.log(.error_, "proxy_request_failed", session_id, &.{

@@ -1,8 +1,10 @@
 const std = @import("std");
+const guardrails_mod = @import("../ai/guardrails.zig");
 const body_policy = @import("../net/body_policy.zig");
 const UnsupportedBodyBehavior = body_policy.UnsupportedBodyBehavior;
 const runtime_model = @import("../net/runtime_model.zig");
 const RuntimeModel = runtime_model.RuntimeModel;
+const GuardrailMode = guardrails_mod.Mode;
 
 pub const LogLevel = enum {
     debug,
@@ -16,6 +18,129 @@ pub const LogLevel = enum {
         if (std.mem.eql(u8, s, "warn")) return .warn;
         if (std.mem.eql(u8, s, "error")) return .error_;
         return error.InvalidLogLevel;
+    }
+};
+
+pub const VaultBackend = enum {
+    memory,
+    file,
+    external,
+
+    pub fn parse(s: []const u8) !VaultBackend {
+        if (std.mem.eql(u8, s, "memory")) return .memory;
+        if (std.mem.eql(u8, s, "file")) return .file;
+        if (std.mem.eql(u8, s, "external")) return .external;
+        return error.InvalidVaultBackend;
+    }
+
+    pub fn asStr(self: VaultBackend) []const u8 {
+        return switch (self) {
+            .memory => "memory",
+            .file => "file",
+            .external => "external",
+        };
+    }
+};
+
+pub const EntityFormat = enum {
+    names,
+    structured,
+
+    pub fn parse(s: []const u8) !EntityFormat {
+        if (std.mem.eql(u8, s, "names")) return .names;
+        if (std.mem.eql(u8, s, "structured")) return .structured;
+        return error.InvalidEntityFormat;
+    }
+
+    pub fn asStr(self: EntityFormat) []const u8 {
+        return switch (self) {
+            .names => "names",
+            .structured => "structured",
+        };
+    }
+};
+
+pub const Locale = enum {
+    us,
+    uk,
+    eu,
+    ca,
+    all,
+
+    pub fn parse(s: []const u8) !Locale {
+        if (std.mem.eql(u8, s, "us")) return .us;
+        if (std.mem.eql(u8, s, "uk")) return .uk;
+        if (std.mem.eql(u8, s, "eu")) return .eu;
+        if (std.mem.eql(u8, s, "ca")) return .ca;
+        if (std.mem.eql(u8, s, "all")) return .all;
+        return error.InvalidLocale;
+    }
+
+    pub fn asStr(self: Locale) []const u8 {
+        return switch (self) {
+            .us => "us",
+            .uk => "uk",
+            .eu => "eu",
+            .ca => "ca",
+            .all => "all",
+        };
+    }
+};
+
+pub const Profile = enum {
+    hipaa_safe_harbor,
+    healthcare_lite,
+    llm_basic,
+    custom,
+
+    pub fn parse(s: []const u8) !Profile {
+        if (std.mem.eql(u8, s, "hipaa-safe-harbor")) return .hipaa_safe_harbor;
+        if (std.mem.eql(u8, s, "healthcare-lite")) return .healthcare_lite;
+        if (std.mem.eql(u8, s, "llm-basic")) return .llm_basic;
+        if (std.mem.eql(u8, s, "custom")) return .custom;
+        return error.InvalidProfile;
+    }
+
+    pub fn asStr(self: Profile) []const u8 {
+        return switch (self) {
+            .hipaa_safe_harbor => "hipaa-safe-harbor",
+            .healthcare_lite => "healthcare-lite",
+            .llm_basic => "llm-basic",
+            .custom => "custom",
+        };
+    }
+
+    pub fn apply(self: Profile, config: *Config) void {
+        switch (self) {
+            .hipaa_safe_harbor => {
+                config.enable_email = true;
+                config.enable_phone = true;
+                config.enable_ip = true;
+                config.enable_healthcare = true;
+                config.enable_dates = true;
+                config.enable_addresses = true;
+                config.enable_fax = true;
+                config.enable_accounts = true;
+                config.enable_licenses = true;
+                config.enable_urls = true;
+                config.enable_vehicle_ids = true;
+                config.enable_context_rules = true;
+            },
+            .healthcare_lite => {
+                config.enable_email = true;
+                config.enable_phone = true;
+                config.enable_healthcare = true;
+                config.enable_dates = true;
+            },
+            .llm_basic => {
+                config.enable_email = true;
+                config.enable_credit_card = true;
+                config.enable_ip = true;
+            },
+            .custom => {
+                // Do nothing; relies entirely on individual flags
+            },
+        }
     }
 };
 
@@ -44,6 +169,8 @@ pub const Config = struct {
     target_host_src: ConfigSource = .default,
     target_port: u16 = 80,
     target_port_src: ConfigSource = .default,
+    entity_format: EntityFormat = .names,
+    entity_format_src: ConfigSource = .default,
     entity_file: ?[]const u8 = null,
     entity_file_src: ConfigSource = .default,
     fuzzy_threshold: f32 = 0.80,
@@ -111,6 +238,48 @@ pub const Config = struct {
     enable_ip_src: ConfigSource = .default,
     enable_healthcare: bool = false,
     enable_healthcare_src: ConfigSource = .default,
+    enable_iban: bool = false,
+    enable_iban_src: ConfigSource = .default,
+    enable_uk_nino: bool = false,
+    enable_uk_nino_src: ConfigSource = .default,
+    enable_uk_nhs: bool = false,
+    enable_uk_nhs_src: ConfigSource = .default,
+    enable_uk_phone: bool = false,
+    enable_uk_phone_src: ConfigSource = .default,
+    enable_uk_postcode: bool = false,
+    enable_uk_postcode_src: ConfigSource = .default,
+    enable_ca_sin: bool = false,
+    enable_ca_sin_src: ConfigSource = .default,
+    enable_passport: bool = false,
+    enable_passport_src: ConfigSource = .default,
+    enable_intl_phone: bool = false,
+    enable_intl_phone_src: ConfigSource = .default,
+    // --- Phase 1 / V4 Pattern library flags ---
+    enable_dates: bool = false,
+    enable_dates_src: ConfigSource = .default,
+    enable_addresses: bool = false,
+    enable_addresses_src: ConfigSource = .default,
+    enable_fax: bool = false,
+    enable_fax_src: ConfigSource = .default,
+    enable_accounts: bool = false,
+    enable_accounts_src: ConfigSource = .default,
+    enable_licenses: bool = false,
+    enable_licenses_src: ConfigSource = .default,
+    enable_urls: bool = false,
+    enable_urls_src: ConfigSource = .default,
+    enable_vehicle_ids: bool = false,
+    enable_vehicle_ids_src: ConfigSource = .default,
+    // --- Phase 3 / V4 Context Rules ---
+    enable_context_rules: bool = false,
+    enable_context_rules_src: ConfigSource = .default,
+    context_confidence_threshold: f32 = 0.70,
+    context_confidence_threshold_src: ConfigSource = .default,
+    // --- International Patterns ---
+    locale: Locale = .us,
+    locale_src: ConfigSource = .default,
+    // --- Detection Profiles ---
+    profile: Profile = .custom,
+    profile_src: ConfigSource = .default,
     // --- Schema-aware redaction flags (Phase 5 / Epic 8) ---
     schema_file: ?[]const u8 = null,
     schema_file_src: ConfigSource = .default,
@@ -121,10 +290,52 @@ pub const Config = struct {
     hash_key_src: ConfigSource = .default,
     hash_key_file: ?[]const u8 = null,
     hash_key_file_src: ConfigSource = .default,
+    // --- Report-only mode (Phase 2 / NMV3-007) ---
+    report_only: bool = false,
+    report_only_src: ConfigSource = .default,
+    // --- Persistent Token Vault (Phase 2 / NMV4-007) ---
+    vault_backend: VaultBackend = .memory,
+    vault_backend_src: ConfigSource = .default,
+    vault_file_path: ?[]const u8 = null,
+    vault_file_path_src: ConfigSource = .default,
+    // --- Phase 5: AI guardrails and semantic caching ---
+    enable_guardrails: bool = false,
+    enable_guardrails_src: ConfigSource = .default,
+    guardrail_mode: GuardrailMode = .alert,
+    guardrail_mode_src: ConfigSource = .default,
+    enable_semantic_cache: bool = false,
+    enable_semantic_cache_src: ConfigSource = .default,
+    semantic_cache_ttl_ms: u64 = 300_000,
+    semantic_cache_ttl_ms_src: ConfigSource = .default,
+    semantic_cache_max_entries: usize = 256,
+    semantic_cache_max_entries_src: ConfigSource = .default,
+    semantic_cache_tenant_header: []const u8 = "X-NanoMask-Tenant",
+    semantic_cache_tenant_header_src: ConfigSource = .default,
+    // --- Phase 3: Enterprise Control Plane (NMV3-011, NMV3-012, NMV3-013) ---
+    admin_api_key_file: ?[]const u8 = null,
+    admin_api_key_file_src: ConfigSource = .default,
+    audit_buffer_size: u32 = 1000,
+    audit_buffer_size_src: ConfigSource = .default,
+    otel_service_name: ?[]const u8 = null,
+    otel_service_name_src: ConfigSource = .default,
+    syslog_address: ?[]const u8 = null,
+    syslog_address_src: ConfigSource = .default,
+    hash_key_exec: ?[]const u8 = null,
+    hash_key_exec_src: ConfigSource = .default,
+    mtls_ca: ?[]const u8 = null,
+    mtls_ca_src: ConfigSource = .default,
+    mtls_cert: ?[]const u8 = null,
+    mtls_cert_src: ConfigSource = .default,
+    mtls_key: ?[]const u8 = null,
+    mtls_key_src: ConfigSource = .default,
 
     /// When true, perform a health check probe against the listener and exit.
     /// Wildcard binds probe loopback so container HEALTHCHECK still works.
     healthcheck: bool = false,
+
+    /// When true, validate all configuration (files, flags, consistency)
+    /// and print a summary without starting the server.
+    validate_config: bool = false,
 
     allocator: std.mem.Allocator,
 
@@ -156,10 +367,23 @@ pub const Config = struct {
         InvalidAuditLogFlag,
         InvalidUnsupportedBodyBehavior,
         InvalidPatternFlag,
+        InvalidGuardrailMode,
+        InvalidSemanticCacheConfig,
         InvalidSchemaDefault,
         SchemaFileNotFound,
         InvalidHashKey,
         HashKeyFileNotFound,
+        InvalidReportOnlyFlag,
+        InvalidApiKeyFile,
+        InvalidAuditBufferSize,
+        InvalidMtlsConfig,
+        InvalidMtlsPemFormat,
+        InvalidVaultBackend,
+        MissingVaultFilePath,
+        VaultFileNotFound,
+        InvalidContextConfidenceThreshold,
+        InvalidLocale,
+        InvalidProfile,
         UnknownFlag,
         OutOfMemory,
     };
@@ -204,8 +428,38 @@ pub const Config = struct {
         if (self.hash_key_file != null and self.hash_key_file_src == .env_var) {
             self.allocator.free(self.hash_key_file.?);
         }
+        if (self.vault_file_path != null and self.vault_file_path_src == .env_var) {
+            self.allocator.free(self.vault_file_path.?);
+        }
         if (self.schema_default) |sd| {
             self.allocator.free(sd);
+        }
+        // Only free when the value was heap-allocated from an env var.
+        // cli_flag assignments borrow directly from the argv slice (server lifetime)
+        // so no deinit is needed for that source.
+        if (self.semantic_cache_tenant_header_src == .env_var) {
+            self.allocator.free(self.semantic_cache_tenant_header);
+        }
+        if (self.admin_api_key_file != null and self.admin_api_key_file_src == .env_var) {
+            self.allocator.free(self.admin_api_key_file.?);
+        }
+        if (self.otel_service_name != null and self.otel_service_name_src == .env_var) {
+            self.allocator.free(self.otel_service_name.?);
+        }
+        if (self.syslog_address != null and self.syslog_address_src == .env_var) {
+            self.allocator.free(self.syslog_address.?);
+        }
+        if (self.hash_key_exec != null and self.hash_key_exec_src == .env_var) {
+            self.allocator.free(self.hash_key_exec.?);
+        }
+        if (self.mtls_ca != null and self.mtls_ca_src == .env_var) {
+            self.allocator.free(self.mtls_ca.?);
+        }
+        if (self.mtls_cert != null and self.mtls_cert_src == .env_var) {
+            self.allocator.free(self.mtls_cert.?);
+        }
+        if (self.mtls_key != null and self.mtls_key_src == .env_var) {
+            self.allocator.free(self.mtls_key.?);
         }
     }
 
@@ -222,6 +476,7 @@ pub const Config = struct {
         \\  --runtime-model <mode>              Connection scheduler: thread-per-connection or worker-pool (default: thread-per-connection)
         \\  --runtime-worker-threads <n>        Worker threads for worker-pool mode (0 = auto, default: 0)
         \\  --max-body-size <bytes>             Maximum request body size in bytes (default: 10485760)
+        \\  --entity-format <format>            Format of the entity file: names or structured (default: names)
         \\  --entity-file <path>                Path to file containing entity aliases (default: none)
         \\  --watch-interval <ms>               Entity file poll interval in ms (default: 1000)
         \\  --fuzzy-threshold <f32>             Threshold for fuzzy matching (0.0 - 1.0) (default: 0.8)
@@ -249,7 +504,16 @@ pub const Config = struct {
         \\  --admin-read-only                   Allow admin visibility but reject runtime entity mutations
         \\  --admin-mutation-rate-limit <n>     Maximum entity mutations per minute (0 disables, default: 60)
         \\  --entity-file-sync                  Write API entity changes back to entity file
+        \\  --admin-api-key-file <path>         Bootstrap API keys from JSON file for RBAC (Phase 3)
+        \\  --report-only                       Detect PII without modifying payloads (evaluation mode, default: disabled)
+        \\  --enable-guardrails                 Enable baseline AI guardrail checks on request bodies
+        \\  --guardrail-mode <mode>             Guardrail action: alert or block (default: alert)
+        \\  --enable-semantic-cache             Cache de-identified prompt-response pairs in memory
+        \\  --semantic-cache-ttl-ms <ms>        Semantic cache entry TTL in ms (default: 300000)
+        \\  --semantic-cache-max-entries <n>    Maximum semantic cache entries; eviction is O(n) per store — keep ≤4096 (default: 256)
+        \\  --semantic-cache-tenant-header <h>  Header used for cache tenant isolation (default: X-NanoMask-Tenant)
         \\  --healthcheck                       Probe /healthz on the local listener and exit
+        \\  --validate-config                   Validate configuration and print summary without starting the server
         \\  --help                              Print this help message and exit
         \\
         \\Optional detection features:
@@ -258,15 +522,252 @@ pub const Config = struct {
         \\  --enable-credit-card                Redact credit card numbers with Luhn validation (default: disabled)
         \\  --enable-ip                         Redact IPv4/IPv6 addresses (default: disabled)
         \\  --enable-healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
+        \\  --enable-iban                       Redact EU IBAN values (default: disabled)
+        \\  --enable-uk-nino                    Redact UK National Insurance numbers (default: disabled)
+        \\  --enable-uk-nhs                     Redact UK National Health Service numbers (default: disabled)
+        \\  --enable-uk-phone                   Redact UK Phone Numbers (+44, national 0) (default: disabled)
+        \\  --enable-uk-postcode                Redact UK Postcodes (e.g. SW1A 1AA) (default: disabled)
+        \\  --enable-ca-sin                     Redact Canadian SIN and Health Cards (default: disabled)
+        \\  --enable-passport                   Redact passport numbers when label-qualified (default: disabled)
+        \\  --enable-intl-phone                 Redact common non-US international phone numbers (default: disabled)
+        \\  --enable-dates                      Redact dates and aggregate ages > 89 (default: disabled)
+        \\  --enable-addresses                  Redact US street addresses, ZIPs, city/states (default: disabled)
+        \\  --enable-fax                        Redact fax numbers (default: disabled)
+        \\  --enable-accounts                   Redact banking and financial account numbers (default: disabled)
+        \\  --enable-licenses                   Redact US driver's licenses, DEA, and NPI numbers (default: disabled)
+        \\  --enable-urls                       Redact HTTP/HTTPS URLs (default: disabled)
+        \\  --enable-vehicle-ids                Redact VINs and heuristic license plates (default: disabled)
+        \\  --enable-context-rules              Redact contextual patterns like Name after 'Patient:' (Stage 4) (default: disabled)
+        \\  --context-confidence-threshold <f>  Threshold for context rules (0.0 - 1.0) (default: 0.70)
+        \\  --locale <region>                   Enable regional PII patterns: us, uk, eu, ca, all (default: us)
+        \\  --profile <name>                    Enable a detection profile preset (hipaa-safe-harbor, healthcare-lite, llm-basic, custom)
+        \\  --list-profiles                     List available detection profiles and exit
+        \\
+        \\Override profile flags (set feature to disabled after profile has been applied):
+        \\  --disable-email                     Disable email detection (overrides profile)
+        \\  --disable-phone                     Disable phone detection (overrides profile)
+        \\  --disable-credit-card               Disable credit card detection (overrides profile)
+        \\  --disable-ip                        Disable IP address detection (overrides profile)
+        \\  --disable-healthcare                Disable healthcare ID detection (overrides profile)
+        \\  --disable-iban                      Disable IBAN detection (overrides profile)
+        \\  --disable-uk-nino                   Disable UK NINO detection (overrides profile)
+        \\  --disable-uk-nhs                    Disable UK NHS detection (overrides profile)
+        \\  --disable-uk-phone                  Disable UK phone detection (overrides profile)
+        \\  --disable-uk-postcode               Disable UK postcode detection (overrides profile)
+        \\  --disable-ca-sin                    Disable Canadian SIN detection (overrides profile)
+        \\  --disable-passport                  Disable passport detection (overrides profile)
+        \\  --disable-intl-phone                Disable intl phone detection (overrides profile)
+        \\  --disable-dates                     Disable date detection (overrides profile)
+        \\  --disable-addresses                 Disable address detection (overrides profile)
+        \\  --disable-fax                       Disable fax detection (overrides profile)
+        \\  --disable-accounts                  Disable account detection (overrides profile)
+        \\  --disable-licenses                  Disable license detection (overrides profile)
+        \\  --disable-urls                      Disable URL detection (overrides profile)
+        \\  --disable-vehicle-ids               Disable vehicle ID detection (overrides profile)
+        \\  --disable-context-rules             Disable context rules (overrides profile)
+        \\
         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
         \\  --hash-key-file <path>              File containing the 64-char hex HMAC key
+        \\  --hash-key-exec <command>           Shell command that outputs the HMAC key on stdout (Phase 3)
+        \\                                      WARNING: command is executed as a shell; only use with trusted config sources
+        \\  --vault-backend <type>              Backend for HASH-mode persistence: memory, file, external (default: memory)
+        \\  --vault-file-path <path>            File path for encrypted local storage (required with --vault-backend file)
+        \\
+        \\Enterprise observability (Phase 3):
+        \\  --audit-buffer-size <n>              In-memory audit ring buffer size (default: 1000)
+        \\  --otel-service-name <name>          Add OTel-compatible fields to structured logs
+        \\  --syslog-address <host:port>        Duplicate log lines to UDP syslog target (RFC 5424)
+        \\
+        \\Mutual TLS (Phase 3):
+        \\  --mtls-ca <path>                    Client CA bundle PEM for mutual TLS verification
+        \\  --mtls-cert <path>                  Client certificate PEM for mTLS
+        \\  --mtls-key <path>                   Client private key PEM for mTLS
         \\
     ;
 
+    const known_flags = [_][]const u8{
+        "--listen-host",
+        "--listen-port",
+        "--target-host",
+        "--target-port",
+        "--target-tls",
+        "--max-connections",
+        "--runtime-model",
+        "--runtime-worker-threads",
+        "--max-body-size",
+        "--entity-format",
+        "--entity-file",
+        "--watch-interval",
+        "--fuzzy-threshold",
+        "--log-level",
+        "--log-file",
+        "--audit-log",
+        "--tls-cert",
+        "--tls-key",
+        "--ca-file",
+        "--tls-no-system-ca",
+        "--upstream-connect-timeout-ms",
+        "--upstream-read-timeout-ms",
+        "--upstream-request-timeout-ms",
+        "--shutdown-drain-timeout-ms",
+        "--unsupported-request-body-behavior",
+        "--unsupported-response-body-behavior",
+        "--admin-api",
+        "--admin-token",
+        "--admin-listen-address",
+        "--admin-allowlist",
+        "--admin-read-only",
+        "--admin-mutation-rate-limit",
+        "--entity-file-sync",
+        "--admin-api-key-file",
+        "--report-only",
+        "--enable-guardrails",
+        "--guardrail-mode",
+        "--enable-semantic-cache",
+        "--semantic-cache-ttl-ms",
+        "--semantic-cache-max-entries",
+        "--semantic-cache-tenant-header",
+        "--healthcheck",
+        "--validate-config",
+        "--help",
+        "--enable-email",
+        "--enable-phone",
+        "--enable-credit-card",
+        "--enable-ip",
+        "--enable-healthcare",
+        "--enable-iban",
+        "--enable-uk-nino",
+        "--enable-uk-nhs",
+        "--enable-uk-phone",
+        "--enable-uk-postcode",
+        "--enable-ca-sin",
+        "--enable-passport",
+        "--enable-intl-phone",
+        "--enable-dates",
+        "--enable-addresses",
+        "--enable-fax",
+        "--enable-accounts",
+        "--enable-licenses",
+        "--enable-urls",
+        "--enable-vehicle-ids",
+        "--enable-context-rules",
+        "--context-confidence-threshold",
+        "--locale",
+        "--profile",
+        "--list-profiles",
+        "--schema-file",
+        "--schema-default",
+        "--hash-key",
+        "--hash-key-file",
+        "--hash-key-exec",
+        "--vault-backend",
+        "--vault-file-path",
+        "--audit-buffer-size",
+        "--otel-service-name",
+        "--syslog-address",
+        "--mtls-ca",
+        "--mtls-cert",
+        "--mtls-key",
+        "--disable-email",
+        "--disable-phone",
+        "--disable-credit-card",
+        "--disable-ip",
+        "--disable-healthcare",
+        "--disable-iban",
+        "--disable-uk-nino",
+        "--disable-uk-nhs",
+        "--disable-uk-phone",
+        "--disable-uk-postcode",
+        "--disable-ca-sin",
+        "--disable-passport",
+        "--disable-intl-phone",
+        "--disable-dates",
+        "--disable-addresses",
+        "--disable-fax",
+        "--disable-accounts",
+        "--disable-licenses",
+        "--disable-urls",
+        "--disable-vehicle-ids",
+        "--disable-context-rules",
+    };
+
+    pub fn printProfiles() void {
+        const text =
+            \\Available Detection Profiles:
+            \\
+            \\  hipaa-safe-harbor
+            \\    Enables all HIPAA Safe Harbor identifiers: email, phone, IP, healthcare IDs (MRN, etc.),
+            \\    dates/ages, addresses, fax, accounts, licenses, URLs, vehicle IDs, and context rules.
+            \\
+            \\  healthcare-lite
+            \\    A faster, lower false-positive profile: email, phone, healthcare IDs, and dates/ages.
+            \\    (Excludes context rules, addresses, licenses, etc.)
+            \\
+            \\  llm-basic
+            \\    Fastest baseline protection: email, credit card, IP.
+            \\
+            \\  custom
+            \\    No preset active. Requires individual --enable-* flags. (Default)
+            \\
+        ;
+        std.debug.print("{s}", .{text});
+    }
+
     pub fn printHelp() void {
         std.debug.print("{s}", .{help_text});
+    }
+
+    fn levenshteinDistance(a: []const u8, b: []const u8) usize {
+        if (a.len == 0) return b.len;
+        if (b.len == 0) return a.len;
+
+        var prev: [128]usize = undefined;
+        var curr: [128]usize = undefined;
+        std.debug.assert(b.len + 1 <= prev.len);
+
+        for (0..b.len + 1) |j| {
+            prev[j] = j;
+        }
+
+        for (a, 0..) |a_byte, i| {
+            curr[0] = i + 1;
+            for (b, 0..) |b_byte, j| {
+                const substitution_cost: usize = if (a_byte == b_byte) 0 else 1;
+                const deletion = prev[j + 1] + 1;
+                const insertion = curr[j] + 1;
+                const substitution = prev[j] + substitution_cost;
+                curr[j + 1] = @min(@min(deletion, insertion), substitution);
+            }
+            std.mem.copyForwards(usize, prev[0 .. b.len + 1], curr[0 .. b.len + 1]);
+        }
+
+        return prev[b.len];
+    }
+
+    fn suggestFlag(flag: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, flag, "--")) return null;
+        // levenshteinDistance uses a fixed 128-element stack buffer indexed by
+        // b.len + 1. Guard here so we never exceed it regardless of input.
+        if (flag.len >= 128) return null;
+
+        var best_flag: ?[]const u8 = null;
+        var best_distance: usize = std.math.maxInt(usize);
+
+        for (known_flags) |candidate| {
+            const distance = levenshteinDistance(flag, candidate);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_flag = candidate;
+            }
+        }
+
+        if (best_flag) |candidate| {
+            const max_distance: usize = if (flag.len <= 16) 3 else 4;
+            if (best_distance <= max_distance) return candidate;
+        }
+        return null;
     }
 
     fn needsBracketedHost(host: []const u8) bool {
@@ -349,6 +850,12 @@ pub const Config = struct {
             };
             if (config.target_port == 0) return error.InvalidPort;
             config.target_port_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FORMAT")) {
+            config.entity_format = EntityFormat.parse(value) catch {
+                std.debug.print("error: NANOMASK_ENTITY_FORMAT must be names or structured, got '{s}'\n", .{value});
+                return error.InvalidEntityFormat;
+            };
+            config.entity_format_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FILE")) {
             config.entity_file = try allocator.dupe(u8, value);
             config.entity_file_src = .env_var;
@@ -514,6 +1021,181 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_HEALTHCARE")) {
             config.enable_healthcare = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_healthcare_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_IBAN")) {
+            config.enable_iban = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_iban_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_NINO")) {
+            config.enable_uk_nino = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_nino_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_NHS")) {
+            config.enable_uk_nhs = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_nhs_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_PHONE")) {
+            config.enable_uk_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_phone_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_POSTCODE")) {
+            config.enable_uk_postcode = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_postcode_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_CA_SIN")) {
+            config.enable_ca_sin = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_ca_sin_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_PASSPORT")) {
+            config.enable_passport = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_passport_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_INTL_PHONE")) {
+            config.enable_intl_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_intl_phone_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_DATES")) {
+            config.enable_dates = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_dates_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_ADDRESSES")) {
+            config.enable_addresses = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_addresses_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_FAX")) {
+            config.enable_fax = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_fax_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_ACCOUNTS")) {
+            config.enable_accounts = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_accounts_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_LICENSES")) {
+            config.enable_licenses = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_licenses_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_URLS")) {
+            config.enable_urls = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_urls_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_VEHICLE_IDS")) {
+            config.enable_vehicle_ids = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_vehicle_ids_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_CONTEXT_RULES")) {
+            config.enable_context_rules = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_context_rules_src = .env_var;
+            // NANOMASK_DISABLE_* env vars (NMV4-010)
+            // These override profile-enabled features via environment variables.
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_EMAIL")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_email = false;
+                config.enable_email_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_PHONE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_phone = false;
+                config.enable_phone_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_CREDIT_CARD")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_credit_card = false;
+                config.enable_credit_card_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_IP")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_ip = false;
+                config.enable_ip_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_HEALTHCARE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_healthcare = false;
+                config.enable_healthcare_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_IBAN")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_iban = false;
+                config.enable_iban_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_NINO")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_nino = false;
+                config.enable_uk_nino_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_NHS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_nhs = false;
+                config.enable_uk_nhs_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_PHONE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_phone = false;
+                config.enable_uk_phone_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_POSTCODE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_postcode = false;
+                config.enable_uk_postcode_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_CA_SIN")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_ca_sin = false;
+                config.enable_ca_sin_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_PASSPORT")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_passport = false;
+                config.enable_passport_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_INTL_PHONE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_intl_phone = false;
+                config.enable_intl_phone_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_DATES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_dates = false;
+                config.enable_dates_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_ADDRESSES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_addresses = false;
+                config.enable_addresses_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_FAX")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_fax = false;
+                config.enable_fax_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_ACCOUNTS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_accounts = false;
+                config.enable_accounts_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_LICENSES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_licenses = false;
+                config.enable_licenses_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_URLS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_urls = false;
+                config.enable_urls_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_VEHICLE_IDS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_vehicle_ids = false;
+                config.enable_vehicle_ids_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_CONTEXT_RULES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_context_rules = false;
+                config.enable_context_rules_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD")) {
+            config.context_confidence_threshold = std.fmt.parseFloat(f32, value) catch {
+                std.debug.print("error: NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD must be a float between 0.0 and 1.0, got '{s}'\n", .{value});
+                return error.InvalidContextConfidenceThreshold;
+            };
+            if (config.context_confidence_threshold < 0.0 or config.context_confidence_threshold > 1.0) return error.InvalidContextConfidenceThreshold;
+            config.context_confidence_threshold_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_LOCALE")) {
+            config.locale = Locale.parse(value) catch {
+                std.debug.print("error: NANOMASK_LOCALE must be us, uk, eu, ca, or all, got '{s}'\n", .{value});
+                return error.InvalidLocale;
+            };
+            config.locale_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_PROFILE")) {
+            config.profile = Profile.parse(value) catch {
+                std.debug.print("error: NANOMASK_PROFILE must be hipaa-safe-harbor, healthcare-lite, llm-basic, or custom, got '{s}'\n", .{value});
+                return error.InvalidProfile;
+            };
+            config.profile_src = .env_var;
+            config.profile.apply(config);
         } else if (std.mem.eql(u8, name, "NANOMASK_SCHEMA_FILE")) {
             config.schema_file = try allocator.dupe(u8, value);
             config.schema_file_src = .env_var;
@@ -558,6 +1240,89 @@ pub const Config = struct {
                 std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ value, @errorName(err) });
                 return error.HashKeyFileNotFound;
             }
+        } else if (std.mem.eql(u8, name, "NANOMASK_REPORT_ONLY")) {
+            config.report_only = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_REPORT_ONLY must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidReportOnlyFlag;
+            };
+            config.report_only_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_GUARDRAILS")) {
+            config.enable_guardrails = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_ENABLE_GUARDRAILS must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidPatternFlag;
+            };
+            config.enable_guardrails_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_GUARDRAIL_MODE")) {
+            config.guardrail_mode = GuardrailMode.parse(value) catch {
+                std.debug.print("error: NANOMASK_GUARDRAIL_MODE must be alert or block, got '{s}'\n", .{value});
+                return error.InvalidGuardrailMode;
+            };
+            config.guardrail_mode_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_SEMANTIC_CACHE")) {
+            config.enable_semantic_cache = parseBoolEnv(value) orelse {
+                std.debug.print("error: NANOMASK_ENABLE_SEMANTIC_CACHE must be true/false or 1/0, got '{s}'\n", .{value});
+                return error.InvalidSemanticCacheConfig;
+            };
+            config.enable_semantic_cache_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SEMANTIC_CACHE_TTL_MS")) {
+            config.semantic_cache_ttl_ms = try parseTimeoutValue(value, "NANOMASK_SEMANTIC_CACHE_TTL_MS");
+            config.semantic_cache_ttl_ms_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SEMANTIC_CACHE_MAX_ENTRIES")) {
+            config.semantic_cache_max_entries = std.fmt.parseInt(usize, value, 10) catch {
+                std.debug.print("error: NANOMASK_SEMANTIC_CACHE_MAX_ENTRIES must be a positive integer, got '{s}'\n", .{value});
+                return error.InvalidSemanticCacheConfig;
+            };
+            if (config.semantic_cache_max_entries == 0) return error.InvalidSemanticCacheConfig;
+            config.semantic_cache_max_entries_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SEMANTIC_CACHE_TENANT_HEADER")) {
+            config.semantic_cache_tenant_header = try allocator.dupe(u8, value);
+            config.semantic_cache_tenant_header_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ADMIN_API_KEY_FILE")) {
+            config.admin_api_key_file = try allocator.dupe(u8, value);
+            config.admin_api_key_file_src = .env_var;
+            if (std.fs.cwd().openFile(value, .{})) |*f| {
+                f.close();
+            } else |err| {
+                std.debug.print("error: cannot open API key file '{s}': {s}\n", .{ value, @errorName(err) });
+                return error.InvalidApiKeyFile;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_AUDIT_BUFFER_SIZE")) {
+            config.audit_buffer_size = std.fmt.parseInt(u32, value, 10) catch {
+                std.debug.print("error: NANOMASK_AUDIT_BUFFER_SIZE must be a positive integer, got '{s}'\n", .{value});
+                return error.InvalidAuditBufferSize;
+            };
+            if (config.audit_buffer_size == 0) return error.InvalidAuditBufferSize;
+            config.audit_buffer_size_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_OTEL_SERVICE_NAME")) {
+            config.otel_service_name = try allocator.dupe(u8, value);
+            config.otel_service_name_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_SYSLOG_ADDRESS")) {
+            config.syslog_address = try allocator.dupe(u8, value);
+            config.syslog_address_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_HASH_KEY_EXEC")) {
+            config.hash_key_exec = try allocator.dupe(u8, value);
+            config.hash_key_exec_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_VAULT_BACKEND")) {
+            config.vault_backend = VaultBackend.parse(value) catch {
+                std.debug.print("error: NANOMASK_VAULT_BACKEND must be memory, file, or external, got '{s}'\n", .{value});
+                return error.InvalidVaultBackend;
+            };
+            config.vault_backend_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_VAULT_FILE_PATH")) {
+            config.vault_file_path = try allocator.dupe(u8, value);
+            config.vault_file_path_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_CA")) {
+            try checkPemFile(value, "mTLS CA");
+            config.mtls_ca = try allocator.dupe(u8, value);
+            config.mtls_ca_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_CERT")) {
+            try checkPemFile(value, "mTLS cert");
+            config.mtls_cert = try allocator.dupe(u8, value);
+            config.mtls_cert_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_MTLS_KEY")) {
+            try checkPemFile(value, "mTLS key");
+            config.mtls_key = try allocator.dupe(u8, value);
+            config.mtls_key_src = .env_var;
         }
     }
 
@@ -619,6 +1384,7 @@ pub const Config = struct {
             "NANOMASK_LISTEN_PORT",
             "NANOMASK_TARGET_HOST",
             "NANOMASK_TARGET_PORT",
+            "NANOMASK_ENTITY_FORMAT",
             "NANOMASK_ENTITY_FILE",
             "NANOMASK_FUZZY_THRESHOLD",
             "NANOMASK_MAX_CONNECTIONS",
@@ -652,10 +1418,40 @@ pub const Config = struct {
             "NANOMASK_ENABLE_CREDIT_CARD",
             "NANOMASK_ENABLE_IP",
             "NANOMASK_ENABLE_HEALTHCARE",
+            "NANOMASK_ENABLE_IBAN",
+            "NANOMASK_ENABLE_UK_NINO",
+            "NANOMASK_ENABLE_PASSPORT",
+            "NANOMASK_ENABLE_INTL_PHONE",
+            "NANOMASK_ENABLE_DATES",
+            "NANOMASK_ENABLE_ADDRESSES",
+            "NANOMASK_ENABLE_FAX",
+            "NANOMASK_ENABLE_ACCOUNTS",
+            "NANOMASK_ENABLE_LICENSES",
+            "NANOMASK_ENABLE_URLS",
+            "NANOMASK_ENABLE_VEHICLE_IDS",
+            "NANOMASK_ENABLE_CONTEXT_RULES",
+            "NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD",
+            "NANOMASK_LOCALE",
+            "NANOMASK_PROFILE",
             "NANOMASK_SCHEMA_FILE",
             "NANOMASK_SCHEMA_DEFAULT",
             "NANOMASK_HASH_KEY",
             "NANOMASK_HASH_KEY_FILE",
+            "NANOMASK_REPORT_ONLY",
+            "NANOMASK_ENABLE_GUARDRAILS",
+            "NANOMASK_GUARDRAIL_MODE",
+            "NANOMASK_ENABLE_SEMANTIC_CACHE",
+            "NANOMASK_SEMANTIC_CACHE_TTL_MS",
+            "NANOMASK_SEMANTIC_CACHE_MAX_ENTRIES",
+            "NANOMASK_SEMANTIC_CACHE_TENANT_HEADER",
+            "NANOMASK_ADMIN_API_KEY_FILE",
+            "NANOMASK_AUDIT_BUFFER_SIZE",
+            "NANOMASK_OTEL_SERVICE_NAME",
+            "NANOMASK_SYSLOG_ADDRESS",
+            "NANOMASK_HASH_KEY_EXEC",
+            "NANOMASK_MTLS_CA",
+            "NANOMASK_MTLS_CERT",
+            "NANOMASK_MTLS_KEY",
         };
 
         for (env_keys) |key| {
@@ -721,6 +1517,17 @@ pub const Config = struct {
                     return error.InvalidPort;
                 }
                 config.target_port_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--entity-format")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --entity-format\n", .{});
+                    return error.MissingValue;
+                }
+                config.entity_format = EntityFormat.parse(args[i]) catch {
+                    std.debug.print("error: --entity-format must be names or structured, got '{s}'\n", .{args[i]});
+                    return error.InvalidEntityFormat;
+                };
+                config.entity_format_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--entity-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1014,6 +1821,162 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-healthcare")) {
                 config.enable_healthcare = true;
                 config.enable_healthcare_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-iban")) {
+                config.enable_iban = true;
+                config.enable_iban_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-nino")) {
+                config.enable_uk_nino = true;
+                config.enable_uk_nino_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-nhs")) {
+                config.enable_uk_nhs = true;
+                config.enable_uk_nhs_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-phone")) {
+                config.enable_uk_phone = true;
+                config.enable_uk_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-postcode")) {
+                config.enable_uk_postcode = true;
+                config.enable_uk_postcode_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-ca-sin")) {
+                config.enable_ca_sin = true;
+                config.enable_ca_sin_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-passport")) {
+                config.enable_passport = true;
+                config.enable_passport_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-intl-phone")) {
+                config.enable_intl_phone = true;
+                config.enable_intl_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-dates")) {
+                config.enable_dates = true;
+                config.enable_dates_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-addresses")) {
+                config.enable_addresses = true;
+                config.enable_addresses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-fax")) {
+                config.enable_fax = true;
+                config.enable_fax_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-accounts")) {
+                config.enable_accounts = true;
+                config.enable_accounts_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-licenses")) {
+                config.enable_licenses = true;
+                config.enable_licenses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-urls")) {
+                config.enable_urls = true;
+                config.enable_urls_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-vehicle-ids")) {
+                config.enable_vehicle_ids = true;
+                config.enable_vehicle_ids_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-context-rules")) {
+                config.enable_context_rules = true;
+                config.enable_context_rules_src = .cli_flag;
+                // --disable-* override flags (NMV4-010)
+                // These allow operators to selectively turn off pattern detectors
+                // that were enabled by a profile preset.
+            } else if (std.mem.eql(u8, arg, "--disable-email")) {
+                config.enable_email = false;
+                config.enable_email_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-phone")) {
+                config.enable_phone = false;
+                config.enable_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-credit-card")) {
+                config.enable_credit_card = false;
+                config.enable_credit_card_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-ip")) {
+                config.enable_ip = false;
+                config.enable_ip_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-healthcare")) {
+                config.enable_healthcare = false;
+                config.enable_healthcare_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-iban")) {
+                config.enable_iban = false;
+                config.enable_iban_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-nino")) {
+                config.enable_uk_nino = false;
+                config.enable_uk_nino_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-nhs")) {
+                config.enable_uk_nhs = false;
+                config.enable_uk_nhs_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-phone")) {
+                config.enable_uk_phone = false;
+                config.enable_uk_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-postcode")) {
+                config.enable_uk_postcode = false;
+                config.enable_uk_postcode_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-ca-sin")) {
+                config.enable_ca_sin = false;
+                config.enable_ca_sin_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-passport")) {
+                config.enable_passport = false;
+                config.enable_passport_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-intl-phone")) {
+                config.enable_intl_phone = false;
+                config.enable_intl_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-dates")) {
+                config.enable_dates = false;
+                config.enable_dates_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-addresses")) {
+                config.enable_addresses = false;
+                config.enable_addresses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-fax")) {
+                config.enable_fax = false;
+                config.enable_fax_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-accounts")) {
+                config.enable_accounts = false;
+                config.enable_accounts_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-licenses")) {
+                config.enable_licenses = false;
+                config.enable_licenses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-urls")) {
+                config.enable_urls = false;
+                config.enable_urls_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-vehicle-ids")) {
+                config.enable_vehicle_ids = false;
+                config.enable_vehicle_ids_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-context-rules")) {
+                config.enable_context_rules = false;
+                config.enable_context_rules_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--context-confidence-threshold")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --context-confidence-threshold\n", .{});
+                    return error.MissingValue;
+                }
+                config.context_confidence_threshold = std.fmt.parseFloat(f32, args[i]) catch {
+                    std.debug.print("error: --context-confidence-threshold must be a float between 0.0 and 1.0, got '{s}'\n", .{args[i]});
+                    return error.InvalidContextConfidenceThreshold;
+                };
+                if (config.context_confidence_threshold < 0.0 or config.context_confidence_threshold > 1.0) {
+                    std.debug.print("error: --context-confidence-threshold must be between 0.0 and 1.0, got '{s}'\n", .{args[i]});
+                    return error.InvalidContextConfidenceThreshold;
+                }
+                config.context_confidence_threshold_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--locale")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --locale\n", .{});
+                    return error.MissingValue;
+                }
+                config.locale = Locale.parse(args[i]) catch {
+                    std.debug.print("error: --locale must be us, uk, eu, ca, or all, got '{s}'\n", .{args[i]});
+                    return error.InvalidLocale;
+                };
+                config.locale_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--profile")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --profile\n", .{});
+                    return error.MissingValue;
+                }
+                config.profile = Profile.parse(args[i]) catch {
+                    std.debug.print("error: --profile must be hipaa-safe-harbor, healthcare-lite, llm-basic, or custom, got '{s}'\n", .{args[i]});
+                    return error.InvalidProfile;
+                };
+                config.profile_src = .cli_flag;
+                // Immediately apply profile defaults. Later individual flags in args will correctly override these.
+                config.profile.apply(&config);
+            } else if (std.mem.eql(u8, arg, "--list-profiles")) {
+                printProfiles();
+                std.posix.exit(0);
             } else if (std.mem.eql(u8, arg, "--schema-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1088,10 +2051,192 @@ pub const Config = struct {
                     std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ args[i], @errorName(err) });
                     return error.HashKeyFileNotFound;
                 }
+            } else if (std.mem.eql(u8, arg, "--vault-backend")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --vault-backend\n", .{});
+                    return error.MissingValue;
+                }
+                config.vault_backend = VaultBackend.parse(args[i]) catch {
+                    std.debug.print("error: --vault-backend must be memory, file, or external, got '{s}'\n", .{args[i]});
+                    return error.InvalidVaultBackend;
+                };
+                config.vault_backend_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--vault-file-path")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --vault-file-path\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.vault_file_path != null and config.vault_file_path_src == .env_var) {
+                    allocator.free(config.vault_file_path.?);
+                }
+                config.vault_file_path = args[i];
+                config.vault_file_path_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--report-only")) {
+                config.report_only = true;
+                config.report_only_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-guardrails")) {
+                config.enable_guardrails = true;
+                config.enable_guardrails_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--guardrail-mode")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --guardrail-mode\n", .{});
+                    return error.MissingValue;
+                }
+                config.guardrail_mode = GuardrailMode.parse(args[i]) catch {
+                    std.debug.print("error: --guardrail-mode must be alert or block, got '{s}'\n", .{args[i]});
+                    return error.InvalidGuardrailMode;
+                };
+                config.guardrail_mode_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-semantic-cache")) {
+                config.enable_semantic_cache = true;
+                config.enable_semantic_cache_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--semantic-cache-ttl-ms")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --semantic-cache-ttl-ms\n", .{});
+                    return error.MissingValue;
+                }
+                config.semantic_cache_ttl_ms = try parseTimeoutValue(args[i], "--semantic-cache-ttl-ms");
+                config.semantic_cache_ttl_ms_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--semantic-cache-max-entries")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --semantic-cache-max-entries\n", .{});
+                    return error.MissingValue;
+                }
+                config.semantic_cache_max_entries = std.fmt.parseInt(usize, args[i], 10) catch {
+                    std.debug.print("error: --semantic-cache-max-entries must be a positive integer, got '{s}'\n", .{args[i]});
+                    return error.InvalidSemanticCacheConfig;
+                };
+                if (config.semantic_cache_max_entries == 0) {
+                    std.debug.print("error: --semantic-cache-max-entries must be > 0\n", .{});
+                    return error.InvalidSemanticCacheConfig;
+                }
+                config.semantic_cache_max_entries_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--semantic-cache-tenant-header")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --semantic-cache-tenant-header\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.semantic_cache_tenant_header_src == .env_var) {
+                    allocator.free(config.semantic_cache_tenant_header);
+                }
+                config.semantic_cache_tenant_header = args[i];
+                config.semantic_cache_tenant_header_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--admin-api-key-file")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --admin-api-key-file\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.admin_api_key_file != null and config.admin_api_key_file_src == .env_var) {
+                    allocator.free(config.admin_api_key_file.?);
+                }
+                config.admin_api_key_file = args[i];
+                config.admin_api_key_file_src = .cli_flag;
+                if (std.fs.cwd().openFile(args[i], .{})) |*f| {
+                    f.close();
+                } else |err| {
+                    std.debug.print("error: cannot open API key file '{s}': {s}\n", .{ args[i], @errorName(err) });
+                    return error.InvalidApiKeyFile;
+                }
+            } else if (std.mem.eql(u8, arg, "--audit-buffer-size")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --audit-buffer-size\n", .{});
+                    return error.MissingValue;
+                }
+                config.audit_buffer_size = std.fmt.parseInt(u32, args[i], 10) catch {
+                    std.debug.print("error: --audit-buffer-size must be a positive integer, got '{s}'\n", .{args[i]});
+                    return error.InvalidAuditBufferSize;
+                };
+                if (config.audit_buffer_size == 0) {
+                    std.debug.print("error: --audit-buffer-size must be > 0\n", .{});
+                    return error.InvalidAuditBufferSize;
+                }
+                config.audit_buffer_size_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--otel-service-name")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --otel-service-name\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.otel_service_name != null and config.otel_service_name_src == .env_var) {
+                    allocator.free(config.otel_service_name.?);
+                }
+                config.otel_service_name = args[i];
+                config.otel_service_name_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--syslog-address")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --syslog-address\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.syslog_address != null and config.syslog_address_src == .env_var) {
+                    allocator.free(config.syslog_address.?);
+                }
+                config.syslog_address = args[i];
+                config.syslog_address_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--hash-key-exec")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --hash-key-exec\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.hash_key_exec != null and config.hash_key_exec_src == .env_var) {
+                    allocator.free(config.hash_key_exec.?);
+                }
+                config.hash_key_exec = args[i];
+                config.hash_key_exec_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--mtls-ca")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --mtls-ca\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.mtls_ca != null and config.mtls_ca_src == .env_var) {
+                    allocator.free(config.mtls_ca.?);
+                }
+                try checkPemFile(args[i], "mTLS CA");
+                config.mtls_ca = args[i];
+                config.mtls_ca_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--mtls-cert")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --mtls-cert\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.mtls_cert != null and config.mtls_cert_src == .env_var) {
+                    allocator.free(config.mtls_cert.?);
+                }
+                try checkPemFile(args[i], "mTLS cert");
+                config.mtls_cert = args[i];
+                config.mtls_cert_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--mtls-key")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --mtls-key\n", .{});
+                    return error.MissingValue;
+                }
+                if (config.mtls_key != null and config.mtls_key_src == .env_var) {
+                    allocator.free(config.mtls_key.?);
+                }
+                try checkPemFile(args[i], "mTLS key");
+                config.mtls_key = args[i];
+                config.mtls_key_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--healthcheck")) {
                 config.healthcheck = true;
+            } else if (std.mem.eql(u8, arg, "--validate-config")) {
+                config.validate_config = true;
             } else {
                 std.debug.print("error: unknown flag '{s}'\n", .{arg});
+                if (suggestFlag(arg)) |suggested| {
+                    std.debug.print("  hint: did you mean '{s}'?\n", .{suggested});
+                }
                 return error.UnknownFlag;
             }
         }
@@ -1125,11 +2270,17 @@ pub const Config = struct {
             std.debug.print("  hint: use --ca-file <path> to provide your self-signed CA bundle\n", .{});
         }
 
-        // Require --admin-token when --admin-api is enabled to prevent
-        // unauthenticated access to entity management endpoints.
-        if (config.admin_api and config.admin_token == null) {
-            std.debug.print("error: --admin-api requires --admin-token <secret> for authentication\n", .{});
+        // Require --admin-token or --admin-api-key-file when --admin-api is enabled
+        // to prevent unauthenticated access to entity management endpoints.
+        if (config.admin_api and config.admin_token == null and config.admin_api_key_file == null) {
+            std.debug.print("error: --admin-api requires --admin-token <secret> or --admin-api-key-file <path> for authentication\n", .{});
             return error.MissingAdminToken;
+        }
+
+        // Validate Vault combinations
+        if (config.vault_backend == .file and config.vault_file_path == null) {
+            std.debug.print("error: --vault-backend file requires --vault-file-path\n", .{});
+            return error.MissingVaultFilePath;
         }
 
         if (config.admin_api) {
@@ -1156,9 +2307,35 @@ pub const Config = struct {
             std.debug.print("WARNING: --admin-mutation-rate-limit has no effect without --admin-api\n", .{});
         }
 
+        // mTLS: all three files must be provided together
+        const mtls_count: u8 = @as(u8, if (config.mtls_ca != null) 1 else 0) +
+            @as(u8, if (config.mtls_cert != null) 1 else 0) +
+            @as(u8, if (config.mtls_key != null) 1 else 0);
+        if (mtls_count > 0 and mtls_count < 3) {
+            std.debug.print("error: --mtls-ca, --mtls-cert, and --mtls-key must all be specified together\n", .{});
+            return error.InvalidMtlsConfig;
+        }
+
         return config;
     }
 };
+
+/// Verify that a file exists and starts with a PEM header ("-----BEGIN").
+/// Used to catch obviously wrong file paths or non-PEM content at startup
+/// rather than at connection time.
+fn checkPemFile(path: []const u8, label: []const u8) Config.ParseError!void {
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        std.debug.print("error: cannot open {s} PEM file '{s}'\n", .{ label, path });
+        return error.InvalidMtlsPemFormat;
+    };
+    defer file.close();
+    var hdr: [16]u8 = undefined;
+    const n = file.readAll(&hdr) catch 0;
+    if (n < 10 or !std.mem.startsWith(u8, hdr[0..n], "-----BEGIN")) {
+        std.debug.print("error: {s} file '{s}' is not a valid PEM file (missing '-----BEGIN' header)\n", .{ label, path });
+        return error.InvalidMtlsPemFormat;
+    }
+}
 
 const testing = std.testing;
 
@@ -1284,6 +2461,14 @@ test "Config - unknown flag" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.UnknownFlag, res);
+}
+
+test "Config - unknown flag suggestion" {
+    try testing.expectEqualStrings("--target-tls", Config.suggestFlag("--target_tls").?);
+}
+
+test "Config - unknown flag without close suggestion" {
+    try testing.expect(Config.suggestFlag("--totally-different") == null);
 }
 
 test "Config - help flag" {
@@ -1729,6 +2914,51 @@ test "Config - tls-no-system-ca + ca-file is valid (complementary)" {
     try testing.expectEqualStrings(tmp_ca, cfg.ca_file.?);
 }
 
+test "Config - valid locale flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--locale",
+        "uk",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(Locale.uk, cfg.locale);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.locale_src);
+}
+
+test "Config - valid locale env var" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_LOCALE", "eu", std.testing.allocator);
+
+    try testing.expectEqual(Locale.eu, cfg.locale);
+    try testing.expectEqual(ConfigSource.env_var, cfg.locale_src);
+}
+
+test "Config - invalid locale flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--locale",
+        "invalid_locale",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidLocale, res);
+}
+
+test "Config - missing locale flag value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--locale",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
+}
+
 test "Config - healthcheck flag" {
     const args = [_][]const u8{
         "nanomask",
@@ -1853,6 +3083,104 @@ test "Config - hash-key invalid hex chars" {
     try testing.expectError(error.InvalidHashKey, res);
 }
 
+// --- Epic 9: NMV4-010 Detection Profiles ---
+
+test "Config - parse valid profile" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+        "hipaa-safe-harbor",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(Profile.hipaa_safe_harbor, cfg.profile);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.profile_src);
+    // Verify some expected profile expansions
+    try testing.expect(cfg.enable_email);
+    try testing.expect(cfg.enable_dates);
+    try testing.expect(cfg.enable_context_rules);
+}
+
+test "Config - invalid profile returns error" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+        "unknown-profile",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidProfile, res);
+}
+
+test "Config - missing profile value returns error" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
+}
+
+test "Config - cli flags override profile defaults" {
+    // Env sets profile to hipaa-safe-harbor (which enables dates), then
+    // env explicitly disables dates (overriding profile).
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_PROFILE", "hipaa-safe-harbor", std.testing.allocator);
+    try testing.expect(cfg.enable_dates);
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_ENABLE_DATES", "false", std.testing.allocator);
+    try testing.expect(!cfg.enable_dates);
+}
+
+test "Config - disable flags override profile via CLI" {
+    // --profile hipaa-safe-harbor enables dates, addresses, and context-rules.
+    // --disable-dates and --disable-context-rules turn them back off.
+    // Other profile-enabled detectors remain active.
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+        "hipaa-safe-harbor",
+        "--disable-dates",
+        "--disable-context-rules",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    // Profile-enabled, NOT overridden
+    try testing.expect(cfg.enable_email);
+    try testing.expect(cfg.enable_phone);
+    try testing.expect(cfg.enable_healthcare);
+    try testing.expect(cfg.enable_addresses);
+
+    // Profile-enabled, then disabled
+    try testing.expect(!cfg.enable_dates);
+    try testing.expect(!cfg.enable_context_rules);
+}
+
+test "Config - disable env var overrides profile" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_PROFILE", "hipaa-safe-harbor", std.testing.allocator);
+    try testing.expect(cfg.enable_email);
+    try testing.expect(cfg.enable_context_rules);
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_DISABLE_EMAIL", "true", std.testing.allocator);
+    try Config.applyEnvVar(&cfg, "NANOMASK_DISABLE_CONTEXT_RULES", "true", std.testing.allocator);
+    try testing.expect(!cfg.enable_email);
+    try testing.expect(!cfg.enable_context_rules);
+
+    // Other profile-enabled flags remain active
+    try testing.expect(cfg.enable_phone);
+    try testing.expect(cfg.enable_healthcare);
+}
+
 test "Config - hash-key missing value" {
     const args = [_][]const u8{
         "nanomask",
@@ -1922,4 +3250,88 @@ test "Config - unsupported body behavior invalid value" {
 
     const res = Config.parse(std.testing.allocator, &args);
     try testing.expectError(error.InvalidUnsupportedBodyBehavior, res);
+}
+
+test "Config - validate-config flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--validate-config",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.validate_config);
+}
+
+test "Config - validate-config combined with other flags" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--listen-host",
+        "0.0.0.0",
+        "--target-host",
+        "api.openai.com",
+        "--target-port",
+        "443",
+        "--target-tls",
+        "--enable-email",
+        "--validate-config",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(cfg.validate_config);
+    try testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
+    try testing.expectEqualStrings("api.openai.com", cfg.target_host);
+    try testing.expectEqual(@as(u16, 443), cfg.target_port);
+    try testing.expect(cfg.target_tls);
+    try testing.expect(cfg.enable_email);
+}
+
+test "Config - validate-config defaults to false" {
+    const args = [_][]const u8{"nanomask"};
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expect(!cfg.validate_config);
+}
+
+test "Config - vault-backend valid type" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--vault-backend",
+        "file",
+        "--vault-file-path",
+        "/tmp/vault.enc",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(VaultBackend.file, cfg.vault_backend);
+    try testing.expectEqualStrings("/tmp/vault.enc", cfg.vault_file_path.?);
+}
+
+test "Config - vault-backend file requires path" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--vault-backend",
+        "file",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingVaultFilePath, res);
+}
+
+test "Config - vault-backend invalid type" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--vault-backend",
+        "postgres",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidVaultBackend, res);
 }

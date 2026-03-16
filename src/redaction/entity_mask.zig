@@ -5,7 +5,7 @@ const std = @import("std");
 // ---------------------------------------------------------------------------
 // Dictionary-based name pseudonymization for PII/PHI de-identification.
 // Given known names (e.g. "John Doe", "Dr. Smith"), replaces all occurrences
-// with deterministic aliases ("Entity_A", "Entity_B") in a single O(n) pass
+// with deterministic aliases ("Entity_1", "Entity_2") in a single O(n) pass
 // using an Aho-Corasick multi-pattern automaton.
 //
 // Bidirectional: mask() replaces names->aliases, unmask() reverses aliases->names.
@@ -38,7 +38,7 @@ pub const BoundedAuditMatches = struct {
 /// Returns true if the byte is NOT alphanumeric (i.e. is a word boundary).
 /// This prevents partial matches like "John" inside "Johnson".
 fn isWordBoundary(byte: u8) bool {
-    return !std.ascii.isAlphanumeric(byte);
+    return !(std.ascii.isAlphanumeric(byte) or byte >= 128);
 }
 
 fn isWordBoundaryBefore(input: []const u8, pos: usize) bool {
@@ -55,33 +55,29 @@ fn isWordBoundaryAfter(input: []const u8, pos: usize) bool {
 // Alias generation
 // ---------------------------------------------------------------------------
 
-/// Maximum supported entities: A-Z (26) + AA-ZZ (676) = 702.
-const max_entities = 702;
-
 /// Prefix used for all generated alias identifiers.
 const alias_prefix = "Entity_";
 
-/// Generate a deterministic alias: Entity_A, Entity_B, ..., Entity_Z, Entity_AA, ...
+/// Generate a deterministic alias: Entity_1, Entity_2, ..., Entity_N.
+/// Unbounded — supports arbitrarily large entity sets.
 fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
-    if (index >= max_entities) return error.TooManyEntities;
+    return std.fmt.allocPrint(allocator, "{s}{d}", .{ alias_prefix, index + 1 });
+}
 
-    var suffix_buf: [2]u8 = undefined;
-    var suffix_len: usize = 0;
-
-    if (index < 26) {
-        suffix_buf[0] = @as(u8, @intCast(index)) + 'A';
-        suffix_len = 1;
-    } else {
-        const adjusted = index - 26;
-        suffix_buf[0] = @as(u8, @intCast(adjusted / 26)) + 'A';
-        suffix_buf[1] = @as(u8, @intCast(adjusted % 26)) + 'A';
-        suffix_len = 2;
+/// Generate legacy V3 aliases for backward-compatible HASH restore: Entity_A .. Entity_ZZ.
+/// This matches the exact 702-entity logic used previously. If index exceeds 701,
+/// this returns a memory error (which is caught and handled during initialization).
+fn generateLegacyAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
+    const letters = 26;
+    if (index < letters) {
+        return std.fmt.allocPrint(allocator, "Entity_{c}", .{@as(u8, @intCast(index)) + 'A'});
+    } else if (index < letters * letters + letters) {
+        const i = index - letters;
+        const first: u8 = @intCast(i / letters);
+        const second: u8 = @intCast(i % letters);
+        return std.fmt.allocPrint(allocator, "Entity_{c}{c}", .{ first + 'A', second + 'A' });
     }
-
-    const result = try allocator.alloc(u8, alias_prefix.len + suffix_len);
-    @memcpy(result[0..alias_prefix.len], alias_prefix);
-    @memcpy(result[alias_prefix.len..result.len], suffix_buf[0..suffix_len]);
-    return result;
+    return error.LegacyIndexOutOfBounds;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +91,7 @@ fn generateAlias(allocator: std.mem.Allocator, index: usize) ![]u8 {
 /// Uses ArrayListUnmanaged for Zig 0.15 compatibility -- allocator is passed
 /// explicitly to each method that needs allocation.
 pub const AhoCorasick = struct {
-    const alphabet_size = 64; // Shrunk from 256 to fit nodes into L2 cache
+    const alphabet_size = 170; // ASCII-folded plus raw high-bit UTF-8 bytes
     const null_node: u32 = std.math.maxInt(u32);
 
     const char_map: [256]u8 = blk: {
@@ -118,11 +114,14 @@ pub const AhoCorasick = struct {
         idx += 1;
         map['\''] = idx;
         idx += 1;
-        // all mapped characters fit under 64. Unmapped bytes use index 0.
+        for (128..256) |raw| {
+            map[raw] = idx;
+            idx += 1;
+        }
         break :blk map;
     };
 
-    const Node = struct {
+    pub const Node = struct {
         children: [alphabet_size]u32,
         failure: u32,
         output: ?usize, // pattern index, null if non-accepting
@@ -468,17 +467,27 @@ pub const AcChunkState = struct {
 ///   defer em.deinit();
 ///   const masked = try em.mask("Patient John Doe was seen by Dr. Smith", allocator);
 ///   defer allocator.free(masked);
-///   // masked == "Patient Entity_A was seen by Entity_B"
+///   // masked == "Patient Entity_1 was seen by Entity_2"
 pub const EntityMap = struct {
     names: [][]u8,
     aliases: [][]u8,
     alias_const_slices: []const []const u8,
     name_const_slices: []const []const u8,
+    reverse_name_slices: []const []const u8,
     forward_ac: AhoCorasick,
     reverse_ac: AhoCorasick,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, raw_names: []const []const u8) !EntityMap {
+        const n = raw_names.len;
+        const group_ids = try allocator.alloc(usize, n);
+        defer allocator.free(group_ids);
+        for (group_ids, 0..) |*id, i| id.* = i;
+        return initGrouped(allocator, raw_names, group_ids);
+    }
+
+    pub fn initGrouped(allocator: std.mem.Allocator, raw_names: []const []const u8, group_ids: []const usize) !EntityMap {
+        std.debug.assert(raw_names.len == group_ids.len);
         const n = raw_names.len;
 
         const names = try allocator.alloc([]u8, n);
@@ -488,12 +497,26 @@ pub const EntityMap = struct {
 
         const name_lengths = try allocator.alloc(usize, n);
         defer allocator.free(name_lengths);
-        const alias_lengths = try allocator.alloc(usize, n);
-        defer allocator.free(alias_lengths);
 
         // Track how many elements have been fully initialized for errdefer cleanup.
         var names_initialized: usize = 0;
         var aliases_initialized: usize = 0;
+
+        // The reverse automaton must handle *both* the new numeric alias (Entity_1)
+        // AND the legacy alphabetic alias (Entity_A) for the same name, so it can
+        // successfully unmask stored payloads from previous versions.
+        var reverse_aliases: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (reverse_aliases.items) |a| allocator.free(a);
+            reverse_aliases.deinit(allocator);
+        }
+        var reverse_alias_lengths: std.ArrayListUnmanaged(usize) = .empty;
+        defer reverse_alias_lengths.deinit(allocator);
+
+        // The reverse AC output is a pattern index. We need a map from the
+        // reverse pattern index back to the underlying original name string.
+        var reverse_alias_to_name: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer reverse_alias_to_name.deinit(allocator);
 
         errdefer {
             for (0..names_initialized) |j| allocator.free(names[j]);
@@ -504,15 +527,36 @@ pub const EntityMap = struct {
             names[i] = try allocator.dupe(u8, name);
             names_initialized = i + 1;
             name_lengths[i] = name.len;
-            aliases[i] = try generateAlias(allocator, i);
+
+            const group_id = group_ids[i];
+
+            // Generate the primary (new) numeric alias based on the group ID, not the row index
+            aliases[i] = try generateAlias(allocator, group_id);
             aliases_initialized = i + 1;
-            alias_lengths[i] = aliases[i].len;
+
+            // Add primary alias to reverse mapping
+            try reverse_aliases.append(allocator, try allocator.dupe(u8, aliases[i]));
+            try reverse_alias_lengths.append(allocator, aliases[i].len);
+            try reverse_alias_to_name.append(allocator, names[i]);
+
+            // If within legacy limits (<702), also register the legacy alias for unmasking
+            if (generateLegacyAlias(allocator, group_id)) |legacy_alias| {
+                try reverse_aliases.append(allocator, legacy_alias);
+                try reverse_alias_lengths.append(allocator, legacy_alias.len);
+                try reverse_alias_to_name.append(allocator, names[i]);
+            } else |_| {
+                // Ignore LegacyIndexOutOfBounds for > 702 entities
+            }
         }
 
         // Pre-build const slices to avoid per-call allocation in mask()/unmask().
         const alias_const_slices = try allocator.alloc([]const u8, n);
         errdefer allocator.free(alias_const_slices);
         for (aliases, 0..) |alias, i| alias_const_slices[i] = alias;
+
+        const reverse_name_slices = try allocator.alloc([]const u8, reverse_alias_to_name.items.len);
+        errdefer allocator.free(reverse_name_slices);
+        for (reverse_alias_to_name.items, 0..) |name, i| reverse_name_slices[i] = name;
 
         const name_const_slices = try allocator.alloc([]const u8, n);
         errdefer allocator.free(name_const_slices);
@@ -527,16 +571,21 @@ pub const EntityMap = struct {
 
         var reverse_ac = try AhoCorasick.init(allocator);
         errdefer reverse_ac.deinit();
-        for (aliases, 0..) |alias, i| {
+        for (reverse_aliases.items, 0..) |alias, i| {
             try reverse_ac.addPattern(alias, i);
         }
-        try reverse_ac.build(alias_lengths);
+        try reverse_ac.build(reverse_alias_lengths.items);
+
+        // Free the temporarily allocated reverse_aliases since the AC built successfully
+        for (reverse_aliases.items) |a| allocator.free(a);
+        reverse_aliases.deinit(allocator);
 
         return EntityMap{
             .names = names,
             .aliases = aliases,
             .alias_const_slices = alias_const_slices,
             .name_const_slices = name_const_slices,
+            .reverse_name_slices = reverse_name_slices,
             .forward_ac = forward_ac,
             .reverse_ac = reverse_ac,
             .allocator = allocator,
@@ -550,6 +599,7 @@ pub const EntityMap = struct {
         self.allocator.free(self.aliases);
         self.allocator.free(self.alias_const_slices);
         self.allocator.free(self.name_const_slices);
+        self.allocator.free(self.reverse_name_slices);
         self.forward_ac.deinit();
         self.reverse_ac.deinit();
     }
@@ -693,7 +743,7 @@ pub const EntityMap = struct {
 
     /// Replace aliases back to real names.
     pub fn unmask(self: *const EntityMap, input: []const u8, allocator: std.mem.Allocator) ![]u8 {
-        return replaceAll(&self.reverse_ac, input, self.name_const_slices, allocator);
+        return replaceAll(&self.reverse_ac, input, self.reverse_name_slices, allocator);
     }
 
     /// Read-only access to raw name strings for use by the fuzzy matcher.
@@ -844,7 +894,7 @@ pub const EntityMap = struct {
         const result = try replaceAllBounded(
             &self.reverse_ac,
             combined,
-            self.name_const_slices,
+            self.reverse_name_slices,
             safe_end,
             &consumed,
             allocator,
@@ -872,7 +922,7 @@ test "EntityMap - single name replacement" {
 
     const result = try em.mask("Patient John Doe was examined.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Patient Entity_A was examined.", result);
+    try std.testing.expectEqualStrings("Patient Entity_1 was examined.", result);
 }
 
 test "EntityMap - multiple names" {
@@ -882,7 +932,7 @@ test "EntityMap - multiple names" {
 
     const result = try em.mask("John Doe was seen by Dr. Smith today.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Entity_A was seen by Entity_B today.", result);
+    try std.testing.expectEqualStrings("Entity_1 was seen by Entity_2 today.", result);
 }
 
 test "EntityMap - collectMaskMatches exposes selected aliases" {
@@ -894,8 +944,8 @@ test "EntityMap - collectMaskMatches exposes selected aliases" {
     defer allocator.free(matches);
 
     try std.testing.expectEqual(@as(usize, 2), matches.len);
-    try std.testing.expectEqualStrings("Entity_A", matches[0].replacement);
-    try std.testing.expectEqualStrings("Entity_B", matches[1].replacement);
+    try std.testing.expectEqualStrings("Entity_1", matches[0].replacement);
+    try std.testing.expectEqualStrings("Entity_2", matches[1].replacement);
 }
 
 test "EntityMap - case insensitive matching" {
@@ -905,7 +955,17 @@ test "EntityMap - case insensitive matching" {
 
     const result = try em.mask("JOHN DOE and john doe are the same.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Entity_A and Entity_A are the same.", result);
+    try std.testing.expectEqualStrings("Entity_1 and Entity_1 are the same.", result);
+}
+
+test "EntityMap - exact UTF-8 names match through the automaton" {
+    const allocator = std.testing.allocator;
+    var em = try EntityMap.init(allocator, &.{"Жан Иванов"});
+    defer em.deinit();
+
+    const result = try em.mask("Пациент Жан Иванов прибыл.", allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Пациент Entity_1 прибыл.", result);
 }
 
 test "EntityMap - word boundary enforcement" {
@@ -1046,11 +1106,36 @@ test "EntityMap - unmask round trip" {
 
     const masked = try em.mask(original, allocator);
     defer allocator.free(masked);
-    try std.testing.expectEqualStrings("Entity_A and Entity_B filed claims.", masked);
+    try std.testing.expectEqualStrings("Entity_1 and Entity_2 filed claims.", masked);
 
     const unmasked = try em.unmask(masked, allocator);
     defer allocator.free(unmasked);
     try std.testing.expectEqualStrings(original, unmasked);
+}
+
+test "EntityMap - unmask legacy aliases" {
+    const allocator = std.testing.allocator;
+    // Index 0 -> legacy Entity_A, new Entity_1
+    // Index 26 -> legacy Entity_AA, new Entity_27
+    var em = try EntityMap.init(allocator, &.{ "First", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Padding", "Last" });
+    defer em.deinit();
+
+    // Verify both aliases unmask back to the original name successfully
+    const input_new = "Look at Entity_1 and Entity_27";
+    const unmasked_new = try em.unmask(input_new, allocator);
+    defer allocator.free(unmasked_new);
+    try std.testing.expectEqualStrings("Look at First and Last", unmasked_new);
+
+    const input_legacy = "Look at Entity_A and Entity_AA";
+    const unmasked_legacy = try em.unmask(input_legacy, allocator);
+    defer allocator.free(unmasked_legacy);
+    try std.testing.expectEqualStrings("Look at First and Last", unmasked_legacy);
+
+    // Mixed is also fine
+    const input_mixed = "Entity_1 is also Entity_A";
+    const unmasked_mixed = try em.unmask(input_mixed, allocator);
+    defer allocator.free(unmasked_mixed);
+    try std.testing.expectEqualStrings("First is also First", unmasked_mixed);
 }
 
 test "EntityMap - multiple occurrences of same name" {
@@ -1060,23 +1145,23 @@ test "EntityMap - multiple occurrences of same name" {
 
     const result = try em.mask("John Doe said that John Doe was here.", allocator);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("Entity_A said that Entity_A was here.", result);
+    try std.testing.expectEqualStrings("Entity_1 said that Entity_1 was here.", result);
 }
 
 test "EntityMap - alias generation sequence" {
     const allocator = std.testing.allocator;
-    // Verify alias naming: A, B, C, ...
+    // Verify alias naming: 1, 2, 3, ...
     const a0 = try generateAlias(allocator, 0);
     defer allocator.free(a0);
-    try std.testing.expectEqualStrings("Entity_A", a0);
+    try std.testing.expectEqualStrings("Entity_1", a0);
 
     const a25 = try generateAlias(allocator, 25);
     defer allocator.free(a25);
-    try std.testing.expectEqualStrings("Entity_Z", a25);
+    try std.testing.expectEqualStrings("Entity_26", a25);
 
-    const a26 = try generateAlias(allocator, 26);
-    defer allocator.free(a26);
-    try std.testing.expectEqualStrings("Entity_AA", a26);
+    const a999 = try generateAlias(allocator, 999);
+    defer allocator.free(a999);
+    try std.testing.expectEqualStrings("Entity_1000", a999);
 }
 
 // ---------------------------------------------------------------------------

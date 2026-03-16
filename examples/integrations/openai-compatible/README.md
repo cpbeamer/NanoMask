@@ -28,16 +28,25 @@ sh examples/integrations/openai-compatible/curl-chat.sh
 ## Python
 
 ```bash
-pip install openai
+pip install ./sdk/python
 python examples/integrations/openai-compatible/python_client.py
 ```
 
 ## Node
 
 ```bash
-npm install openai
+npm install openai ./sdk/node
 node examples/integrations/openai-compatible/node_client.mjs
 ```
+
+## SDK Wrappers
+
+If you want the client boilerplate packaged instead of handwritten:
+
+- Python: `from nanomask import OpenAI, verify`
+- Node: `import { createClient, verify } from "@nanomask/openai"`
+
+The wrappers default the client base URL to NanoMask and inject `X-ZPG-Entities` headers when you pass an entity list.
 
 ## Auth
 

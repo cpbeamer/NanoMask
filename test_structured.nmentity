@@ -1,0 +1,7 @@
+[entity]
+name = John Doe
+dob = 1985-03-15
+
+[entity]
+name = Jane Smith
+ssn = 123-45-6789

@@ -8,3 +8,6 @@ zig-out/
 # Internal planning docs — not shipped with the product
 backlog*.md
 phase1_backlog.md
+
+# Test output artifacts
+test_output.txt

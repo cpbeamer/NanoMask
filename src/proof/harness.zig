@@ -323,10 +323,14 @@ fn applySchemaCase(case: CorpusCase, allocator: std.mem.Allocator) ![]u8 {
     defer schema.deinit();
 
     var maybe_hasher: ?hasher_mod.Hasher = null;
+    // Vault must outlive the hasher — declared at function scope.
+    var mem_vault_backing: ?*@import("../vault/memory_vault.zig").MemoryVault = null;
+    defer if (mem_vault_backing) |mv| mv.vaultInterface().deinit();
     defer if (maybe_hasher) |*hasher| hasher.deinit();
 
     if (case.hash_key) |hash_key| {
-        maybe_hasher = try hasher_mod.Hasher.init(hash_key, allocator);
+        mem_vault_backing = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+        maybe_hasher = try hasher_mod.Hasher.init(hash_key, mem_vault_backing.?.vaultInterface(), allocator);
     }
 
     var entity_map: ?entity_mask.EntityMap = null;
@@ -776,8 +780,10 @@ fn benchmarkSchemaHashLatency() !BenchmarkResult {
     var schema = try schema_mod.Schema.parseContent(schema_text, allocator);
     defer schema.deinit();
 
-    const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    var hasher = try hasher_mod.Hasher.init(key, allocator);
+    const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    defer mem_vault.vaultInterface().deinit();
+    var hasher = try hasher_mod.Hasher.init(key_hex, mem_vault.vaultInterface(), allocator);
     defer hasher.deinit();
 
     const token = try hasher.hash("PT-99001");

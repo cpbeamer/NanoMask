@@ -8,6 +8,11 @@ const EntitySnapshot = versioned_entity_set.EntitySnapshot;
 const http_util = @import("../net/http_util.zig");
 const logger_mod = @import("../infra/logger.zig");
 const Logger = logger_mod.Logger;
+const rbac = @import("rbac.zig");
+pub const Role = rbac.Role;
+pub const ApiKeyStore = rbac.ApiKeyStore;
+const audit_store_mod = @import("../infra/audit_store.zig");
+pub const AuditStore = audit_store_mod.AuditStore;
 
 // ---------------------------------------------------------------------------
 // Admin API — REST endpoints for runtime entity management
@@ -29,6 +34,13 @@ pub const AdminConfig = struct {
     entity_file_sync: bool,
     entity_file: ?[]const u8,
     fuzzy_threshold: f32,
+    /// Optional RBAC API key store. When set, Bearer tokens are authenticated
+    /// against this store and role-checked per endpoint. Falls back to the
+    /// static `token` field when null (backward compatible).
+    api_key_store: ?*ApiKeyStore = null,
+    /// Optional in-memory audit ring buffer. When set, admin and redaction
+    /// audit events are appended here and served via GET /_admin/audit.
+    audit_store: ?*AuditStore = null,
 };
 
 pub const ListenerMode = enum {
@@ -104,7 +116,13 @@ pub const IpAllowlist = struct {
 pub fn isAdminRoute(path: []const u8) bool {
     return std.mem.eql(u8, path, "/_admin/entities") or
         std.mem.startsWith(u8, path, "/_admin/entities?") or
-        std.mem.startsWith(u8, path, "/_admin/entities/");
+        std.mem.startsWith(u8, path, "/_admin/entities/") or
+        std.mem.eql(u8, path, "/_admin/evaluation-report") or
+        std.mem.eql(u8, path, "/_admin/evaluation-report/reset") or
+        std.mem.eql(u8, path, "/_admin/api-keys") or
+        std.mem.startsWith(u8, path, "/_admin/api-keys/") or
+        std.mem.eql(u8, path, "/_admin/audit") or
+        std.mem.startsWith(u8, path, "/_admin/audit?");
 }
 
 /// Handle an admin API request. Returns true if the request was handled
@@ -129,8 +147,28 @@ pub fn handleAdminRequest(
         }
     }
 
-    // Auth check: if token is configured, require Bearer token
-    if (admin_config.token) |expected_token| {
+    // Auth: RBAC key store takes priority, then static token
+    var caller_role: Role = .admin; // default when no auth is configured
+    if (admin_config.api_key_store) |key_store| {
+        const auth_header = http_util.findHeader(request.head_buffer, "Authorization");
+        if (auth_header == null) {
+            logAdminRequestDenied(admin_config, session_id, client_address, "unauthorized");
+            try sendJsonResponse(request, .unauthorized, "{\"error\":\"unauthorized\"}");
+            return .unauthorized;
+        }
+        const raw_token = extractBearerToken(auth_header.?) orelse {
+            logAdminRequestDenied(admin_config, session_id, client_address, "unauthorized");
+            try sendJsonResponse(request, .unauthorized, "{\"error\":\"unauthorized\"}");
+            return .unauthorized;
+        };
+        const auth_result = key_store.authenticate(raw_token) orelse {
+            logAdminRequestDenied(admin_config, session_id, client_address, "unauthorized");
+            try sendJsonResponse(request, .unauthorized, "{\"error\":\"unauthorized\"}");
+            return .unauthorized;
+        };
+        caller_role = auth_result.role;
+    } else if (admin_config.token) |expected_token| {
+        // Legacy static token auth (backward compatible)
         const auth_header = http_util.findHeader(request.head_buffer, "Authorization");
         if (auth_header == null or !validateBearerToken(auth_header.?, expected_token)) {
             logAdminRequestDenied(admin_config, session_id, client_address, "unauthorized");
@@ -139,8 +177,31 @@ pub fn handleAdminRequest(
         }
     }
 
+    const uri_str = request.head.target;
     const method = request.head.method;
+
+    // --- API Key management routes (admin role required) ---
+    if (std.mem.eql(u8, uri_str, "/_admin/api-keys") or
+        std.mem.startsWith(u8, uri_str, "/_admin/api-keys/"))
+    {
+        return try handleApiKeyRequest(request, admin_config, caller_role, uri_str, session_id, client_address, allocator);
+    }
+
+    // --- Audit log query route (viewer role sufficient) ---
+    if (std.mem.eql(u8, uri_str, "/_admin/audit") or
+        std.mem.startsWith(u8, uri_str, "/_admin/audit?"))
+    {
+        return try handleAuditRequest(request, admin_config, uri_str, allocator);
+    }
+
+    // --- Entity management routes ---
     if (isMutationMethod(method)) {
+        // Mutations require at least operator role
+        if (!caller_role.atLeast(.operator)) {
+            logAdminRequestDenied(admin_config, session_id, client_address, "insufficient_role");
+            try sendJsonResponse(request, .forbidden, "{\"error\":\"insufficient role\"}");
+            return .forbidden;
+        }
         if (admin_config.read_only) {
             logAdminRequestDenied(admin_config, session_id, client_address, "read_only");
             try sendJsonResponse(request, .forbidden, "{\"error\":\"admin API is read-only\"}");
@@ -180,7 +241,7 @@ const RebuildResult = struct {
     entity_count_after: usize,
 };
 
-fn validateBearerToken(auth_value: []const u8, expected: []const u8) bool {
+pub fn validateBearerToken(auth_value: []const u8, expected: []const u8) bool {
     const prefix = "Bearer ";
     if (auth_value.len < prefix.len) return false;
     // Check prefix in constant time to avoid leaking which part failed.
@@ -204,6 +265,279 @@ fn ipOnlyEqual(a: std.net.Address, b: std.net.Address) bool {
 
 fn isMutationMethod(method: http.Method) bool {
     return method == .POST or method == .PUT or method == .DELETE;
+}
+
+/// Extract the raw token from a "Bearer <token>" Authorization header value.
+fn extractBearerToken(auth_value: []const u8) ?[]const u8 {
+    const prefix = "Bearer ";
+    if (auth_value.len <= prefix.len) return null;
+    if (!mem.startsWith(u8, auth_value, prefix)) return null;
+    return auth_value[prefix.len..];
+}
+
+/// Handle /_admin/api-keys CRUD routes. Requires admin role for all operations.
+fn handleApiKeyRequest(
+    request: *http.Server.Request,
+    admin_config: AdminConfig,
+    caller_role: Role,
+    uri_str: []const u8,
+    session_id: []const u8,
+    client_address: std.net.Address,
+    allocator: std.mem.Allocator,
+) !http.Status {
+    if (!caller_role.atLeast(.admin)) {
+        logAdminRequestDenied(admin_config, session_id, client_address, "insufficient_role");
+        try sendJsonResponse(request, .forbidden, "{\"error\":\"admin role required\"}");
+        return .forbidden;
+    }
+
+    const key_store = admin_config.api_key_store orelse {
+        try sendJsonResponse(request, .not_found, "{\"error\":\"api key management not configured\"}");
+        return .not_found;
+    };
+
+    const method = request.head.method;
+
+    if (method == .GET and std.mem.eql(u8, uri_str, "/_admin/api-keys")) {
+        // List all keys (metadata only, never raw tokens)
+        const json = key_store.renderKeysJson(allocator) catch {
+            try sendJsonResponse(request, .internal_server_error, "{\"error\":\"render failed\"}");
+            return .internal_server_error;
+        };
+        defer allocator.free(json);
+        try sendJsonResponse(request, .ok, json);
+        return .ok;
+    }
+
+    if (method == .POST and std.mem.eql(u8, uri_str, "/_admin/api-keys")) {
+        // Create a new API key. Body: {"name":"...", "role":"viewer|operator|admin", "tenant":"..."}
+        // Rate-limit mutations
+        if (admin_config.state) |state| {
+            if (!state.mutation_limiter.allow(admin_config.mutation_rate_limit_per_minute)) {
+                try sendJsonResponse(request, .too_many_requests, "{\"error\":\"rate limit exceeded\"}");
+                return .too_many_requests;
+            }
+        }
+
+        const body = readRequestBody(request, allocator, admin_config.logger) catch |err| switch (err) {
+            error.PayloadTooLarge => {
+                try sendJsonResponse(request, .payload_too_large, "{\"error\":\"body too large\"}");
+                return .payload_too_large;
+            },
+            else => return err,
+        };
+        defer allocator.free(body);
+        if (body.len == 0) {
+            try sendJsonResponse(request, .bad_request, "{\"error\":\"empty body\"}");
+            return .bad_request;
+        }
+
+        // Parse name, role, optional tenant from JSON body
+        var name: ?[]const u8 = null;
+        var role_str: ?[]const u8 = null;
+        var tenant: ?[]const u8 = null;
+        parseApiKeyBody(body, &name, &role_str, &tenant);
+
+        if (name == null or role_str == null) {
+            try sendJsonResponse(request, .bad_request, "{\"error\":\"name and role required\"}");
+            return .bad_request;
+        }
+
+        const role = Role.parse(role_str.?) orelse {
+            try sendJsonResponse(request, .bad_request, "{\"error\":\"invalid role, use viewer/operator/admin\"}");
+            return .bad_request;
+        };
+
+        // Generate a random API key and hex-encode it
+        var raw_key_bytes: [32]u8 = undefined;
+        std.crypto.random.bytes(&raw_key_bytes);
+        var hex_key: [64]u8 = undefined;
+        const hex_chars = "0123456789abcdef";
+        for (raw_key_bytes, 0..) |byte, idx| {
+            hex_key[idx * 2] = hex_chars[byte >> 4];
+            hex_key[idx * 2 + 1] = hex_chars[byte & 0x0f];
+        }
+
+        key_store.addKey(&hex_key, role, tenant, name.?) catch |err| {
+            switch (err) {
+                error.DuplicateKey => {
+                    try sendJsonResponse(request, .conflict, "{\"error\":\"duplicate key\"}");
+                    return .conflict;
+                },
+                error.DuplicateName => {
+                    try sendJsonResponse(request, .conflict, "{\"error\":\"key name already in use\"}");
+                    return .conflict;
+                },
+                else => {
+                    try sendJsonResponse(request, .internal_server_error, "{\"error\":\"internal error\"}");
+                    return .internal_server_error;
+                },
+            }
+        };
+
+        // Audit log the key creation
+        if (admin_config.logger) |logger| {
+            logger.auditAdmin(session_id, .{
+                .action = "api_key_created",
+                .source = "admin_api",
+                .result = "success",
+                .version = 0,
+                .entity_count_after = key_store.count(),
+            });
+        }
+
+        // Return the raw key once (caller must save it).
+        // Build response via the writer so 'name' is JSON-escaped and cannot
+        // inject characters that would break the object structure.
+        var resp_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer resp_buf.deinit(allocator);
+        {
+            const w = resp_buf.writer(allocator);
+            try w.writeAll("{\"key\":\"");
+            try w.writeAll(hex_key[0..]);
+            try w.writeAll("\",\"name\":\"");
+            try rbac.writeJsonEscaped(w, name.?);
+            try w.writeAll("\",\"role\":\"");
+            try w.writeAll(role.label());
+            try w.writeByte('}');
+        }
+        const resp = try resp_buf.toOwnedSlice(allocator);
+        defer allocator.free(resp);
+        try sendJsonResponse(request, .created, resp);
+        return .created;
+    }
+
+    if (method == .DELETE and std.mem.startsWith(u8, uri_str, "/_admin/api-keys/")) {
+        // Delete key by name (path suffix)
+        if (admin_config.state) |state| {
+            if (!state.mutation_limiter.allow(admin_config.mutation_rate_limit_per_minute)) {
+                try sendJsonResponse(request, .too_many_requests, "{\"error\":\"rate limit exceeded\"}");
+                return .too_many_requests;
+            }
+        }
+
+        const key_name = uri_str["/_admin/api-keys/".len..];
+        if (key_name.len == 0) {
+            try sendJsonResponse(request, .bad_request, "{\"error\":\"key name required\"}");
+            return .bad_request;
+        }
+
+        if (key_store.removeByName(key_name)) {
+            if (admin_config.logger) |logger| {
+                logger.auditAdmin(session_id, .{
+                    .action = "api_key_revoked",
+                    .source = "admin_api",
+                    .result = "success",
+                    .version = 0,
+                    .entity_count_after = key_store.count(),
+                });
+            }
+            try sendJsonResponse(request, .ok, "{\"status\":\"deleted\"}");
+            return .ok;
+        } else {
+            try sendJsonResponse(request, .not_found, "{\"error\":\"key not found\"}");
+            return .not_found;
+        }
+    }
+
+    try sendJsonResponse(request, .method_not_allowed, "{\"error\":\"method not allowed\"}");
+    return .method_not_allowed;
+}
+
+/// Handle GET /_admin/audit[?type=<t>&session=<s>&limit=<n>].
+/// Requires at least viewer role (auth already checked by caller).
+fn handleAuditRequest(
+    request: *http.Server.Request,
+    admin_config: AdminConfig,
+    uri_str: []const u8,
+    allocator: std.mem.Allocator,
+) !http.Status {
+    if (request.head.method != .GET) {
+        try sendJsonResponse(request, .method_not_allowed, "{\"error\":\"method not allowed\"}");
+        return .method_not_allowed;
+    }
+
+    const store = admin_config.audit_store orelse {
+        try sendJsonResponse(request, .not_found, "{\"error\":\"audit store not configured\"}");
+        return .not_found;
+    };
+
+    // Parse optional query parameters: ?type=redaction&session=abc&limit=50
+    var filters: audit_store_mod.QueryFilters = .{};
+    if (std.mem.indexOfScalar(u8, uri_str, '?')) |qs| {
+        const query = uri_str[qs + 1 ..];
+        filters.event_type = extractQueryParam(query, "type");
+        filters.session_id = extractQueryParam(query, "session");
+        if (extractQueryParam(query, "limit")) |limit_str| {
+            filters.limit = std.fmt.parseInt(u32, limit_str, 10) catch filters.limit;
+        }
+    }
+
+    const json = store.queryJson(filters, allocator) catch {
+        try sendJsonResponse(request, .internal_server_error, "{\"error\":\"query failed\"}");
+        return .internal_server_error;
+    };
+    defer allocator.free(json);
+    try sendJsonResponse(request, .ok, json);
+    return .ok;
+}
+
+/// Extract a single query-parameter value from a raw query string.
+/// E.g. extractQueryParam("type=admin&limit=10", "type") → "admin"
+fn extractQueryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (pair.len > name.len and
+            std.mem.startsWith(u8, pair, name) and
+            pair[name.len] == '=')
+        {
+            return pair[name.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// Minimal JSON parser for API key creation body.
+/// Extracts "name", "role", "tenant" string values.
+fn parseApiKeyBody(
+    body: []const u8,
+    name: *?[]const u8,
+    role: *?[]const u8,
+    tenant: *?[]const u8,
+) void {
+    // Simple field extraction without full JSON parsing
+    name.* = extractJsonStringField(body, "name");
+    role.* = extractJsonStringField(body, "role");
+    tenant.* = extractJsonStringField(body, "tenant");
+}
+
+/// Extract a string field from JSON body: "field":"value"
+fn extractJsonStringField(body: []const u8, field: []const u8) ?[]const u8 {
+    // Search for "field" pattern
+    var i: usize = 0;
+    while (i + field.len + 3 < body.len) : (i += 1) {
+        if (body[i] == '"' and i + 1 + field.len < body.len and
+            std.mem.eql(u8, body[i + 1 .. i + 1 + field.len], field) and
+            body[i + 1 + field.len] == '"')
+        {
+            // Found the key, now find the colon and value
+            var j = i + 2 + field.len;
+            while (j < body.len and (body[j] == ' ' or body[j] == '\t' or body[j] == ':')) : (j += 1) {}
+            if (j >= body.len or body[j] != '"') continue;
+            j += 1; // skip opening quote
+            const val_start = j;
+            while (j < body.len and body[j] != '"') {
+                if (body[j] == '\\' and j + 1 < body.len) {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if (j >= body.len) continue;
+            return body[val_start..j];
+        }
+    }
+    return null;
 }
 
 fn logAdminRequestDenied(
@@ -571,6 +905,7 @@ fn rebuildAndSwap(
         names,
         admin_config.fuzzy_threshold,
         new_version,
+        logger,
         allocator,
     );
 
@@ -800,6 +1135,10 @@ test "isAdminRoute - matching paths" {
     try std.testing.expect(isAdminRoute("/_admin/entities"));
     try std.testing.expect(isAdminRoute("/_admin/entities/"));
     try std.testing.expect(isAdminRoute("/_admin/entities?foo=bar"));
+    try std.testing.expect(isAdminRoute("/_admin/api-keys"));
+    try std.testing.expect(isAdminRoute("/_admin/api-keys/my-key"));
+    try std.testing.expect(isAdminRoute("/_admin/audit"));
+    try std.testing.expect(isAdminRoute("/_admin/audit?type=redaction"));
 }
 
 test "isAdminRoute - non-matching paths" {

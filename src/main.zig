@@ -23,6 +23,17 @@ const shutdown_mod = @import("infra/shutdown.zig");
 const proxy_server_mod = @import("net/proxy_server.zig");
 const runtime_model_mod = @import("net/runtime_model.zig");
 const upstream_client = @import("net/upstream_client.zig");
+const evaluation_report_mod = @import("infra/evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const rbac = @import("admin/rbac.zig");
+const ApiKeyStore = rbac.ApiKeyStore;
+const audit_store_mod = @import("infra/audit_store.zig");
+const AuditStore = audit_store_mod.AuditStore;
+const semantic_cache_mod = @import("infra/semantic_cache.zig");
+const vault_mod = @import("vault/vault.zig");
+const memory_vault_mod = @import("vault/memory_vault.zig");
+const file_vault_mod = @import("vault/file_vault.zig");
+const external_vault_mod = @import("vault/external_vault.zig");
 
 var termination_signal_requested = std.atomic.Value(bool).init(false);
 
@@ -41,6 +52,104 @@ fn installTerminationSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+}
+
+fn appendFeature(
+    features: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    label: []const u8,
+) !void {
+    if (features.items.len > 0) {
+        try features.appendSlice(allocator, ", ");
+    }
+    try features.appendSlice(allocator, label);
+}
+
+fn buildFeatureSummary(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    entity_count: usize,
+    schema_field_count: usize,
+) ![]u8 {
+    var features: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer features.deinit(allocator);
+
+    try appendFeature(&features, allocator, "ssn");
+    if (entity_count > 0 or cfg.admin_api) try appendFeature(&features, allocator, "entity-mask");
+    if (cfg.enable_email) try appendFeature(&features, allocator, "email");
+    if (cfg.enable_phone) try appendFeature(&features, allocator, "phone");
+    if (cfg.enable_credit_card) try appendFeature(&features, allocator, "credit-card");
+    if (cfg.enable_ip) try appendFeature(&features, allocator, "ip");
+    if (cfg.enable_healthcare) try appendFeature(&features, allocator, "healthcare");
+    if (cfg.enable_iban) try appendFeature(&features, allocator, "iban");
+    if (cfg.enable_uk_nino) try appendFeature(&features, allocator, "uk-nino");
+    if (cfg.enable_passport) try appendFeature(&features, allocator, "passport");
+    if (cfg.enable_intl_phone) try appendFeature(&features, allocator, "intl-phone");
+    if (cfg.enable_dates) try appendFeature(&features, allocator, "dates");
+    if (cfg.enable_addresses) try appendFeature(&features, allocator, "addresses");
+    if (cfg.enable_fax) try appendFeature(&features, allocator, "fax");
+    if (cfg.enable_accounts) try appendFeature(&features, allocator, "accounts");
+    if (cfg.enable_licenses) try appendFeature(&features, allocator, "licenses");
+    if (cfg.enable_urls) try appendFeature(&features, allocator, "urls");
+    if (cfg.enable_vehicle_ids) try appendFeature(&features, allocator, "vehicle-ids");
+
+    if (schema_field_count > 0) try appendFeature(&features, allocator, "schema");
+    if (cfg.target_tls) try appendFeature(&features, allocator, "upstream-tls");
+    if (cfg.report_only) try appendFeature(&features, allocator, "report-only");
+
+    if (cfg.enable_guardrails) {
+        var guardrail_buf: [48]u8 = undefined;
+        const label = try std.fmt.bufPrint(&guardrail_buf, "guardrails({s})", .{cfg.guardrail_mode.label()});
+        try appendFeature(&features, allocator, label);
+    }
+
+    if (cfg.enable_semantic_cache) {
+        try appendFeature(&features, allocator, "semantic-cache");
+    }
+
+    if (cfg.admin_api) {
+        try appendFeature(&features, allocator, "admin-api");
+    }
+
+    return try features.toOwnedSlice(allocator);
+}
+
+fn printStartupBanner(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    entity_count: usize,
+    schema_field_count: usize,
+) !void {
+    const feature_summary = try buildFeatureSummary(allocator, cfg, entity_count, schema_field_count);
+    defer allocator.free(feature_summary);
+
+    var schema_buf: [32]u8 = undefined;
+    const schema_summary = if (schema_field_count > 0)
+        try std.fmt.bufPrint(&schema_buf, "{d} fields", .{schema_field_count})
+    else
+        "disabled";
+
+    std.debug.print(
+        "\n" ++
+            "NanoMask {s}\n" ++
+            "  Listener  {s}:{d}\n" ++
+            "  Upstream  {s}://{s}:{d}\n" ++
+            "  Entities  {d}\n" ++
+            "  Schema    {s}\n" ++
+            "  Features  {s}\n" ++
+            "\n",
+        .{
+            Config.version,
+            cfg.listen_host,
+            cfg.listen_port,
+            if (cfg.target_tls) "https" else "http",
+            cfg.target_host,
+            cfg.target_port,
+            entity_count,
+            schema_summary,
+            feature_summary,
+        },
+    );
 }
 
 pub fn main() !void {
@@ -89,12 +198,130 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    // --- Validate-config mode ---
+    // When --validate-config is set, print the resolved configuration
+    // summary and exit 0. All file existence, flag pairing, and
+    // consistency checks already ran during Config.parse().
+    if (cfg.validate_config) {
+        std.debug.print(
+            "NanoMask configuration valid.\n" ++
+                "\n" ++
+                "  Network\n" ++
+                "    listen        {s}:{d}\n" ++
+                "    target        {s}:{d}\n" ++
+                "    target_tls    {s}\n" ++
+                "    listener_tls  {s}\n" ++
+                "    max_conns     {d}\n" ++
+                "    runtime       {s}\n" ++
+                "\n" ++
+                "  Redaction\n" ++
+                "    entity_file   {s}\n" ++
+                "    schema_file   {s}\n" ++
+                "    email         {s}\n" ++
+                "    phone         {s}\n" ++
+                "    credit_card   {s}\n" ++
+                "    ip            {s}\n" ++
+                "    healthcare    {s}\n" ++
+                "    iban          {s}\n" ++
+                "    uk_nino       {s}\n" ++
+                "    passport      {s}\n" ++
+                "    intl_phone    {s}\n" ++
+                "    dates         {s}\n" ++
+                "    addresses     {s}\n" ++
+                "    accounts      {s}\n" ++
+                "    licenses      {s}\n" ++
+                "    urls          {s}\n" ++
+                "    vehicle_ids   {s}\n" ++
+                "    report_only   {s}\n" ++
+                "    guardrails    {s} ({s})\n" ++
+                "    sem_cache     {s} ttl={d}ms entries={d}\n" ++
+                "\n" ++
+                "  Admin\n" ++
+                "    admin_api     {s}\n" ++
+                "    audit_log     {s}\n" ++
+                "    log_level     {s}\n" ++
+                "\n" ++
+                "  Not Yet Implemented (flags accepted, no effect)\n" ++
+                "    syslog        accepted (UDP syslog forwarding not yet implemented)\n" ++
+                "    mtls          accepted (mTLS enforcement not yet implemented)\n",
+            .{
+                cfg.listen_host,
+                cfg.listen_port,
+                cfg.target_host,
+                cfg.target_port,
+                if (cfg.target_tls) "enabled" else "disabled",
+                if (cfg.tls_cert != null) "enabled" else "disabled",
+                cfg.max_connections,
+                cfg.runtime_model.label(),
+                cfg.entity_file orelse "none",
+                cfg.schema_file orelse "none",
+                if (cfg.enable_email) "enabled" else "disabled",
+                if (cfg.enable_phone) "enabled" else "disabled",
+                if (cfg.enable_credit_card) "enabled" else "disabled",
+                if (cfg.enable_ip) "enabled" else "disabled",
+                if (cfg.enable_healthcare) "enabled" else "disabled",
+                if (cfg.enable_iban) "enabled" else "disabled",
+                if (cfg.enable_uk_nino) "enabled" else "disabled",
+                if (cfg.enable_passport) "enabled" else "disabled",
+                if (cfg.enable_intl_phone) "enabled" else "disabled",
+                if (cfg.enable_dates) "enabled" else "disabled",
+                if (cfg.enable_addresses) "enabled" else "disabled",
+                if (cfg.enable_accounts) "enabled" else "disabled",
+                if (cfg.enable_licenses) "enabled" else "disabled",
+                if (cfg.enable_urls) "enabled" else "disabled",
+                if (cfg.enable_vehicle_ids) "enabled" else "disabled",
+                if (cfg.report_only) "enabled" else "disabled",
+                if (cfg.enable_guardrails) "enabled" else "disabled",
+                cfg.guardrail_mode.label(),
+                if (cfg.enable_semantic_cache) "enabled" else "disabled",
+                cfg.semantic_cache_ttl_ms,
+                cfg.semantic_cache_max_entries,
+                if (cfg.admin_api) "enabled" else "disabled",
+                if (cfg.audit_log) "enabled" else "disabled",
+                @tagName(cfg.log_level),
+            },
+        );
+        std.process.exit(0);
+    }
+
     // --- Structured Logger ---
     var log = Logger.init(cfg.log_level, cfg.audit_log, cfg.log_file) catch |err| {
         std.debug.print("error: failed to initialise logger: {}\n", .{err});
         std.process.exit(1);
     };
     defer log.deinit();
+
+    // --- OTel service name (Phase 3 / NMV3-013) ---
+    if (cfg.otel_service_name) |svc| {
+        log.service_name = svc;
+    }
+
+    // --- Syslog forwarding (Phase 3 / NMV3-013) ---
+    // UDP syslog output is not yet implemented. Warn the operator rather than
+    // silently ignoring the flag so they know it has no effect.
+    if (cfg.syslog_address != null) {
+        log.log(.warn, "syslog_not_implemented", null, &.{
+            .{ .key = "note", .value = .{ .string = "--syslog-address is accepted but UDP syslog forwarding is not yet implemented in this build" } },
+        });
+    }
+
+    // --- mTLS (Phase 3 / NMV3-011) ---
+    // PEM files are validated at startup (see config.zig checkPemFile) but
+    // mTLS enforcement is not yet wired into the TLS stack. Warn the operator.
+    if (cfg.mtls_ca != null or cfg.mtls_cert != null or cfg.mtls_key != null) {
+        log.log(.warn, "mtls_not_implemented", null, &.{
+            .{ .key = "note", .value = .{ .string = "--mtls-* flags are accepted but mTLS enforcement is not yet implemented in this build" } },
+        });
+    }
+
+    // --- Audit ring buffer (Phase 3 / NMV3-012) ---
+    var audit_store_instance = AuditStore.init(cfg.audit_buffer_size, allocator) catch |err| {
+        std.debug.print("error: failed to initialise audit store: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer audit_store_instance.deinit();
+    // Wire audit events from the logger into the ring buffer.
+    log.audit_store = &audit_store_instance;
 
     var active_connections = std.atomic.Value(u32).init(0);
     var connections_total = std.atomic.Value(u64).init(0);
@@ -132,6 +359,7 @@ pub fn main() !void {
         .{ .key = "log_level", .value = .{ .string = @tagName(cfg.log_level) } },
         .{ .key = "unsupported_request_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_request_body_behavior) } },
         .{ .key = "unsupported_response_body_behavior", .value = .{ .string = @tagName(cfg.unsupported_response_body_behavior) } },
+        .{ .key = "report_only", .value = .{ .boolean = cfg.report_only } },
     });
 
     var admin_state = admin.AdminState{};
@@ -150,6 +378,7 @@ pub fn main() !void {
     // thread — avoids dangling pointer risk from stack-local optionals.
     var entity_set: ?*VersionedEntitySet = null;
     var watcher: ?FileWatcher = null;
+    var entity_count: usize = 0;
 
     defer {
         // Join the watcher thread before freeing the entity set it references.
@@ -165,6 +394,7 @@ pub fn main() !void {
             ef,
             cfg.fuzzy_threshold,
             1,
+            &log,
             allocator,
         ) catch {
             std.process.exit(1);
@@ -174,6 +404,7 @@ pub fn main() !void {
             .{ .key = "count", .value = .{ .uint = initial_snapshot.loaded_names.len } },
             .{ .key = "file", .value = .{ .string = ef } },
         });
+        entity_count = initial_snapshot.loaded_names.len;
 
         const es = try allocator.create(VersionedEntitySet);
         es.* = VersionedEntitySet.init(initial_snapshot);
@@ -185,6 +416,7 @@ pub fn main() !void {
             cfg.watch_interval_ms,
             es,
             cfg.fuzzy_threshold,
+            cfg.entity_format,
             allocator,
             &observability,
             &log,
@@ -200,12 +432,14 @@ pub fn main() !void {
             &empty_names,
             cfg.fuzzy_threshold,
             1,
+            &log,
             allocator,
         ) catch {
             log.err("empty_entity_set_failed", null);
             std.process.exit(1);
         };
         log.info("admin_api_enabled", null);
+        entity_count = initial_snapshot.loaded_names.len;
         const es = try allocator.create(VersionedEntitySet);
         es.* = VersionedEntitySet.init(initial_snapshot);
         entity_set = es;
@@ -215,6 +449,7 @@ pub fn main() !void {
 
     // --- Schema-aware redaction setup (Epic 8) ---
     var schema_instance: ?schema_mod.Schema = null;
+    var schema_field_count: usize = 0;
     defer if (schema_instance) |*s| s.deinit();
 
     if (cfg.schema_file) |sf| {
@@ -226,38 +461,151 @@ pub fn main() !void {
         if (cfg.schema_default) |sd| {
             schema_instance.?.default_action = schema_mod.SchemaAction.parse(sd) catch .scan;
         }
+        schema_field_count = schema_instance.?.fieldCount();
         log.log(.info, "schema_loaded", null, &.{
             .{ .key = "file", .value = .{ .string = sf } },
-            .{ .key = "fields", .value = .{ .uint = schema_instance.?.fieldCount() } },
+            .{ .key = "fields", .value = .{ .uint = schema_field_count } },
         });
     }
 
+    var vault_instance: ?vault_mod.VaultBackend = null;
     var hasher_instance: ?hasher_mod.Hasher = null;
-    defer if (hasher_instance) |*h| h.deinit();
+    defer {
+        // Hasher does NOT own the vault — deinit only frees hasher-internal state.
+        if (hasher_instance) |*h| h.deinit();
+        // Vault is owned by main and freed here.
+        if (vault_instance) |*v| {
+            switch (v.*) {
+                .memory => |m| m.vaultInterface().deinit(),
+                .file => |f| f.vaultInterface().deinit(),
+                .external => |e| e.vaultInterface().deinit(),
+            }
+        }
+    }
 
     // Only create a hasher when an explicit key is provided or the schema
     // actually contains HASH-action fields. This avoids unnecessary
     // crypto-random key generation for schemas with no HASH rules.
     const needs_hasher = cfg.hash_key != null or cfg.hash_key_file != null or
+        cfg.hash_key_exec != null or
         (if (schema_instance) |*s| s.hasHashFields() else false);
 
     if (needs_hasher) {
-        if (cfg.hash_key_file) |kf| {
-            hasher_instance = hasher_mod.Hasher.initFromFile(kf, allocator) catch |err| {
-                std.debug.print("error: failed to load hash key file: {}\n", .{err});
+        // 1. Resolve the HMAC key bytes first — FileVault needs them for encryption.
+        var resolved_key_hex: ?[]const u8 = null;
+        var exec_output_owned: ?[]u8 = null;
+        defer if (exec_output_owned) |eo| allocator.free(eo);
+        // Holds file contents when --hash-key-file is used; freed after hasher init.
+        var file_key_contents_owned: ?[]u8 = null;
+        defer if (file_key_contents_owned) |fkc| allocator.free(fkc);
+
+        if (cfg.hash_key_exec) |cmd| {
+            const argv = if (builtin.os.tag == .windows)
+                &[_][]const u8{ "cmd.exe", "/c", cmd }
+            else
+                &[_][]const u8{ "/bin/sh", "-c", cmd };
+
+            var child = std.process.Child.init(argv, allocator);
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Inherit;
+            child.spawn() catch |err| {
+                std.debug.print("error: failed to spawn hash-key-exec command '{s}': {}\n", .{ cmd, err });
                 std.process.exit(1);
             };
+            exec_output_owned = child.stdout.?.readToEndAlloc(allocator, 256) catch |err| {
+                std.debug.print("error: failed to read hash-key-exec output: {}\n", .{err});
+                std.process.exit(1);
+            };
+            _ = child.wait() catch {};
+            resolved_key_hex = std.mem.trim(u8, exec_output_owned.?, " \t\r\n");
+        } else if (cfg.hash_key_file) |kf| {
+            // Read the key file now so the same hex is used for both FileVault
+            // encryption key derivation and Hasher initialization. Without this,
+            // the FileVault would be encrypted with a random key that is lost on
+            // restart, breaking pseudonymization reversibility.
+            const kf_file = std.fs.cwd().openFile(kf, .{}) catch |err| {
+                std.debug.print("error: cannot open hash key file '{s}': {s}\n", .{ kf, @errorName(err) });
+                std.process.exit(1);
+            };
+            defer kf_file.close();
+            file_key_contents_owned = kf_file.readToEndAlloc(allocator, 128) catch {
+                std.debug.print("error: failed to read hash key file '{s}'\n", .{kf});
+                std.process.exit(1);
+            };
+            const trimmed = std.mem.trim(u8, file_key_contents_owned.?, " \t\n\r");
+            if (trimmed.len < 64) {
+                std.debug.print("error: hash key file must contain at least 64 hex characters\n", .{});
+                std.process.exit(1);
+            }
+            resolved_key_hex = trimmed[0..64];
         } else {
-            hasher_instance = hasher_mod.Hasher.init(cfg.hash_key, allocator) catch |err| {
-                std.debug.print("error: failed to initialise hasher: {}\n", .{err});
-                std.process.exit(1);
-            };
+            resolved_key_hex = cfg.hash_key; // may be null → auto-generated
         }
-        const hex = hasher_instance.?.keyHex();
+
+        // Parse or auto-generate the 32-byte key for vault encryption.
+        var vault_key: [32]u8 = undefined;
+        var vault_key_from_hex = false;
+
+        if (resolved_key_hex) |hex| {
+            if (hex.len >= 64) {
+                if (std.fmt.hexToBytes(&vault_key, hex[0..64])) |_| {
+                    vault_key_from_hex = true;
+                } else |_| {
+                    // Invalid hex chars — Hasher.init will also reject this
+                }
+            }
+        }
+
+        if (!vault_key_from_hex) {
+            // Auto-generate — no hex key provided or hex decode failed.
+            std.crypto.random.bytes(&vault_key);
+        }
+
+        // 2. Initialize the correct Vault backend
+        switch (cfg.vault_backend) {
+            .memory => {
+                vault_instance = .{ .memory = memory_vault_mod.MemoryVault.init(allocator) catch |err| {
+                    std.debug.print("error: failed to initialize memory vault: {}\n", .{err});
+                    std.process.exit(1);
+                } };
+            },
+            .file => {
+                vault_instance = .{ .file = file_vault_mod.FileVault.init(allocator, cfg.vault_file_path.?, vault_key) catch |err| {
+                    std.debug.print("error: failed to initialize file vault: {}\n", .{err});
+                    std.process.exit(1);
+                } };
+            },
+            .external => {
+                std.debug.print("error: the 'external' vault backend is not yet implemented. Use --vault-backend memory or --vault-backend file.\n", .{});
+                std.process.exit(1);
+            },
+        }
+
+        const vault_iface = switch (vault_instance.?) {
+            .memory => |m| m.vaultInterface(),
+            .file => |f| f.vaultInterface(),
+            .external => |e| e.vaultInterface(),
+        };
+
+        // 3. Initialize the Hasher with the resolved key and vault interface.
+        // All key sources now have resolved_key_hex set (or null for auto-generated),
+        // so we use Hasher.init uniformly instead of branching on the key source.
+        const key_source: []const u8 = if (cfg.hash_key_exec != null) "exec" else if (cfg.hash_key_file != null) "file" else if (cfg.hash_key != null) "cli" else "auto";
+
+        hasher_instance = hasher_mod.Hasher.init(resolved_key_hex, vault_iface, allocator) catch |err| {
+            std.debug.print("error: failed to initialise hasher ({s}): {}\n", .{ key_source, err });
+            std.process.exit(1);
+        };
+
         log.log(.info, "hasher_initialized", null, &.{
-            .{ .key = "key_source", .value = .{ .string = if (cfg.hash_key != null) "cli" else if (cfg.hash_key_file != null) "file" else "auto" } },
-            .{ .key = "key_prefix", .value = .{ .string = hex[0..8] } },
+            .{ .key = "key_source", .value = .{ .string = key_source } },
+            .{ .key = "key_prefix", .value = .{ .string = hasher_instance.?.keyHex()[0..8] } },
+            .{ .key = "vault_backend", .value = .{ .string = cfg.vault_backend.asStr() } },
         });
+    }
+
+    if (hasher_instance) |*h| {
+        h.setObservability(&observability);
     }
 
     // --- TLS setup ---
@@ -297,6 +645,36 @@ pub fn main() !void {
 
     if (!tls_enabled) {
         log.warn("no_tls_warning", null);
+    }
+
+    // --- TLS posture summary ---
+    // Emit a structured log summarizing the listener and upstream TLS
+    // configuration so operators can verify the deployment matches their
+    // intended security posture at a glance.
+    const listener_cipher = if (tls_enabled) "TLS_AES_128_GCM_SHA256" else "none";
+    const listener_cert = if (cfg.tls_cert) |cert| cert else "none";
+    const upstream_ca_source: []const u8 = if (cfg.ca_file != null and cfg.tls_no_system_ca)
+        "custom_only"
+    else if (cfg.ca_file != null)
+        "custom"
+    else if (cfg.tls_no_system_ca)
+        "none"
+    else
+        "system";
+    log.log(.info, "tls_posture", null, &.{
+        .{ .key = "listener_tls", .value = .{ .boolean = tls_enabled } },
+        .{ .key = "listener_cipher", .value = .{ .string = listener_cipher } },
+        .{ .key = "listener_cert", .value = .{ .string = listener_cert } },
+        .{ .key = "upstream_tls", .value = .{ .boolean = cfg.target_tls } },
+        .{ .key = "upstream_ca_source", .value = .{ .string = upstream_ca_source } },
+    });
+    // Hint: built-in TLS works but a hardened ingress tier is recommended
+    // for production deployments (see docs/tls_strategy.md).
+    if (tls_enabled) {
+        log.log(.info, "production_tls_hint", null, &.{
+            .{ .key = "recommendation", .value = .{ .string = "use a hardened ingress tier (NGINX, Envoy, ALB) for production TLS termination" } },
+            .{ .key = "docs", .value = .{ .string = "docs/tls_strategy.md" } },
+        });
     }
 
     // --- Upstream TLS status ---
@@ -360,6 +738,22 @@ pub fn main() !void {
         // When neither flag is set, the default system CA scan applies.
     }
 
+    // --- RBAC API key store (Phase 3 / NMV3-011) ---
+    var api_key_store: ?ApiKeyStore = if (cfg.admin_api_key_file) |key_file| blk: {
+        var store = ApiKeyStore.loadFromFile(key_file, allocator) catch |err| {
+            std.debug.print("error: failed to load API key file '{s}': {}\n", .{ key_file, err });
+            std.process.exit(1);
+        };
+        // Suppress "unused variable" warning; store is read below via .count().
+        _ = &store;
+        log.log(.info, "api_key_store_loaded", null, &.{
+            .{ .key = "file", .value = .{ .string = key_file } },
+            .{ .key = "key_count", .value = .{ .uint = store.count() } },
+        });
+        break :blk store;
+    } else null;
+    defer if (api_key_store) |*aks| aks.deinit();
+
     const admin_config = admin.AdminConfig{
         .enabled = cfg.admin_api,
         .token = cfg.admin_token,
@@ -371,9 +765,42 @@ pub fn main() !void {
         .entity_file_sync = cfg.entity_file_sync,
         .entity_file = cfg.entity_file,
         .fuzzy_threshold = cfg.fuzzy_threshold,
+        .api_key_store = if (api_key_store) |*aks| aks else null,
+        .audit_store = &audit_store_instance,
     };
 
     var shutdown_state = shutdown_mod.ShutdownState{};
+
+    // --- Report-only mode evaluation report (Phase 2 / NMV3-007) ---
+    var evaluation_report: ?EvaluationReport = if (cfg.report_only) .{} else null;
+    if (cfg.report_only) {
+        log.log(.info, "report_only_mode_enabled", null, &.{
+            .{ .key = "mode", .value = .{ .string = "report_only" } },
+            .{ .key = "description", .value = .{ .string = "PII detection active, payload modification disabled" } },
+        });
+    }
+
+    var semantic_cache: ?semantic_cache_mod.SemanticCache = if (cfg.enable_semantic_cache)
+        semantic_cache_mod.SemanticCache.init(allocator, cfg.semantic_cache_max_entries, cfg.semantic_cache_ttl_ms)
+    else
+        null;
+    // Wire the logger so OOM warnings in SemanticCache.lookup() reach the
+    // structured log rather than silently disappearing (F2).
+    if (semantic_cache) |*cache| cache.log = &log;
+    defer if (semantic_cache) |*cache| cache.deinit();
+
+    if (cfg.enable_guardrails) {
+        log.log(.info, "guardrails_enabled", null, &.{
+            .{ .key = "mode", .value = .{ .string = cfg.guardrail_mode.label() } },
+        });
+    }
+    if (cfg.enable_semantic_cache) {
+        log.log(.info, "semantic_cache_enabled", null, &.{
+            .{ .key = "ttl_ms", .value = .{ .uint = cfg.semantic_cache_ttl_ms } },
+            .{ .key = "max_entries", .value = .{ .uint = cfg.semantic_cache_max_entries } },
+            .{ .key = "tenant_header", .value = .{ .string = cfg.semantic_cache_tenant_header } },
+        });
+    }
 
     observability.markStartupReady();
 
@@ -410,6 +837,9 @@ pub fn main() !void {
             .{ .key = "mutation_rate_limit_per_minute", .value = .{ .uint = cfg.admin_mutation_rate_limit_per_minute } },
         });
     }
+    printStartupBanner(allocator, cfg, entity_count, schema_field_count) catch |err| {
+        std.debug.print("warning: failed to print startup summary: {s}\n", .{@errorName(err)});
+    };
 
     var server = proxy_server_mod.ProxyServer{
         .net_server = net_server,
@@ -436,6 +866,23 @@ pub fn main() !void {
                 .enable_credit_card = cfg.enable_credit_card,
                 .enable_ip = cfg.enable_ip,
                 .enable_healthcare = cfg.enable_healthcare,
+                .enable_iban = cfg.enable_iban,
+                .enable_uk_nino = cfg.enable_uk_nino,
+                .enable_passport = cfg.enable_passport,
+                .enable_intl_phone = cfg.enable_intl_phone,
+                .enable_dates = cfg.enable_dates,
+                .enable_addresses = cfg.enable_addresses,
+                .enable_accounts = cfg.enable_accounts,
+                .enable_licenses = cfg.enable_licenses,
+                .enable_urls = cfg.enable_urls,
+                .enable_vehicle_ids = cfg.enable_vehicle_ids,
+                .enable_fax = cfg.enable_fax,
+                .guardrail_settings = .{
+                    .enabled = cfg.enable_guardrails,
+                    .mode = cfg.guardrail_mode,
+                },
+                .semantic_cache = if (semantic_cache) |*cache| cache else null,
+                .semantic_cache_tenant_header = cfg.semantic_cache_tenant_header,
                 .schema = if (schema_instance) |*s| s else null,
                 .hasher = if (hasher_instance) |*h| h else null,
                 .shutdown_state = &shutdown_state,
@@ -445,6 +892,8 @@ pub fn main() !void {
                     .read_timeout_ms = cfg.upstream_read_timeout_ms,
                     .request_timeout_ms = cfg.upstream_request_timeout_ms,
                 },
+                .report_only = cfg.report_only,
+                .evaluation_report = if (evaluation_report) |*er| er else null,
             },
         },
         .max_connections = cfg.max_connections,
@@ -485,6 +934,23 @@ pub fn main() !void {
                     .enable_credit_card = cfg.enable_credit_card,
                     .enable_ip = cfg.enable_ip,
                     .enable_healthcare = cfg.enable_healthcare,
+                    .enable_iban = cfg.enable_iban,
+                    .enable_uk_nino = cfg.enable_uk_nino,
+                    .enable_passport = cfg.enable_passport,
+                    .enable_intl_phone = cfg.enable_intl_phone,
+                    .enable_dates = cfg.enable_dates,
+                    .enable_addresses = cfg.enable_addresses,
+                    .enable_accounts = cfg.enable_accounts,
+                    .enable_licenses = cfg.enable_licenses,
+                    .enable_urls = cfg.enable_urls,
+                    .enable_vehicle_ids = cfg.enable_vehicle_ids,
+                    .enable_fax = cfg.enable_fax,
+                    .guardrail_settings = .{
+                        .enabled = cfg.enable_guardrails,
+                        .mode = cfg.guardrail_mode,
+                    },
+                    .semantic_cache = if (semantic_cache) |*cache| cache else null,
+                    .semantic_cache_tenant_header = cfg.semantic_cache_tenant_header,
                     .schema = if (schema_instance) |*s| s else null,
                     .hasher = if (hasher_instance) |*h| h else null,
                     .shutdown_state = &shutdown_state,
@@ -494,6 +960,8 @@ pub fn main() !void {
                         .read_timeout_ms = cfg.upstream_read_timeout_ms,
                         .request_timeout_ms = cfg.upstream_request_timeout_ms,
                     },
+                    .report_only = cfg.report_only,
+                    .evaluation_report = if (evaluation_report) |*er| er else null,
                 },
             },
             .max_connections = cfg.max_connections,

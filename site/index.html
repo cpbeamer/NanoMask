@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NanoMask | Privacy Firewall for Regulated AI Traffic</title>
+    <style>
+      :root {
+        --bg: #f6f0e6;
+        --paper: rgba(255, 249, 240, 0.9);
+        --ink: #0d1b19;
+        --muted: #4a5a56;
+        --teal: #0f766e;
+        --orange: #c2410c;
+        --line: rgba(13, 27, 25, 0.10);
+        --shadow: 0 24px 60px rgba(13, 27, 25, 0.12);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 28%),
+          radial-gradient(circle at top right, rgba(194, 65, 12, 0.14), transparent 24%),
+          linear-gradient(180deg, #fff8ef 0%, var(--bg) 100%);
+      }
+
+      a { color: inherit; }
+
+      .shell {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 32px 20px 64px;
+      }
+
+      .topbar, .hero, .stats, .grid, .footer {
+        display: grid;
+        gap: 20px;
+      }
+
+      .topbar {
+        grid-template-columns: 1fr auto;
+        align-items: center;
+      }
+
+      .nav a {
+        margin-left: 18px;
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 0.95rem;
+      }
+
+      .hero {
+        grid-template-columns: 1.1fr 0.9fr;
+        align-items: center;
+        padding: 36px;
+        margin-top: 20px;
+        border: 1px solid var(--line);
+        border-radius: 32px;
+        background: var(--paper);
+        box-shadow: var(--shadow);
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: rgba(15, 118, 110, 0.10);
+        color: var(--teal);
+        font-size: 0.88rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 18px 0 12px;
+        font-size: clamp(2.6rem, 7vw, 4.8rem);
+        line-height: 0.96;
+      }
+
+      .lede {
+        color: var(--muted);
+        font-size: 1.08rem;
+        line-height: 1.7;
+        max-width: 56ch;
+      }
+
+      .cta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin-top: 26px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 48px;
+        padding: 0 18px;
+        border-radius: 999px;
+        border: 1px solid var(--ink);
+        text-decoration: none;
+        font-weight: 600;
+      }
+
+      .button.primary {
+        background: var(--ink);
+        color: #fff9f0;
+      }
+
+      .hero-card, .card {
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: rgba(255, 255, 255, 0.72);
+        box-shadow: var(--shadow);
+      }
+
+      .hero-card {
+        padding: 24px;
+      }
+
+      .stats {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin-top: 22px;
+      }
+
+      .stat {
+        padding: 22px;
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background: rgba(255, 255, 255, 0.72);
+      }
+
+      .stat strong {
+        display: block;
+        font-size: 2rem;
+        margin-bottom: 8px;
+      }
+
+      .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-top: 26px;
+      }
+
+      .card {
+        padding: 28px;
+      }
+
+      h2 {
+        margin: 0 0 14px;
+        font-size: 1.6rem;
+      }
+
+      p, li {
+        color: var(--muted);
+        line-height: 1.7;
+      }
+
+      ul {
+        margin: 14px 0 0;
+        padding-left: 18px;
+      }
+
+      .kicker {
+        margin: 0 0 10px;
+        color: var(--orange);
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.84rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .code {
+        margin-top: 16px;
+        padding: 18px;
+        border-radius: 20px;
+        background: #132623;
+        color: #e9f4ef;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.9rem;
+        overflow-x: auto;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+      }
+
+      th, td {
+        padding: 14px 0;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+        text-align: left;
+      }
+
+      th {
+        font-size: 0.86rem;
+        color: var(--orange);
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .footer {
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        margin-top: 28px;
+        padding: 22px 0 0;
+      }
+
+      .architecture {
+        width: 100%;
+        margin-top: 12px;
+        border-radius: 24px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(244, 237, 226, 0.92));
+      }
+
+      @media (max-width: 960px) {
+        .hero,
+        .stats,
+        .grid,
+        .footer,
+        .topbar {
+          grid-template-columns: 1fr;
+        }
+
+        .nav a {
+          margin: 0 14px 0 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <img src="assets/nanomask-wordmark.svg" alt="NanoMask wordmark" style="max-width: 360px; width: 100%;">
+        <nav class="nav">
+          <a href="../evaluation/README.md">Evaluation Kit</a>
+          <a href="../docs/security_packet.md">Security Packet</a>
+          <a href="../docs/commercial_offers.md">Commercial Offers</a>
+          <a href="../README.md">README</a>
+        </nav>
+      </section>
+
+      <section class="hero">
+        <div>
+          <span class="eyebrow">Regulated AI, without the compliance stall</span>
+          <h1>Self-hosted privacy control at the network edge.</h1>
+          <p class="lede">
+            NanoMask is a reverse proxy that de-identifies prompts and API payloads before they leave your environment.
+            It keeps the deployment story simple, preserves streaming and headers, and now adds guardrails plus semantic
+            caching for teams that want more than redaction alone.
+          </p>
+          <div class="cta-row">
+            <a class="button primary" href="../evaluation/README.md">Run the evaluation kit</a>
+            <a class="button" href="../sdk/README.md">Use the SDK wrappers</a>
+          </div>
+        </div>
+        <div class="hero-card">
+          <p class="kicker">Why buyers start here</p>
+          <ul>
+            <li>drop-in reverse proxy for OpenAI-compatible, Anthropic-style, Azure OpenAI-style, and generic REST traffic</li>
+            <li>single binary, self-hosted deployment for security and platform teams that do not want another heavy runtime stack</li>
+            <li>report-only mode, structured audit output, and starter packs for healthcare and claims evaluations</li>
+            <li>optional guardrails, international PII coverage, and tenant-aware semantic caching</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="stats">
+        <article class="stat">
+          <strong>16+ GB/s</strong>
+          <span>SSN redaction proof point in ReleaseFast</span>
+        </article>
+        <article class="stat">
+          <strong>5/5</strong>
+          <span>compatibility reference flows passing</span>
+        </article>
+        <article class="stat">
+          <strong>&lt; 5 lines</strong>
+          <span>to switch official SDK clients through NanoMask</span>
+        </article>
+        <article class="stat">
+          <strong>0 runtime deps</strong>
+          <span>single static Zig binary deployment story</span>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <p class="kicker">Architecture</p>
+          <h2>Fits where regulated traffic already flows</h2>
+          <p>NanoMask sits between the app and the model/API vendor. Privacy policy, audit, and optional AI controls stay centralized without asking every application team to rewrite their client behavior.</p>
+          <svg class="architecture" viewBox="0 0 760 320" role="img" aria-label="NanoMask architecture">
+            <rect x="38" y="104" width="170" height="108" rx="24" fill="#FFF9F0" stroke="rgba(13,27,25,0.14)"/>
+            <rect x="294" y="76" width="176" height="164" rx="28" fill="#0D1B19"/>
+            <rect x="550" y="104" width="170" height="108" rx="24" fill="#FFF9F0" stroke="rgba(13,27,25,0.14)"/>
+            <rect x="312" y="32" width="140" height="34" rx="17" fill="#C2410C" opacity="0.12"/>
+            <rect x="312" y="254" width="140" height="34" rx="17" fill="#0F766E" opacity="0.14"/>
+            <text x="73" y="156" fill="#0D1B19" font-family="Space Grotesk, sans-serif" font-size="26" font-weight="700">App / Service</text>
+            <text x="334" y="126" fill="#FFF9F0" font-family="Space Grotesk, sans-serif" font-size="28" font-weight="700">NanoMask</text>
+            <text x="334" y="162" fill="#D8F3EE" font-family="IBM Plex Mono, monospace" font-size="18">redaction</text>
+            <text x="334" y="188" fill="#D8F3EE" font-family="IBM Plex Mono, monospace" font-size="18">guardrails</text>
+            <text x="334" y="214" fill="#D8F3EE" font-family="IBM Plex Mono, monospace" font-size="18">semantic cache</text>
+            <text x="580" y="156" fill="#0D1B19" font-family="Space Grotesk, sans-serif" font-size="26" font-weight="700">LLM / API</text>
+            <text x="325" y="55" fill="#8A2D08" font-family="IBM Plex Mono, monospace" font-size="16">policy + schema</text>
+            <text x="323" y="277" fill="#0B5F59" font-family="IBM Plex Mono, monospace" font-size="16">audit + metrics</text>
+            <path d="M208 158H274" stroke="#0D1B19" stroke-width="4" stroke-linecap="round"/>
+            <path d="M470 158H538" stroke="#0D1B19" stroke-width="4" stroke-linecap="round"/>
+            <path d="M254 146L274 158L254 170" fill="none" stroke="#0D1B19" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M518 146L538 158L518 170" fill="none" stroke="#0D1B19" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </article>
+
+        <article class="card">
+          <p class="kicker">Quick Start</p>
+          <h2>Switch an OpenAI client in minutes</h2>
+          <p>Use the official SDK, but aim it at NanoMask instead of the vendor endpoint.</p>
+          <div class="code">pip install ./sdk/python
+
+from nanomask import OpenAI
+
+client = OpenAI(api_key="replace-me", entities=["Jane Doe"])
+response = client.responses.create(model="gpt-4o-mini", input="Summarize Jane Doe's chart.")</div>
+          <p>Node teams get the same shape through `@nanomask/openai`, and CI can call `verify()` before running integration tests.</p>
+        </article>
+
+        <article class="card">
+          <p class="kicker">Positioning</p>
+          <h2>NanoMask vs Presidio vs Private AI</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Product</th>
+                <th>Best fit</th>
+                <th>Tradeoff</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>NanoMask</td>
+                <td>Teams that want a self-hosted reverse proxy, low operational weight, and strong control over outbound AI traffic.</td>
+                <td>Buyer must already be comfortable with proxy insertion instead of in-app libraries everywhere.</td>
+              </tr>
+              <tr>
+                <td>Presidio</td>
+                <td>Python-heavy teams building custom detection pipelines into their own services.</td>
+                <td>More assembly required when buyers want a drop-in network boundary rather than a library toolkit.</td>
+              </tr>
+              <tr>
+                <td>Private AI</td>
+                <td>Buyers looking for turnkey detection products and broader managed packaging.</td>
+                <td>Heavier vendor-shaped product surface than teams that only want a fast self-hosted privacy firewall.</td>
+              </tr>
+            </tbody>
+          </table>
+        </article>
+
+        <article class="card">
+          <p class="kicker">Pilot Package</p>
+          <h2>Structured evaluation, not founder heroics</h2>
+          <ul>
+            <li>healthcare starter data, schemas, and deployment templates already checked into the repo</li>
+            <li>report-only workflow to baseline coverage before enforcement</li>
+            <li>compatibility summary, benchmark card, and security packet for security review</li>
+            <li>clear success criteria and commercial expansion triggers</li>
+          </ul>
+          <div class="cta-row" style="margin-top: 20px;">
+            <a class="button primary" href="../evaluation/pilot-runbook.md">Open pilot runbook</a>
+            <a class="button" href="../docs/commercial_offers.md">View offer ladder</a>
+          </div>
+        </article>
+      </section>
+
+      <footer class="footer">
+        <p>Phase 5 package: SDK wrappers, guardrails, international PII, semantic caching, evaluation kit, and commercial packaging.</p>
+        <img src="assets/nanomask-mark.svg" alt="NanoMask mark" width="72" height="72">
+      </footer>
+    </main>
+  </body>
+</html>

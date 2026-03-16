@@ -10,6 +10,10 @@ const scanner = @import("../patterns/scanner.zig");
 const schema_mod = @import("../schema/schema.zig");
 const json_redactor = @import("../schema/json_redactor.zig");
 const hasher_mod = @import("../schema/hasher.zig");
+const evaluation_report_mod = @import("evaluation_report.zig");
+const EvaluationReport = evaluation_report_mod.EvaluationReport;
+const PayloadType = evaluation_report_mod.PayloadType;
+const context_rules = @import("../context/rules.zig");
 
 pub const max_events_per_request: usize = 256;
 
@@ -17,7 +21,10 @@ pub const TextStageConfig = struct {
     entity_mask: bool = false,
     ssn: bool = false,
     patterns: bool = false,
+    pattern_flags: scanner.PatternFlags = .{},
     fuzzy: bool = false,
+    context_rules: bool = false,
+    context_confidence_threshold: f32 = 0.70,
 };
 
 pub const AuditEmitter = struct {
@@ -27,12 +34,31 @@ pub const AuditEmitter = struct {
     emitted: usize = 0,
     dropped: usize = 0,
     limit: usize = max_events_per_request,
+    evaluation_report: ?*EvaluationReport = null,
+    payload_type: PayloadType = .text,
 
     pub fn init(log: *Logger, session_id: []const u8, observability: ?*Observability) AuditEmitter {
         return .{
             .log = log,
             .session_id = session_id,
             .observability = observability,
+        };
+    }
+
+    /// Initialize with an evaluation report for report-only mode match tracking.
+    pub fn initWithReport(
+        log: *Logger,
+        session_id: []const u8,
+        observability: ?*Observability,
+        eval_report: ?*EvaluationReport,
+        payload_type: PayloadType,
+    ) AuditEmitter {
+        return .{
+            .log = log,
+            .session_id = session_id,
+            .observability = observability,
+            .evaluation_report = eval_report,
+            .payload_type = payload_type,
         };
     }
 
@@ -50,10 +76,32 @@ pub const AuditEmitter = struct {
             else if (std.mem.eql(u8, event.stage, "schema"))
                 // schema_keep actions are informational — don't count as redaction matches
                 if (std.mem.eql(u8, event.match_type, "schema_keep")) null else observability_mod.MatchStage.schema
+            else if (std.mem.eql(u8, event.stage, "context"))
+                .context
             else
                 null;
-
             if (stage) |s| obs.recordAuditStage(s);
+        }
+
+        // Feed evaluation report when in report-only mode
+        if (self.evaluation_report) |eval_report| {
+            const eval_stage: ?evaluation_report_mod.MatchStage = if (std.mem.eql(u8, event.stage, "entity_mask"))
+                .entity_mask
+            else if (std.mem.eql(u8, event.stage, "ssn"))
+                .ssn
+            else if (std.mem.eql(u8, event.stage, "pattern_library"))
+                .pattern_library
+            else if (std.mem.eql(u8, event.stage, "fuzzy_match"))
+                .fuzzy_match
+            else if (std.mem.eql(u8, event.stage, "schema"))
+                if (!std.mem.eql(u8, event.match_type, "schema_keep")) @as(?evaluation_report_mod.MatchStage, .schema) else null
+            else if (std.mem.eql(u8, event.stage, "context"))
+                .context
+            else
+                null;
+            if (eval_stage) |es| {
+                eval_report.recordMatch(es, self.payload_type, event.confidence);
+            }
         }
 
         if (!self.log.audit_enabled) return;
@@ -86,7 +134,7 @@ pub fn emitRequestAuditEvents(
     body: []const u8,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
+    cfg: TextStageConfig,
     schema: ?*const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     observability: ?*Observability,
@@ -103,7 +151,7 @@ pub fn emitRequestAuditEvents(
             body,
             entity_map,
             fuzzy_matcher,
-            pattern_flags,
+            cfg,
             active_schema,
             hasher,
             &emitter,
@@ -112,15 +160,57 @@ pub fn emitRequestAuditEvents(
         const redacted = try runTextStages(
             body,
             null,
-            .{
-                .entity_mask = true,
-                .ssn = true,
-                .patterns = true,
-                .fuzzy = true,
-            },
+            cfg,
             entity_map,
             fuzzy_matcher,
-            pattern_flags,
+            &emitter,
+            allocator,
+        );
+        allocator.free(redacted);
+    }
+}
+
+/// Like emitRequestAuditEvents but wires the evaluation report into the emitter
+/// so match events flow into the EvaluationReport. Used by the report-only proxy path.
+pub fn emitRequestAuditEventsWithReport(
+    allocator: std.mem.Allocator,
+    log: *Logger,
+    session_id: []const u8,
+    body: []const u8,
+    entity_map: ?*const entity_mask.EntityMap,
+    fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
+    cfg: TextStageConfig,
+    schema: ?*const schema_mod.Schema,
+    hasher: ?*hasher_mod.Hasher,
+    observability: ?*Observability,
+    eval_report: ?*EvaluationReport,
+) !void {
+    if (body.len == 0) return;
+
+    // Determine payload type from content: JSON if schema-aware path is active
+    const payload_type: PayloadType = if (schema != null) .json else .text;
+
+    var emitter = AuditEmitter.initWithReport(log, session_id, observability, eval_report, payload_type);
+    defer emitter.finish();
+
+    if (schema) |active_schema| {
+        try emitSchemaAuditEvents(
+            allocator,
+            body,
+            entity_map,
+            fuzzy_matcher,
+            cfg,
+            active_schema,
+            hasher,
+            &emitter,
+        );
+    } else {
+        const redacted = try runTextStages(
+            body,
+            null,
+            cfg,
+            entity_map,
+            fuzzy_matcher,
             &emitter,
             allocator,
         );
@@ -140,7 +230,7 @@ fn emitSchemaAuditEvents(
     body: []const u8,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
+    cfg: TextStageConfig,
     schema: *const schema_mod.Schema,
     hasher: ?*hasher_mod.Hasher,
     emitter: *AuditEmitter,
@@ -151,7 +241,6 @@ fn emitSchemaAuditEvents(
         .{ .entity_mask = true },
         entity_map,
         fuzzy_matcher,
-        pattern_flags,
         emitter,
         allocator,
     );
@@ -173,7 +262,7 @@ fn emitSchemaAuditEvents(
         emitter: *AuditEmitter,
         entity_map: ?*const entity_mask.EntityMap,
         fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-        pattern_flags: scanner.PatternFlags,
+        cfg: TextStageConfig,
 
         fn onSchemaAction(event: json_redactor.AuditEvent, ctx_ptr: *anyopaque) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ctx_ptr));
@@ -193,17 +282,14 @@ fn emitSchemaAuditEvents(
 
         fn scanField(input: []const u8, field_path: []const u8, ctx_ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
             const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+            var scan_cfg = self.cfg;
+            scan_cfg.entity_mask = false; // Entity mask already ran before schema traversal
             return runTextStages(
                 input,
                 field_path,
-                .{
-                    .ssn = true,
-                    .patterns = true,
-                    .fuzzy = true,
-                },
+                scan_cfg,
                 self.entity_map,
                 self.fuzzy_matcher,
-                self.pattern_flags,
                 self.emitter,
                 alloc,
             );
@@ -214,7 +300,7 @@ fn emitSchemaAuditEvents(
         .emitter = emitter,
         .entity_map = entity_map,
         .fuzzy_matcher = fuzzy_matcher,
-        .pattern_flags = pattern_flags,
+        .cfg = cfg,
     };
 
     const scan_ctx = json_redactor.ScanContext{
@@ -272,7 +358,6 @@ pub fn runTextStages(
     cfg: TextStageConfig,
     entity_map: ?*const entity_mask.EntityMap,
     fuzzy_matcher: ?*const fuzzy_match.FuzzyMatcher,
-    pattern_flags: scanner.PatternFlags,
     emitter: *AuditEmitter,
     allocator: std.mem.Allocator,
 ) ![]u8 {
@@ -323,8 +408,8 @@ pub fn runTextStages(
         redact.redactSsn(current);
     }
 
-    if (cfg.patterns and pattern_flags.anyEnabled()) {
-        const result = try scanner.redactWithMatches(current, pattern_flags, allocator);
+    if (cfg.patterns and cfg.pattern_flags.anyEnabled()) {
+        const result = try scanner.redactWithMatches(current, cfg.pattern_flags, allocator);
         defer allocator.free(result.matches);
 
         for (result.matches) |match| {
@@ -368,6 +453,27 @@ pub fn runTextStages(
         }
     }
 
+    if (cfg.context_rules) {
+        const result = try context_rules.redactContext(current, cfg.context_confidence_threshold, allocator);
+        defer allocator.free(result.matches);
+
+        for (result.matches) |match| {
+            emitTextEvent(
+                emitter,
+                "context",
+                "context_rule",
+                field_path,
+                match.redact_start,
+                match.end - match.redact_start,
+                match.replacement,
+                match.confidence,
+            );
+        }
+
+        allocator.free(current);
+        current = result.output;
+    }
+
     return current;
 }
 
@@ -401,6 +507,10 @@ const pattern_type_map = std.StaticStringMap([]const u8).initComptime(.{
     .{ "[MRN_REDACTED]", "mrn" },
     .{ "[ICD10_REDACTED]", "icd10" },
     .{ "[INSURANCE_REDACTED]", "insurance" },
+    .{ "[IBAN_REDACTED]", "iban" },
+    .{ "[UK_NINO_REDACTED]", "uk_nino" },
+    .{ "[PASSPORT_REDACTED]", "passport" },
+    .{ "[INTL_PHONE_REDACTED]", "intl_phone" },
 });
 
 fn patternMatchType(replacement: []const u8) []const u8 {

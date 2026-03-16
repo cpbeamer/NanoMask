@@ -1,0 +1,110 @@
+[
+  {
+    "id": 1,
+    "description": "Names",
+    "coverage_method": "Supported via Aho-Corasick exact matching (--entities-file) and Fuzzy Match (--fuzzy-entities).",
+    "compensating_control": "AI Guardrails (phi_strict) provides heuristic NER."
+  },
+  {
+    "id": 2,
+    "description": "Geographic data smaller than State",
+    "coverage_method": "Supported via --enable-addresses. Removes street, city, county. Validates and zero-outs restricted population ZIP-3s. Masks normal ZIPs to 3 digits.",
+    "compensating_control": "Manual verification of custom entities-file for highly-specific local zones."
+  },
+  {
+    "id": 3,
+    "description": "Dates related to an individual",
+    "coverage_method": "Supported via --enable-dates. Replaces dates with [DATE_REDACTED] and aggregates ages over 89 to 90+.",
+    "compensating_control": "Context-hinting ensures valid clinical dates with 'DOB', 'admitted', etc. are strictly caught."
+  },
+  {
+    "id": 4,
+    "description": "Phone numbers",
+    "coverage_method": "Supported via --enable-phone. Validates US numbers against area/exchange codes.",
+    "compensating_control": ""
+  },
+  {
+    "id": 5,
+    "description": "Fax numbers",
+    "coverage_method": "Supported via --enable-phone combining phone formats and context heuristics (Fax: ).",
+    "compensating_control": ""
+  },
+  {
+    "id": 6,
+    "description": "Email addresses",
+    "coverage_method": "Supported via --enable-email. Validates local-part and TLD length.",
+    "compensating_control": ""
+  },
+  {
+    "id": 7,
+    "description": "Social Security Numbers",
+    "coverage_method": "Supported universally. SIMD-accelerated detection.",
+    "compensating_control": ""
+  },
+  {
+    "id": 8,
+    "description": "Medical record numbers (MRN)",
+    "coverage_method": "Supported via --enable-healthcare. Uses clinical context hints.",
+    "compensating_control": ""
+  },
+  {
+    "id": 9,
+    "description": "Health plan beneficiary numbers",
+    "coverage_method": "Supported via --enable-healthcare. Uses clinical context hints.",
+    "compensating_control": ""
+  },
+  {
+    "id": 10,
+    "description": "Account numbers",
+    "coverage_method": "Supported via --enable-accounts. Identifies routing and account numbers by context.",
+    "compensating_control": ""
+  },
+  {
+    "id": 11,
+    "description": "Certificate/license numbers",
+    "coverage_method": "Supported via --enable-licenses. Validates DEA (algorithm), NPI (Luhn), and DLs by context.",
+    "compensating_control": ""
+  },
+  {
+    "id": 12,
+    "description": "Vehicle IDs & serial numbers",
+    "coverage_method": "Supported via --enable-vehicle-ids. VINs validated via modulo-11 check digit.",
+    "compensating_control": "Basic License Plate heuristics included."
+  },
+  {
+    "id": 13,
+    "description": "Device identifiers & serial numbers",
+    "coverage_method": "Not fully heuristic. Relies on exact-match entity loading due to arbitrary formats (e.g. MAC, UUID).",
+    "compensating_control": ""
+  },
+  {
+    "id": 14,
+    "description": "Web Universal Resource Locators (URLs)",
+    "coverage_method": "Supported via --enable-urls. Matches HTTP/HTTPS and WWW prefixes.",
+    "compensating_control": ""
+  },
+  {
+    "id": 15,
+    "description": "IP address numbers",
+    "coverage_method": "Supported via --enable-ip. Handles IPv4 (with CIDR overrides) and IPv6.",
+    "compensating_control": ""
+  },
+  {
+    "id": 16,
+    "description": "Biometric identifiers",
+    "coverage_method": "Not processed (NanoMask is text-only).",
+    "compensating_control": ""
+  },
+  {
+    "id": 17,
+    "description": "Full face photos",
+    "coverage_method": "Not processed (NanoMask is text-only).",
+    "compensating_control": ""
+  },
+  {
+    "id": 18,
+    "description": "Any other unique identifying number",
+    "coverage_method": "Handled via custom entity loading and semantic caching schema capabilities.",
+    "compensating_control": "Fallback: Proxy schemas enforce REMOVE on arbitrary tracking fields."
+  }
+]

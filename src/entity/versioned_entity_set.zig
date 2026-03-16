@@ -1,6 +1,7 @@
 const std = @import("std");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
+const config = @import("../infra/config.zig");
 
 // ---------------------------------------------------------------------------
 // Versioned Entity Set — RCU (Read-Copy-Update) for hot-reload
@@ -50,27 +51,37 @@ pub const EntitySnapshot = struct {
     }
 };
 
-/// Manages atomic swap between entity snapshots using the RCU pattern.
-/// Readers call `acquire()` to get a snapshot pointer (lock-free, no mutex).
-/// Writers call `swap()` to atomically install a new snapshot.
+/// Manages safe swap between entity snapshots.
+/// Readers call `acquire()` to get a ref-counted snapshot pointer.
+/// Writers call `swap()` to install a new snapshot.
+///
+/// A RwLock eliminates the TOCTOU race between loading the pointer and
+/// incrementing the ref count. Multiple readers proceed concurrently;
+/// a swap blocks briefly until all active acquires have incremented their
+/// ref counts, then releases. Entity reloads are rare, so the lock is
+/// almost never contended.
 pub const VersionedEntitySet = struct {
-    current: std.atomic.Value(?*EntitySnapshot),
+    current: ?*EntitySnapshot,
     version: std.atomic.Value(u32),
     allocator: std.mem.Allocator,
+    lock: std.Thread.RwLock = .{},
 
     pub fn init(initial_snapshot: *EntitySnapshot) VersionedEntitySet {
         return .{
-            .current = std.atomic.Value(?*EntitySnapshot).init(initial_snapshot),
+            .current = initial_snapshot,
             .version = std.atomic.Value(u32).init(initial_snapshot.version),
             .allocator = initial_snapshot.allocator,
         };
     }
 
     /// Acquire the current snapshot for use during a request.
-    /// Increments ref_count atomically — no mutex, no contention.
+    /// Increments ref_count while holding a shared read lock, eliminating
+    /// the TOCTOU window that existed between the pointer load and increment.
     /// Caller MUST call `release()` when done.
     pub fn acquire(self: *VersionedEntitySet) *EntitySnapshot {
-        const snapshot = self.current.load(.acquire).?;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const snapshot = self.current.?;
         snapshot.acquire();
         return snapshot;
     }
@@ -82,14 +93,19 @@ pub const VersionedEntitySet = struct {
         _ = snapshot.release();
     }
 
-    /// Atomically swap the current snapshot with `new_snapshot`.
-    /// The old snapshot's ref_count is decremented (for the "set owns it" ref).
-    /// If no requests are using the old snapshot, it's freed immediately.
-    /// Otherwise it's freed when the last request releases it.
+    /// Install `new_snapshot` as the current snapshot.
+    /// Holds an exclusive write lock so no acquire() can race the pointer
+    /// swap and ref-count release of the old snapshot.
     pub fn swap(self: *VersionedEntitySet, new_snapshot: *EntitySnapshot) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         self.version.store(new_snapshot.version, .release);
-        const old = self.current.swap(new_snapshot, .acq_rel);
-        // Release the set's own reference to the old snapshot
+        const old = self.current;
+        self.current = new_snapshot;
+        // Release the set's own reference to the old snapshot.
+        // Safe: no reader can hold the old pointer without having already
+        // incremented its ref count, because acquire() holds the shared lock
+        // for the duration of load+increment.
         if (old) |old_snap| {
             _ = old_snap.release();
         }
@@ -104,8 +120,10 @@ pub const VersionedEntitySet = struct {
 
     /// Clean up: release the set's reference to the current snapshot.
     pub fn deinit(self: *VersionedEntitySet) void {
-        const snap = self.current.swap(null, .acq_rel);
-        if (snap) |s| {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.current) |s| {
+            self.current = null;
             _ = s.release();
         }
     }
@@ -125,7 +143,9 @@ const max_entity_name_len = 256;
 pub fn loadSnapshotFromFile(
     path: []const u8,
     fuzzy_threshold: f32,
+    entity_format: config.EntityFormat,
     version: u32,
+    logger: anytype,
     allocator: std.mem.Allocator,
 ) !*EntitySnapshot {
     var file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -140,18 +160,55 @@ pub fn loadSnapshotFromFile(
     var names_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names_list.deinit(allocator);
 
+    var group_ids: std.ArrayListUnmanaged(usize) = .empty;
+    defer group_ids.deinit(allocator);
+
+    var current_group_id: usize = 0;
+    var in_structured_entity = false;
+
     var line_it = std.mem.splitScalar(u8, content, '\n');
     while (line_it.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r"), " \t\r");
+        const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r\xEF\xBB\xBF"), " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        if (trimmed.len > max_entity_name_len) {
-            std.debug.print("[WARN] Skipping entity name exceeding {d} bytes ({d} bytes)\n", .{
+
+        var entity_value: []const u8 = trimmed;
+        if (entity_format == .structured) {
+            if (trimmed.len >= 1 and trimmed[0] == '[') {
+                if (in_structured_entity) {
+                    current_group_id += 1; // Move to next entity alias block
+                }
+                in_structured_entity = true;
+                continue; // [entity] header line
+            }
+
+            // Very basic INI/key-value parser: look for first '='
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_idx| {
+                const val = std.mem.trim(u8, trimmed[eq_idx + 1 ..], " \t\r");
+                if (val.len > 0) {
+                    entity_value = val;
+                } else {
+                    continue; // Skip keys with empty values
+                }
+            } else {
+                continue; // Skip lines without '=' in structured mode
+            }
+        }
+
+        if (entity_value.len > max_entity_name_len) {
+            std.debug.print("[WARN] Skipping entity value exceeding {d} bytes ({d} bytes)\n", .{
                 max_entity_name_len,
-                trimmed.len,
+                entity_value.len,
             });
             continue;
         }
-        try names_list.append(allocator, try allocator.dupe(u8, trimmed));
+
+        try names_list.append(allocator, try allocator.dupe(u8, entity_value));
+        try group_ids.append(allocator, current_group_id);
+
+        if (entity_format == .names) {
+            // Names format: each line is a new group
+            current_group_id += 1;
+        }
     }
 
     const loaded_names = try names_list.toOwnedSlice(allocator);
@@ -160,8 +217,19 @@ pub fn loadSnapshotFromFile(
         allocator.free(loaded_names);
     }
 
-    var em = try entity_mask.EntityMap.init(allocator, loaded_names);
+    const loaded_group_ids = try group_ids.toOwnedSlice(allocator);
+    defer allocator.free(loaded_group_ids);
+
+    var timer = std.time.Timer.start() catch unreachable;
+
+    var em = try entity_mask.EntityMap.initGrouped(allocator, loaded_names, loaded_group_ids);
     errdefer em.deinit();
+
+    // Calculate approximate memory used by the automatons
+    const node_size = @sizeOf(entity_mask.AhoCorasick.Node);
+    const automaton_memory_bytes =
+        (em.forward_ac.nodes.capacity * node_size) +
+        (em.reverse_ac.nodes.capacity * node_size);
 
     var fm = try fuzzy_match.FuzzyMatcher.init(
         allocator,
@@ -170,6 +238,18 @@ pub fn loadSnapshotFromFile(
         fuzzy_threshold,
     );
     errdefer fm.deinit();
+
+    const build_time_ms = timer.read() / std.time.ns_per_ms;
+
+    if (logger != null) {
+        logger.?.log(.info, "automaton_built", null, &.{
+            .{ .key = "entity_set_size", .value = .{ .uint = loaded_names.len } },
+            .{ .key = "automaton_build_time_ms", .value = .{ .uint = build_time_ms } },
+            .{ .key = "automaton_memory_bytes", .value = .{ .uint = automaton_memory_bytes } },
+            .{ .key = "source", .value = .{ .string = path } },
+            .{ .key = "version", .value = .{ .uint = version } },
+        });
+    }
 
     const snapshot = try allocator.create(EntitySnapshot);
     snapshot.* = .{
@@ -191,6 +271,7 @@ pub fn loadSnapshotFromNames(
     names: []const []const u8,
     fuzzy_threshold: f32,
     version: u32,
+    logger: anytype,
     allocator: std.mem.Allocator,
 ) !*EntitySnapshot {
     // Dupe all names so the snapshot owns its data
@@ -206,8 +287,16 @@ pub fn loadSnapshotFromNames(
         initialized = i + 1;
     }
 
+    var timer = std.time.Timer.start() catch unreachable;
+
     var em = try entity_mask.EntityMap.init(allocator, loaded_names);
     errdefer em.deinit();
+
+    // Calculate approximate memory used by the automatons
+    const node_size = @sizeOf(entity_mask.AhoCorasick.Node);
+    const automaton_memory_bytes =
+        (em.forward_ac.nodes.capacity * node_size) +
+        (em.reverse_ac.nodes.capacity * node_size);
 
     var fm = try fuzzy_match.FuzzyMatcher.init(
         allocator,
@@ -216,6 +305,18 @@ pub fn loadSnapshotFromNames(
         fuzzy_threshold,
     );
     errdefer fm.deinit();
+
+    const build_time_ms = timer.read() / std.time.ns_per_ms;
+
+    if (logger != null) {
+        logger.?.log(.info, "automaton_built", null, &.{
+            .{ .key = "entity_set_size", .value = .{ .uint = loaded_names.len } },
+            .{ .key = "automaton_build_time_ms", .value = .{ .uint = build_time_ms } },
+            .{ .key = "automaton_memory_bytes", .value = .{ .uint = automaton_memory_bytes } },
+            .{ .key = "source", .value = .{ .string = "memory" } },
+            .{ .key = "version", .value = .{ .uint = version } },
+        });
+    }
 
     const snapshot = try allocator.create(EntitySnapshot);
     snapshot.* = .{
@@ -240,7 +341,9 @@ test "EntitySnapshot - acquire and release" {
     const snapshot = try loadSnapshotFromFile(
         "entities.txt",
         0.80,
+        .names,
         1,
+        null,
         allocator,
     );
     // snapshot starts with ref_count = 1
@@ -260,7 +363,7 @@ test "EntitySnapshot - acquire and release" {
 test "VersionedEntitySet - acquire returns current snapshot" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snapshot);
     defer set.deinit();
 
@@ -273,11 +376,11 @@ test "VersionedEntitySet - acquire returns current snapshot" {
 test "VersionedEntitySet - swap installs new version" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
-    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, allocator);
+    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 2, null, allocator);
     set.swap(snap2);
 
     const acquired = set.acquire();
@@ -289,13 +392,13 @@ test "VersionedEntitySet - swap installs new version" {
 test "VersionedEntitySet - version monotonicity across multiple swaps" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
     var last_version: u32 = 1;
     for (2..6) |v| {
-        const new_snap = try loadSnapshotFromFile("entities.txt", 0.80, @intCast(v), allocator);
+        const new_snap = try loadSnapshotFromFile("entities.txt", 0.80, .names, @intCast(v), null, allocator);
         set.swap(new_snap);
 
         const acquired = set.acquire();
@@ -310,7 +413,7 @@ test "VersionedEntitySet - version monotonicity across multiple swaps" {
 test "VersionedEntitySet - old snapshot survives while referenced" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
@@ -318,7 +421,7 @@ test "VersionedEntitySet - old snapshot survives while referenced" {
     const held = set.acquire();
 
     // Swap to a new version — snap1 should NOT be freed (held still references it)
-    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, allocator);
+    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 2, null, allocator);
     set.swap(snap2);
 
     // The held snapshot should still be valid and usable
@@ -335,7 +438,7 @@ test "VersionedEntitySet - old snapshot survives while referenced" {
 test "loadSnapshotFromFile - loads entities correctly" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     defer _ = snapshot.release();
 
     // entities.txt has: Jane Smith, John Doe, Dr. Johnson, another name
@@ -348,16 +451,31 @@ test "loadSnapshotFromFile - loads entities correctly" {
     try std.testing.expect(!std.mem.eql(u8, "Jane Smith visited Dr. Johnson", masked));
 }
 
+test "loadSnapshotFromFile - loads structured entities correctly" {
+    const allocator = std.testing.allocator;
+
+    const snapshot = try loadSnapshotFromFile("test_structured.nmentity", 0.80, .structured, 1, null, allocator);
+    defer _ = snapshot.release();
+
+    // test_structured.nmentity has 2 entities, each with 2 fields = 4 total loaded names
+    try std.testing.expectEqual(@as(usize, 4), snapshot.loaded_names.len);
+
+    const masked = try snapshot.entity_map.mask("John Doe DOB is 1985-03-15 and Jane Smith SSN is 123-45-6789", allocator);
+    defer allocator.free(masked);
+    // Entity 1 is John Doe group, Entity 2 is Jane Smith group
+    try std.testing.expectEqualStrings("Entity_1 DOB is Entity_1 and Entity_2 SSN is Entity_2", masked);
+}
+
 test "loadSnapshotFromFile - nonexistent file returns error" {
     const allocator = std.testing.allocator;
-    const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, 1, allocator);
+    const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, .names, 1, null, allocator);
     try std.testing.expectError(error.FileNotFound, result);
 }
 
 test "loadSnapshotFromNames - builds valid snapshot" {
     const allocator = std.testing.allocator;
     const names = [_][]const u8{ "Alice", "Bob", "Charlie" };
-    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, null, allocator);
     defer _ = snapshot.release();
 
     try std.testing.expectEqual(@as(usize, 3), snapshot.loaded_names.len);
@@ -365,13 +483,13 @@ test "loadSnapshotFromNames - builds valid snapshot" {
 
     const masked = try snapshot.entity_map.mask("Alice met Bob", allocator);
     defer allocator.free(masked);
-    try std.testing.expectEqualStrings("Entity_A met Entity_B", masked);
+    try std.testing.expectEqualStrings("Entity_1 met Entity_2", masked);
 }
 
 test "loadSnapshotFromNames - empty list produces valid snapshot" {
     const allocator = std.testing.allocator;
     const names = [_][]const u8{};
-    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, allocator);
+    const snapshot = try loadSnapshotFromNames(&names, 0.80, 1, null, allocator);
     defer _ = snapshot.release();
 
     try std.testing.expectEqual(@as(usize, 0), snapshot.loaded_names.len);

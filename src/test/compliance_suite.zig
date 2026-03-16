@@ -212,9 +212,9 @@ test "e2e compliance - schema HASH round-trip" {
     var schema_instance = try schema_mod.Schema.parseContent(schema_content, allocator);
     defer schema_instance.deinit();
 
-    // Create a hasher with a valid 64-char hex key for determinism
     const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    var hasher_instance = try hasher_mod.Hasher.init(key_hex, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    var hasher_instance = try hasher_mod.Hasher.init(key_hex, mem_vault.vaultInterface(), allocator);
     defer hasher_instance.deinit();
 
     const body =
@@ -282,7 +282,8 @@ test "e2e compliance - large schema payload streams without full request bufferi
     defer schema_instance.deinit();
 
     const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    var hasher_instance = try hasher_mod.Hasher.init(key_hex, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    var hasher_instance = try hasher_mod.Hasher.init(key_hex, mem_vault.vaultInterface(), allocator);
     defer hasher_instance.deinit();
 
     var result = try harness.roundTrip(allocator, payload.items, .{
@@ -351,7 +352,8 @@ test "e2e compliance - audit log emits schema events without leaking values" {
     defer schema_instance.deinit();
 
     const key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    var hasher_instance = try hasher_mod.Hasher.init(key_hex, allocator);
+    const mem_vault = try @import("../vault/memory_vault.zig").MemoryVault.init(allocator);
+    var hasher_instance = try hasher_mod.Hasher.init(key_hex, mem_vault.vaultInterface(), allocator);
     defer hasher_instance.deinit();
 
     var result = try harness.roundTrip(allocator,
@@ -414,7 +416,7 @@ test "e2e compliance - unsupported response rejected when configured" {
 
     var result = try harness.roundTrip(allocator, "{\"patient\":\"Jane Smith\"}", .{
         .entity_names = &names,
-        .upstream_response = "<patient>Entity_A</patient>",
+        .upstream_response = "<patient>Entity_1</patient>",
         .upstream_content_type = "application/xml",
         .unsupported_response_body_behavior = body_policy.UnsupportedBodyBehavior.reject,
     });

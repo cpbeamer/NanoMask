@@ -1,4 +1,5 @@
 const std = @import("std");
+const guardrails_mod = @import("../ai/guardrails.zig");
 const logger_mod = @import("logger.zig");
 const Logger = logger_mod.Logger;
 
@@ -18,6 +19,7 @@ pub const MatchStage = enum(u8) {
     pattern_library,
     fuzzy_match,
     schema,
+    context,
 };
 
 const histogram_bounds_us = [_]u64{
@@ -38,6 +40,8 @@ const histogram_bounds_us = [_]u64{
 const route_count = std.meta.fields(Route).len;
 const stage_count = std.meta.fields(MatchStage).len;
 const latency_bucket_count = histogram_bounds_us.len + 1;
+const guardrail_category_count = std.meta.fields(guardrails_mod.Category).len;
+const guardrail_action_count = 2;
 
 fn initAtomicArray(comptime N: usize) [N]AtomicU64 {
     var values: [N]AtomicU64 = undefined;
@@ -73,6 +77,7 @@ fn stageLabel(stage: MatchStage) []const u8 {
         .pattern_library => "pattern_library",
         .fuzzy_match => "fuzzy_match",
         .schema => "schema",
+        .context => "context",
     };
 }
 
@@ -129,8 +134,16 @@ pub const Observability = struct {
     request_bytes_total: AtomicU64 = AtomicU64.init(0),
     response_bytes_total: AtomicU64 = AtomicU64.init(0),
     redaction_stage_counts: [stage_count]AtomicU64 = initAtomicArray(stage_count),
+    guardrail_counts: [guardrail_category_count][guardrail_action_count]AtomicU64 = initAtomicMatrix(guardrail_category_count, guardrail_action_count),
     entity_reload_success_total: AtomicU64 = AtomicU64.init(0),
     entity_reload_failure_total: AtomicU64 = AtomicU64.init(0),
+    semantic_cache_hits_total: AtomicU64 = AtomicU64.init(0),
+    semantic_cache_misses_total: AtomicU64 = AtomicU64.init(0),
+    semantic_cache_evictions_total: AtomicU64 = AtomicU64.init(0),
+    semantic_cache_entries: AtomicU64 = AtomicU64.init(0),
+    vault_store_total: AtomicU64 = AtomicU64.init(0),
+    vault_lookup_hits_total: AtomicU64 = AtomicU64.init(0),
+    vault_lookup_misses_total: AtomicU64 = AtomicU64.init(0),
     startup_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     entity_reload_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     shutdown_draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -209,6 +222,37 @@ pub const Observability = struct {
     /// events that should not be counted (e.g. schema_keep).
     pub fn recordAuditStage(self: *Observability, stage: MatchStage) void {
         _ = self.redaction_stage_counts[@intFromEnum(stage)].fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordGuardrail(self: *Observability, category: guardrails_mod.Category, blocked: bool) void {
+        const action_idx: usize = if (blocked) 1 else 0;
+        _ = self.guardrail_counts[@intFromEnum(category)][action_idx].fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordSemanticCacheStats(
+        self: *Observability,
+        before: @import("../infra/semantic_cache.zig").Stats,
+        after: @import("../infra/semantic_cache.zig").Stats,
+    ) void {
+        if (after.hits > before.hits)
+            _ = self.semantic_cache_hits_total.fetchAdd(after.hits - before.hits, .monotonic);
+        if (after.misses > before.misses)
+            _ = self.semantic_cache_misses_total.fetchAdd(after.misses - before.misses, .monotonic);
+        if (after.evictions > before.evictions)
+            _ = self.semantic_cache_evictions_total.fetchAdd(after.evictions - before.evictions, .monotonic);
+        self.semantic_cache_entries.store(after.entries, .release);
+    }
+
+    pub fn recordVaultStore(self: *Observability) void {
+        _ = self.vault_store_total.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordVaultLookup(self: *Observability, hit: bool) void {
+        if (hit) {
+            _ = self.vault_lookup_hits_total.fetchAdd(1, .monotonic);
+        } else {
+            _ = self.vault_lookup_misses_total.fetchAdd(1, .monotonic);
+        }
     }
 
     pub fn renderMetrics(self: *const Observability, allocator: std.mem.Allocator) ![]u8 {
@@ -347,6 +391,65 @@ pub const Observability = struct {
         try writer.writeByte('\n');
 
         try writer.writeAll(
+            \\# HELP nanomask_guardrail_events_total AI guardrail detections by category and action.
+            \\# TYPE nanomask_guardrail_events_total counter
+        );
+        inline for (std.meta.fields(guardrails_mod.Category), 0..) |field, idx| {
+            try std.fmt.format(
+                writer,
+                "nanomask_guardrail_events_total{{category=\"{s}\",action=\"alert\"}} {d}\n",
+                .{
+                    field.name,
+                    self.guardrail_counts[idx][0].load(.acquire),
+                },
+            );
+            try std.fmt.format(
+                writer,
+                "nanomask_guardrail_events_total{{category=\"{s}\",action=\"block\"}} {d}\n",
+                .{
+                    field.name,
+                    self.guardrail_counts[idx][1].load(.acquire),
+                },
+            );
+        }
+        try writer.writeByte('\n');
+
+        try writer.writeAll(
+            \\# HELP nanomask_semantic_cache_requests_total Semantic cache lookup outcomes (hit or miss).
+            \\# TYPE nanomask_semantic_cache_requests_total counter
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_semantic_cache_requests_total{{result=\"hit\"}} {d}\n",
+            .{self.semantic_cache_hits_total.load(.acquire)},
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_semantic_cache_requests_total{{result=\"miss\"}} {d}\n\n",
+            .{self.semantic_cache_misses_total.load(.acquire)},
+        );
+
+        try writer.writeAll(
+            \\# HELP nanomask_semantic_cache_evictions_total Semantic cache entries evicted due to TTL expiry or capacity pressure.
+            \\# TYPE nanomask_semantic_cache_evictions_total counter
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_semantic_cache_evictions_total {d}\n\n",
+            .{self.semantic_cache_evictions_total.load(.acquire)},
+        );
+
+        try writer.writeAll(
+            \\# HELP nanomask_semantic_cache_entries Current number of semantic cache entries.
+            \\# TYPE nanomask_semantic_cache_entries gauge
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_semantic_cache_entries {d}\n\n",
+            .{self.semantic_cache_entries.load(.acquire)},
+        );
+
+        try writer.writeAll(
             \\# HELP nanomask_active_connections Active downstream client connections.
             \\# TYPE nanomask_active_connections gauge
         );
@@ -354,6 +457,31 @@ pub const Observability = struct {
             writer,
             "nanomask_active_connections {d}\n\n",
             .{self.active_connections.load(.acquire)},
+        );
+
+        try writer.writeAll(
+            \\# HELP nanomask_vault_store_total Total tokens securely persisted in the token vault.
+            \\# TYPE nanomask_vault_store_total counter
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_vault_store_total {d}\n\n",
+            .{self.vault_store_total.load(.acquire)},
+        );
+
+        try writer.writeAll(
+            \\# HELP nanomask_vault_lookup_total Token vault resolutions (hit or miss).
+            \\# TYPE nanomask_vault_lookup_total counter
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_vault_lookup_total{{result=\"hit\"}} {d}\n",
+            .{self.vault_lookup_hits_total.load(.acquire)},
+        );
+        try std.fmt.format(
+            writer,
+            "nanomask_vault_lookup_total{{result=\"miss\"}} {d}\n\n",
+            .{self.vault_lookup_misses_total.load(.acquire)},
         );
 
         try writer.writeAll(
