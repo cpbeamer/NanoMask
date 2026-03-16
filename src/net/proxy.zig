@@ -555,6 +555,7 @@ pub const ProxyContext = struct {
     enable_licenses: bool = false,
     enable_urls: bool = false,
     enable_vehicle_ids: bool = false,
+    enable_fax: bool = false,
     locale: config_mod.Locale = .us,
     enable_context_rules: bool = false,
     context_confidence_threshold: f32 = 0.70,
@@ -576,7 +577,7 @@ pub const ProxyContext = struct {
     pub fn patternFlags(self: ProxyContext) scanner.PatternFlags {
         return .{
             .email = self.enable_email,
-            .phone = self.enable_phone,
+            .phone = self.enable_phone or self.enable_fax,
             .credit_card = self.enable_credit_card,
             .ip = self.enable_ip,
             .healthcare = self.enable_healthcare,

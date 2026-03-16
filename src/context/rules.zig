@@ -43,7 +43,21 @@ const ContextRule = struct {
 const built_in_rules: []const ContextRule = &.{
     .{
         .kind = .name,
-        .prefixes = &.{ "patient ", "patient: ", "patient is ", "member ", "member: ", "dr ", "dr. ", "provider " },
+        // CAUTION: Avoid short prefixes that overlap with number-rule prefixes.
+        // E.g. "member " would shadow "member id " in the number rule because
+        // the scanner iterates name rules first and "ID" passes the uppercase check.
+        .prefixes = &.{
+            "patient is ",  "patient: ",    "patient ",
+            "member name: ", "member name ",
+            "subscriber: ", "subscriber ",
+            "guarantor: ",  "guarantor ",
+            "resident ",
+            "dr. ",         "dr ",
+            "mr. ",         "mr ",
+            "mrs. ",        "mrs ",
+            "ms. ",         "ms ",
+            "provider ",
+        },
         .regex_match = null,
         .redact_tag = "[NAME_REDACTED]",
         .base_confidence = 0.85,
@@ -51,7 +65,7 @@ const built_in_rules: []const ContextRule = &.{
     },
     .{
         .kind = .address,
-        .prefixes = &.{ "address ", "address: ", "lives at ", "resides at ", "location: ", "home: " },
+        .prefixes = &.{ "address ", "address: ", "lives at ", "resides at ", "located at ", "location: ", "home: " },
         .regex_match = null,
         .redact_tag = "[ADDRESS_REDACTED]",
         .base_confidence = 0.90,
@@ -61,7 +75,16 @@ const built_in_rules: []const ContextRule = &.{
         .kind = .date,
         // Longer/more-specific prefixes must come before shorter ones that would
         // match a subset of the same text (e.g. "dob is " before "dob ").
-        .prefixes = &.{ "dob is ", "dob: ", "dob ", "born on ", "born ", "date of birth: " },
+        // Single-word prefixes like "born " and "admitted " are omitted because
+        // they cause false positives (e.g. "born in Texas" → [DATE_REDACTED]).
+        .prefixes = &.{
+            "date of birth: ", "date of birth ",
+            "discharge date: ", "discharge date ",
+            "dob is ",         "dob: ",           "dob ",
+            "born on ",
+            "admitted: ",
+            "deceased: ",
+        },
         .regex_match = null,
         .redact_tag = "[DATE_REDACTED]",
         .base_confidence = 0.95,
@@ -69,7 +92,16 @@ const built_in_rules: []const ContextRule = &.{
     },
     .{
         .kind = .number,
-        .prefixes = &.{ "account ", "account: ", "acct ", "acct: ", "policy ", "policy: ", "claim ", "claim: ", "file # ", "file " },
+        // "file " is omitted (too generic); "file # " requires the hash qualifier.
+        .prefixes = &.{
+            "account: ",     "account ",
+            "acct: ",        "acct ",
+            "policy # ",     "policy: ",     "policy ",
+            "member id: ",   "member id ",
+            "case number: ", "case number ",
+            "claim # ",      "claim: ",      "claim ",
+            "file # ",
+        },
         .regex_match = null,
         .redact_tag = "[NUMBER_REDACTED]",
         .base_confidence = 0.80,
@@ -272,9 +304,85 @@ test "ContextRules - multiple contexts" {
     defer std.testing.allocator.free(result.output);
     defer std.testing.allocator.free(result.matches);
 
-    // Context heuristic outputs:
-    // 'Dr. ' hits Sarah Jenkins
-    // 'claim ' hits '#'
-    // Result preserves spacing and leaves '948123A.'
-    try testing.expectEqualStrings("Call Dr. [NAME_REDACTED] about claim [NUMBER_REDACTED] 948123A.", result.output);
+    // 'Dr. ' hits Sarah Jenkins → [NAME_REDACTED]
+    // 'claim # ' hits 948123A → [NUMBER_REDACTED]
+    try testing.expectEqualStrings("Call Dr. [NAME_REDACTED] about claim # [NUMBER_REDACTED].", result.output);
+}
+
+test "ContextRules - mr/mrs/ms prefixes" {
+    const allocator = std.testing.allocator;
+
+    const input_mr = "Contact Mr. James Wilson today.";
+    const result_mr = try redactContext(input_mr, 0.70, allocator);
+    defer allocator.free(result_mr.output);
+    defer allocator.free(result_mr.matches);
+    try testing.expectEqualStrings("Contact Mr. [NAME_REDACTED] today.", result_mr.output);
+
+    const input_mrs = "Billing for Mrs. Anna Lee is due.";
+    const result_mrs = try redactContext(input_mrs, 0.70, allocator);
+    defer allocator.free(result_mrs.output);
+    defer allocator.free(result_mrs.matches);
+    try testing.expectEqualStrings("Billing for Mrs. [NAME_REDACTED] is due.", result_mrs.output);
+
+    const input_ms = "Forward to Ms. Rachel Green please.";
+    const result_ms = try redactContext(input_ms, 0.70, allocator);
+    defer allocator.free(result_ms.output);
+    defer allocator.free(result_ms.matches);
+    try testing.expectEqualStrings("Forward to Ms. [NAME_REDACTED] please.", result_ms.output);
+}
+
+test "ContextRules - subscriber and guarantor" {
+    const allocator = std.testing.allocator;
+
+    const input_sub = "Subscriber: John Doe is enrolled.";
+    const result_sub = try redactContext(input_sub, 0.70, allocator);
+    defer allocator.free(result_sub.output);
+    defer allocator.free(result_sub.matches);
+    try testing.expectEqualStrings("Subscriber: [NAME_REDACTED] is enrolled.", result_sub.output);
+
+    const input_guar = "Guarantor Jane Smith approved.";
+    const result_guar = try redactContext(input_guar, 0.70, allocator);
+    defer allocator.free(result_guar.output);
+    defer allocator.free(result_guar.matches);
+    try testing.expectEqualStrings("Guarantor [NAME_REDACTED] approved.", result_guar.output);
+}
+
+test "ContextRules - located at address" {
+    const input = "Facility located at 500 Commerce Drive NE.";
+    const result = try redactContext(input, 0.70, std.testing.allocator);
+    defer std.testing.allocator.free(result.output);
+    defer std.testing.allocator.free(result.matches);
+    try testing.expectEqualStrings("Facility located at [ADDRESS_REDACTED].", result.output);
+}
+
+test "ContextRules - date of birth and discharge date" {
+    const allocator = std.testing.allocator;
+
+    const input_dob = "Date of birth: 03/15/1985 confirmed.";
+    const result_dob = try redactContext(input_dob, 0.70, allocator);
+    defer allocator.free(result_dob.output);
+    defer allocator.free(result_dob.matches);
+    try testing.expectEqualStrings("Date of birth: [DATE_REDACTED] confirmed.", result_dob.output);
+
+    const input_dis = "Discharge date: 12/01/2025 finalized.";
+    const result_dis = try redactContext(input_dis, 0.70, allocator);
+    defer allocator.free(result_dis.output);
+    defer allocator.free(result_dis.matches);
+    try testing.expectEqualStrings("Discharge date: [DATE_REDACTED] finalized.", result_dis.output);
+}
+
+test "ContextRules - member id and case number" {
+    const allocator = std.testing.allocator;
+
+    const input_mid = "Member ID: 8472910 on file.";
+    const result_mid = try redactContext(input_mid, 0.70, allocator);
+    defer allocator.free(result_mid.output);
+    defer allocator.free(result_mid.matches);
+    try testing.expectEqualStrings("Member ID: [NUMBER_REDACTED] on file.", result_mid.output);
+
+    const input_case = "Refer to case number 20250316 for details.";
+    const result_case = try redactContext(input_case, 0.70, allocator);
+    defer allocator.free(result_case.output);
+    defer allocator.free(result_case.matches);
+    try testing.expectEqualStrings("Refer to case number [NUMBER_REDACTED] for details.", result_case.output);
 }

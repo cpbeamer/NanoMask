@@ -19,6 +19,7 @@ pub const MatchStage = enum(u8) {
     pattern_library,
     fuzzy_match,
     schema,
+    context,
 };
 
 const histogram_bounds_us = [_]u64{
@@ -76,6 +77,7 @@ fn stageLabel(stage: MatchStage) []const u8 {
         .pattern_library => "pattern_library",
         .fuzzy_match => "fuzzy_match",
         .schema => "schema",
+        .context => "context",
     };
 }
 

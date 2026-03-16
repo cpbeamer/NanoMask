@@ -542,6 +542,30 @@ pub const Config = struct {
         \\  --locale <region>                   Enable regional PII patterns: us, uk, eu, ca, all (default: us)
         \\  --profile <name>                    Enable a detection profile preset (hipaa-safe-harbor, healthcare-lite, llm-basic, custom)
         \\  --list-profiles                     List available detection profiles and exit
+        \\
+        \\Override profile flags (set feature to disabled after profile has been applied):
+        \\  --disable-email                     Disable email detection (overrides profile)
+        \\  --disable-phone                     Disable phone detection (overrides profile)
+        \\  --disable-credit-card               Disable credit card detection (overrides profile)
+        \\  --disable-ip                        Disable IP address detection (overrides profile)
+        \\  --disable-healthcare                Disable healthcare ID detection (overrides profile)
+        \\  --disable-iban                      Disable IBAN detection (overrides profile)
+        \\  --disable-uk-nino                   Disable UK NINO detection (overrides profile)
+        \\  --disable-uk-nhs                    Disable UK NHS detection (overrides profile)
+        \\  --disable-uk-phone                  Disable UK phone detection (overrides profile)
+        \\  --disable-uk-postcode               Disable UK postcode detection (overrides profile)
+        \\  --disable-ca-sin                    Disable Canadian SIN detection (overrides profile)
+        \\  --disable-passport                  Disable passport detection (overrides profile)
+        \\  --disable-intl-phone                Disable intl phone detection (overrides profile)
+        \\  --disable-dates                     Disable date detection (overrides profile)
+        \\  --disable-addresses                 Disable address detection (overrides profile)
+        \\  --disable-fax                       Disable fax detection (overrides profile)
+        \\  --disable-accounts                  Disable account detection (overrides profile)
+        \\  --disable-licenses                  Disable license detection (overrides profile)
+        \\  --disable-urls                      Disable URL detection (overrides profile)
+        \\  --disable-vehicle-ids               Disable vehicle ID detection (overrides profile)
+        \\  --disable-context-rules             Disable context rules (overrides profile)
+        \\
         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
         \\  --schema-default <action>           Default action for unlisted keys: REDACT, KEEP, SCAN (default: SCAN)
         \\  --hash-key <hex>                    64-char hex HMAC key for HASH-mode pseudonymization
@@ -646,6 +670,27 @@ pub const Config = struct {
         "--mtls-ca",
         "--mtls-cert",
         "--mtls-key",
+        "--disable-email",
+        "--disable-phone",
+        "--disable-credit-card",
+        "--disable-ip",
+        "--disable-healthcare",
+        "--disable-iban",
+        "--disable-uk-nino",
+        "--disable-uk-nhs",
+        "--disable-uk-phone",
+        "--disable-uk-postcode",
+        "--disable-ca-sin",
+        "--disable-passport",
+        "--disable-intl-phone",
+        "--disable-dates",
+        "--disable-addresses",
+        "--disable-fax",
+        "--disable-accounts",
+        "--disable-licenses",
+        "--disable-urls",
+        "--disable-vehicle-ids",
+        "--disable-context-rules",
     };
 
     pub fn printProfiles() void {
@@ -1024,6 +1069,113 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_CONTEXT_RULES")) {
             config.enable_context_rules = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_context_rules_src = .env_var;
+            // NANOMASK_DISABLE_* env vars (NMV4-010)
+            // These override profile-enabled features via environment variables.
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_EMAIL")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_email = false;
+                config.enable_email_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_PHONE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_phone = false;
+                config.enable_phone_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_CREDIT_CARD")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_credit_card = false;
+                config.enable_credit_card_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_IP")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_ip = false;
+                config.enable_ip_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_HEALTHCARE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_healthcare = false;
+                config.enable_healthcare_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_IBAN")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_iban = false;
+                config.enable_iban_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_NINO")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_nino = false;
+                config.enable_uk_nino_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_NHS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_nhs = false;
+                config.enable_uk_nhs_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_PHONE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_phone = false;
+                config.enable_uk_phone_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_UK_POSTCODE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_uk_postcode = false;
+                config.enable_uk_postcode_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_CA_SIN")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_ca_sin = false;
+                config.enable_ca_sin_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_PASSPORT")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_passport = false;
+                config.enable_passport_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_INTL_PHONE")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_intl_phone = false;
+                config.enable_intl_phone_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_DATES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_dates = false;
+                config.enable_dates_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_ADDRESSES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_addresses = false;
+                config.enable_addresses_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_FAX")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_fax = false;
+                config.enable_fax_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_ACCOUNTS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_accounts = false;
+                config.enable_accounts_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_LICENSES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_licenses = false;
+                config.enable_licenses_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_URLS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_urls = false;
+                config.enable_urls_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_VEHICLE_IDS")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_vehicle_ids = false;
+                config.enable_vehicle_ids_src = .env_var;
+            }
+        } else if (std.mem.eql(u8, name, "NANOMASK_DISABLE_CONTEXT_RULES")) {
+            if (parseBoolEnv(value) orelse return error.InvalidPatternFlag) {
+                config.enable_context_rules = false;
+                config.enable_context_rules_src = .env_var;
+            }
         } else if (std.mem.eql(u8, name, "NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD")) {
             config.context_confidence_threshold = std.fmt.parseFloat(f32, value) catch {
                 std.debug.print("error: NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD must be a float between 0.0 and 1.0, got '{s}'\n", .{value});
@@ -1693,8 +1845,95 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-intl-phone")) {
                 config.enable_intl_phone = true;
                 config.enable_intl_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-dates")) {
+                config.enable_dates = true;
+                config.enable_dates_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-addresses")) {
+                config.enable_addresses = true;
+                config.enable_addresses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-fax")) {
+                config.enable_fax = true;
+                config.enable_fax_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-accounts")) {
+                config.enable_accounts = true;
+                config.enable_accounts_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-licenses")) {
+                config.enable_licenses = true;
+                config.enable_licenses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-urls")) {
+                config.enable_urls = true;
+                config.enable_urls_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-vehicle-ids")) {
+                config.enable_vehicle_ids = true;
+                config.enable_vehicle_ids_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--enable-context-rules")) {
                 config.enable_context_rules = true;
+                config.enable_context_rules_src = .cli_flag;
+            // --disable-* override flags (NMV4-010)
+            // These allow operators to selectively turn off pattern detectors
+            // that were enabled by a profile preset.
+            } else if (std.mem.eql(u8, arg, "--disable-email")) {
+                config.enable_email = false;
+                config.enable_email_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-phone")) {
+                config.enable_phone = false;
+                config.enable_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-credit-card")) {
+                config.enable_credit_card = false;
+                config.enable_credit_card_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-ip")) {
+                config.enable_ip = false;
+                config.enable_ip_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-healthcare")) {
+                config.enable_healthcare = false;
+                config.enable_healthcare_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-iban")) {
+                config.enable_iban = false;
+                config.enable_iban_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-nino")) {
+                config.enable_uk_nino = false;
+                config.enable_uk_nino_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-nhs")) {
+                config.enable_uk_nhs = false;
+                config.enable_uk_nhs_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-phone")) {
+                config.enable_uk_phone = false;
+                config.enable_uk_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-uk-postcode")) {
+                config.enable_uk_postcode = false;
+                config.enable_uk_postcode_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-ca-sin")) {
+                config.enable_ca_sin = false;
+                config.enable_ca_sin_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-passport")) {
+                config.enable_passport = false;
+                config.enable_passport_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-intl-phone")) {
+                config.enable_intl_phone = false;
+                config.enable_intl_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-dates")) {
+                config.enable_dates = false;
+                config.enable_dates_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-addresses")) {
+                config.enable_addresses = false;
+                config.enable_addresses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-fax")) {
+                config.enable_fax = false;
+                config.enable_fax_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-accounts")) {
+                config.enable_accounts = false;
+                config.enable_accounts_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-licenses")) {
+                config.enable_licenses = false;
+                config.enable_licenses_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-urls")) {
+                config.enable_urls = false;
+                config.enable_urls_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-vehicle-ids")) {
+                config.enable_vehicle_ids = false;
+                config.enable_vehicle_ids_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--disable-context-rules")) {
+                config.enable_context_rules = false;
                 config.enable_context_rules_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--context-confidence-threshold")) {
                 i += 1;
@@ -2886,22 +3125,60 @@ test "Config - missing profile value returns error" {
 }
 
 test "Config - cli flags override profile defaults" {
-    // We parse 'hipaa-safe-harbor' early in the args list, then specifically
-    // disable dates manually later. Note: Nanomask args parsing currently uses boolean
-    // true-only flags (e.g. --enable-dates). Normally to 'disable' a profile default,
-    // arg parsers need a --disable-* flag, but since Zig config currently only has
-    // --enable-*, we simulate the concept by seeing if an env var config overrides it
-    // since environment variables allow 'false'.
+    // Env sets profile to hipaa-safe-harbor (which enables dates), then
+    // env explicitly disables dates (overriding profile).
     var cfg = Config{ .allocator = std.testing.allocator };
     defer cfg.deinit();
 
-    // 1. Env sets profile to hipaa-safe-harbor (which enables dates)
     try Config.applyEnvVar(&cfg, "NANOMASK_PROFILE", "hipaa-safe-harbor", std.testing.allocator);
     try testing.expect(cfg.enable_dates);
 
-    // 2. Env explicitly disables dates (overriding profile)
     try Config.applyEnvVar(&cfg, "NANOMASK_ENABLE_DATES", "false", std.testing.allocator);
     try testing.expect(!cfg.enable_dates);
+}
+
+test "Config - disable flags override profile via CLI" {
+    // --profile hipaa-safe-harbor enables dates, addresses, and context-rules.
+    // --disable-dates and --disable-context-rules turn them back off.
+    // Other profile-enabled detectors remain active.
+    const args = [_][]const u8{
+        "nanomask",
+        "--profile",
+        "hipaa-safe-harbor",
+        "--disable-dates",
+        "--disable-context-rules",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    // Profile-enabled, NOT overridden
+    try testing.expect(cfg.enable_email);
+    try testing.expect(cfg.enable_phone);
+    try testing.expect(cfg.enable_healthcare);
+    try testing.expect(cfg.enable_addresses);
+
+    // Profile-enabled, then disabled
+    try testing.expect(!cfg.enable_dates);
+    try testing.expect(!cfg.enable_context_rules);
+}
+
+test "Config - disable env var overrides profile" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_PROFILE", "hipaa-safe-harbor", std.testing.allocator);
+    try testing.expect(cfg.enable_email);
+    try testing.expect(cfg.enable_context_rules);
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_DISABLE_EMAIL", "true", std.testing.allocator);
+    try Config.applyEnvVar(&cfg, "NANOMASK_DISABLE_CONTEXT_RULES", "true", std.testing.allocator);
+    try testing.expect(!cfg.enable_email);
+    try testing.expect(!cfg.enable_context_rules);
+
+    // Other profile-enabled flags remain active
+    try testing.expect(cfg.enable_phone);
+    try testing.expect(cfg.enable_healthcare);
 }
 
 test "Config - hash-key missing value" {

@@ -11,6 +11,7 @@ pub const MatchStage = enum(u8) {
     pattern_library,
     fuzzy_match,
     schema,
+    context,
 };
 
 pub const PayloadType = enum(u8) {
@@ -33,6 +34,7 @@ fn stageLabel(stage: MatchStage) []const u8 {
         .pattern_library => "pattern_library",
         .fuzzy_match => "fuzzy_match",
         .schema => "schema",
+        .context => "context",
     };
 }
 

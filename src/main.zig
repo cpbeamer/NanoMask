@@ -876,6 +876,7 @@ pub fn main() !void {
                 .enable_licenses = cfg.enable_licenses,
                 .enable_urls = cfg.enable_urls,
                 .enable_vehicle_ids = cfg.enable_vehicle_ids,
+                .enable_fax = cfg.enable_fax,
                 .guardrail_settings = .{
                     .enabled = cfg.enable_guardrails,
                     .mode = cfg.guardrail_mode,
@@ -943,6 +944,7 @@ pub fn main() !void {
                     .enable_licenses = cfg.enable_licenses,
                     .enable_urls = cfg.enable_urls,
                     .enable_vehicle_ids = cfg.enable_vehicle_ids,
+                    .enable_fax = cfg.enable_fax,
                     .guardrail_settings = .{
                         .enabled = cfg.enable_guardrails,
                         .mode = cfg.guardrail_mode,

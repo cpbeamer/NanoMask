@@ -76,9 +76,10 @@ pub const AuditEmitter = struct {
             else if (std.mem.eql(u8, event.stage, "schema"))
                 // schema_keep actions are informational — don't count as redaction matches
                 if (std.mem.eql(u8, event.match_type, "schema_keep")) null else observability_mod.MatchStage.schema
+            else if (std.mem.eql(u8, event.stage, "context"))
+                .context
             else
                 null;
-
             if (stage) |s| obs.recordAuditStage(s);
         }
 
@@ -94,9 +95,10 @@ pub const AuditEmitter = struct {
                 .fuzzy_match
             else if (std.mem.eql(u8, event.stage, "schema"))
                 if (!std.mem.eql(u8, event.match_type, "schema_keep")) @as(?evaluation_report_mod.MatchStage, .schema) else null
+            else if (std.mem.eql(u8, event.stage, "context"))
+                .context
             else
                 null;
-
             if (eval_stage) |es| {
                 eval_report.recordMatch(es, self.payload_type, event.confidence);
             }
