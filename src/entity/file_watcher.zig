@@ -5,6 +5,7 @@ const observability_mod = @import("../infra/observability.zig");
 const Observability = observability_mod.Observability;
 const logger_mod = @import("../infra/logger.zig");
 const Logger = logger_mod.Logger;
+const config = @import("../infra/config.zig");
 
 // ---------------------------------------------------------------------------
 // File Watcher — poll-based entity file reload trigger
@@ -23,6 +24,7 @@ pub const FileWatcher = struct {
     last_size: u64,
     entity_set: *VersionedEntitySet,
     fuzzy_threshold: f32,
+    entity_format: config.EntityFormat,
     allocator: std.mem.Allocator,
     observability: ?*Observability,
     logger: ?*Logger,
@@ -34,6 +36,7 @@ pub const FileWatcher = struct {
         poll_interval_ms: u64,
         entity_set: *VersionedEntitySet,
         fuzzy_threshold: f32,
+        entity_format: config.EntityFormat,
         allocator: std.mem.Allocator,
         observability: ?*Observability,
         logger: ?*Logger,
@@ -48,6 +51,7 @@ pub const FileWatcher = struct {
             .last_size = stat.size,
             .entity_set = entity_set,
             .fuzzy_threshold = fuzzy_threshold,
+            .entity_format = entity_format,
             .allocator = allocator,
             .observability = observability,
             .logger = logger,
@@ -141,6 +145,7 @@ pub const FileWatcher = struct {
         const new_snapshot = versioned_entity_set.loadSnapshotFromFile(
             self.path,
             self.fuzzy_threshold,
+            self.entity_format,
             new_version,
             self.logger,
             self.allocator,
@@ -219,12 +224,12 @@ test "getFileStat - missing file returns zeroes" {
 test "FileWatcher - start and join lifecycle" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try versioned_entity_set.loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
+    const snapshot = try versioned_entity_set.loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snapshot);
     defer set.deinit();
 
     // Use a very short poll interval — the test only needs one cycle
-    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, allocator, null, null);
+    var watcher = FileWatcher.init("entities.txt", 10, &set, 0.80, .names, allocator, null, null);
     try watcher.start();
 
     // Let it run briefly, then join — verifies clean thread cleanup

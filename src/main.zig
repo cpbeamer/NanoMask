@@ -416,6 +416,7 @@ pub fn main() !void {
             cfg.watch_interval_ms,
             es,
             cfg.fuzzy_threshold,
+            cfg.entity_format,
             allocator,
             &observability,
             &log,

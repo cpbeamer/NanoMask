@@ -480,6 +480,15 @@ pub const EntityMap = struct {
 
     pub fn init(allocator: std.mem.Allocator, raw_names: []const []const u8) !EntityMap {
         const n = raw_names.len;
+        const group_ids = try allocator.alloc(usize, n);
+        defer allocator.free(group_ids);
+        for (group_ids, 0..) |*id, i| id.* = i;
+        return initGrouped(allocator, raw_names, group_ids);
+    }
+
+    pub fn initGrouped(allocator: std.mem.Allocator, raw_names: []const []const u8, group_ids: []const usize) !EntityMap {
+        std.debug.assert(raw_names.len == group_ids.len);
+        const n = raw_names.len;
 
         const names = try allocator.alloc([]u8, n);
         errdefer allocator.free(names);
@@ -519,8 +528,10 @@ pub const EntityMap = struct {
             names_initialized = i + 1;
             name_lengths[i] = name.len;
             
-            // Generate the primary (new) numeric alias
-            aliases[i] = try generateAlias(allocator, i);
+            const group_id = group_ids[i];
+
+            // Generate the primary (new) numeric alias based on the group ID, not the row index
+            aliases[i] = try generateAlias(allocator, group_id);
             aliases_initialized = i + 1;
             
             // Add primary alias to reverse mapping
@@ -529,7 +540,7 @@ pub const EntityMap = struct {
             try reverse_alias_to_name.append(allocator, names[i]);
 
             // If within legacy limits (<702), also register the legacy alias for unmasking
-            if (generateLegacyAlias(allocator, i)) |legacy_alias| {
+            if (generateLegacyAlias(allocator, group_id)) |legacy_alias| {
                 try reverse_aliases.append(allocator, legacy_alias);
                 try reverse_alias_lengths.append(allocator, legacy_alias.len);
                 try reverse_alias_to_name.append(allocator, names[i]);

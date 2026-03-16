@@ -70,8 +70,10 @@ fn matchAccount(buf: []const u8, cursor: usize) ?struct { value_start: usize, en
     return null;
 }
 
-pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+pub fn tryMatchAt(buf: []const u8, pos: usize, allow_us: bool) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
     if (pos >= buf.len) return null;
+
+    if (!allow_us) return null;
 
     const c = std.ascii.toLower(buf[pos]);
     if (c == 'a' or c == 'r') {
@@ -89,21 +91,21 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
 
 test "account - Routing Number" {
     const input = "Routing: 123456789 used";
-    const m = tryMatchAt(input, 0).?;
+    const m = tryMatchAt(input, 0, true).?;
     try std.testing.expectEqualStrings("Routing: 123456789", input[m.start..m.end]);
     try std.testing.expectEqualStrings(routing_replacement, m.replacement);
 }
 
 test "account - Account Number" {
     const input = "Acct# 9876543210 ok";
-    const m = tryMatchAt(input, 0).?;
+    const m = tryMatchAt(input, 0, true).?;
     try std.testing.expectEqualStrings("Acct# 9876543210", input[m.start..m.end]);
     try std.testing.expectEqualStrings(account_replacement, m.replacement);
 }
 
 test "account - ABA" {
     const input = "ABA 111000111";
-    const m = tryMatchAt(input, 0).?;
+    const m = tryMatchAt(input, 0, true).?;
     try std.testing.expectEqualStrings("ABA 111000111", input[m.start..m.end]);
     try std.testing.expectEqualStrings(routing_replacement, m.replacement);
 }

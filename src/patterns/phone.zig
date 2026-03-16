@@ -134,14 +134,22 @@ fn isValidUsPhone(digits: []const u8, count: u8) bool {
 }
 
 /// Single-position match for the unified scanner.
-pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+pub fn tryMatchAt(buf: []const u8, pos: usize, allow_us: bool) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
     if (pos >= buf.len) return null;
     const c = buf[pos];
     if (!std.ascii.isDigit(c) and c != '(' and c != '+') return null;
     // Skip if preceded by a digit (part of a longer number)
     if (pos > 0 and std.ascii.isDigit(buf[pos - 1])) return null;
     const candidate = extractPhoneCandidate(buf, pos) orelse return null;
-    if (!isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;
+    
+    // Default phone scanning is currently strictly US-formatting
+    if (allow_us) {
+        if (!isValidUsPhone(candidate.digits[0..candidate.digit_count], candidate.digit_count)) return null;
+    } else {
+        // If not US or ALL, we don't apply the US phone logic
+        // UK logic is in a different file/module in Phase 4.
+        return null;
+    }
     // Not followed by more digits
     if (candidate.end < buf.len and std.ascii.isDigit(buf[candidate.end])) return null;
 
@@ -158,61 +166,61 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
 test "phone - parenthesized format" {
     const input = "Call (555) 234-5678 now";
     const start = std.mem.indexOf(u8, input, "(555)").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("(555) 234-5678", input[m.start..m.end]);
 }
 
 test "phone - dashed format" {
     const input = "Call 555-234-5678 now";
     const start = std.mem.indexOf(u8, input, "555-").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("555-234-5678", input[m.start..m.end]);
 }
 
 test "phone - dotted format" {
     const input = "Call 555.234.5678 now";
     const start = std.mem.indexOf(u8, input, "555.").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("555.234.5678", input[m.start..m.end]);
 }
 
 test "phone - 10 contiguous digits" {
     const input = "Call 5552345678 now";
     const start = std.mem.indexOf(u8, input, "555").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("5552345678", input[m.start..m.end]);
 }
 
 test "phone - international prefix +1" {
     const input = "Call +1-555-234-5678 today";
     const start = std.mem.indexOfScalar(u8, input, '+').?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("+1-555-234-5678", input[m.start..m.end]);
 }
 
 test "phone - domestic prefix 1" {
     const input = "Call 1-555-234-5678 today";
     const start = std.mem.indexOf(u8, input, "1-555").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("1-555-234-5678", input[m.start..m.end]);
 }
 
 test "phone - rejects area code starting with 0" {
     const input = "Number 055-234-5678 here";
     const start = std.mem.indexOf(u8, input, "055").?;
-    try std.testing.expect(tryMatchAt(input, start) == null);
+    try std.testing.expect(tryMatchAt(input, start, true) == null);
 }
 
 test "phone - rejects area code starting with 1" {
     const input = "Number 155-234-5678 here";
     const start = std.mem.indexOf(u8, input, "155").?;
-    try std.testing.expect(tryMatchAt(input, start) == null);
+    try std.testing.expect(tryMatchAt(input, start, true) == null);
 }
 
 test "phone - rejects all-same digits" {
     const input = "Number 2222222222 here";
     const start = std.mem.indexOf(u8, input, "222").?;
-    try std.testing.expect(tryMatchAt(input, start) == null);
+    try std.testing.expect(tryMatchAt(input, start, true) == null);
 }
 
 test "phone - embedded in longer digit sequence rejected" {
@@ -220,19 +228,19 @@ test "phone - embedded in longer digit sequence rejected" {
     // First digit '9' at position 6 is not preceded by digit, but the full
     // sequence has 14 digits which fails US phone validation.
     const start = std.mem.indexOf(u8, input, "99").?;
-    try std.testing.expect(tryMatchAt(input, start) == null);
+    try std.testing.expect(tryMatchAt(input, start, true) == null);
 }
 
 test "phone - fax context before" {
     const input = "Send fax to 555-234-5678 please";
     const start = std.mem.indexOf(u8, input, "555").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings(fax_replacement, m.replacement);
 }
 
 test "phone - fax context after" {
     const input = "Number: (555) 234-5678 (Fax)";
     const start = std.mem.indexOf(u8, input, "(555)").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings(fax_replacement, m.replacement);
 }

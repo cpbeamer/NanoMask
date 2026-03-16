@@ -555,6 +555,7 @@ pub const ProxyContext = struct {
     enable_licenses: bool = false,
     enable_urls: bool = false,
     enable_vehicle_ids: bool = false,
+    locale: config_mod.Locale = .us,
     enable_context_rules: bool = false,
     context_confidence_threshold: f32 = 0.70,
     guardrail_settings: guardrails_mod.Settings = .{},
@@ -589,6 +590,7 @@ pub const ProxyContext = struct {
             .licenses = self.enable_licenses,
             .urls = self.enable_urls,
             .vehicle_ids = self.enable_vehicle_ids,
+            .locale = self.locale,
         };
     }
 

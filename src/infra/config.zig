@@ -42,6 +42,51 @@ pub const VaultBackend = enum {
     }
 };
 
+pub const EntityFormat = enum {
+    names,
+    structured,
+
+    pub fn parse(s: []const u8) !EntityFormat {
+        if (std.mem.eql(u8, s, "names")) return .names;
+        if (std.mem.eql(u8, s, "structured")) return .structured;
+        return error.InvalidEntityFormat;
+    }
+
+    pub fn asStr(self: EntityFormat) []const u8 {
+        return switch (self) {
+            .names => "names",
+            .structured => "structured",
+        };
+    }
+};
+
+pub const Locale = enum {
+    us,
+    uk,
+    eu,
+    ca,
+    all,
+
+    pub fn parse(s: []const u8) !Locale {
+        if (std.mem.eql(u8, s, "us")) return .us;
+        if (std.mem.eql(u8, s, "uk")) return .uk;
+        if (std.mem.eql(u8, s, "eu")) return .eu;
+        if (std.mem.eql(u8, s, "ca")) return .ca;
+        if (std.mem.eql(u8, s, "all")) return .all;
+        return error.InvalidLocale;
+    }
+
+    pub fn asStr(self: Locale) []const u8 {
+        return switch (self) {
+            .us => "us",
+            .uk => "uk",
+            .eu => "eu",
+            .ca => "ca",
+            .all => "all",
+        };
+    }
+};
+
 pub const Profile = enum {
     hipaa_safe_harbor,
     healthcare_lite,
@@ -124,6 +169,8 @@ pub const Config = struct {
     target_host_src: ConfigSource = .default,
     target_port: u16 = 80,
     target_port_src: ConfigSource = .default,
+    entity_format: EntityFormat = .names,
+    entity_format_src: ConfigSource = .default,
     entity_file: ?[]const u8 = null,
     entity_file_src: ConfigSource = .default,
     fuzzy_threshold: f32 = 0.80,
@@ -195,6 +242,14 @@ pub const Config = struct {
     enable_iban_src: ConfigSource = .default,
     enable_uk_nino: bool = false,
     enable_uk_nino_src: ConfigSource = .default,
+    enable_uk_nhs: bool = false,
+    enable_uk_nhs_src: ConfigSource = .default,
+    enable_uk_phone: bool = false,
+    enable_uk_phone_src: ConfigSource = .default,
+    enable_uk_postcode: bool = false,
+    enable_uk_postcode_src: ConfigSource = .default,
+    enable_ca_sin: bool = false,
+    enable_ca_sin_src: ConfigSource = .default,
     enable_passport: bool = false,
     enable_passport_src: ConfigSource = .default,
     enable_intl_phone: bool = false,
@@ -219,6 +274,9 @@ pub const Config = struct {
     enable_context_rules_src: ConfigSource = .default,
     context_confidence_threshold: f32 = 0.70,
     context_confidence_threshold_src: ConfigSource = .default,
+    // --- International Patterns ---
+    locale: Locale = .us,
+    locale_src: ConfigSource = .default,
     // --- Detection Profiles ---
     profile: Profile = .custom,
     profile_src: ConfigSource = .default,
@@ -324,6 +382,7 @@ pub const Config = struct {
         MissingVaultFilePath,
         VaultFileNotFound,
         InvalidContextConfidenceThreshold,
+        InvalidLocale,
         InvalidProfile,
         UnknownFlag,
         OutOfMemory,
@@ -417,6 +476,7 @@ pub const Config = struct {
         \\  --runtime-model <mode>              Connection scheduler: thread-per-connection or worker-pool (default: thread-per-connection)
         \\  --runtime-worker-threads <n>        Worker threads for worker-pool mode (0 = auto, default: 0)
         \\  --max-body-size <bytes>             Maximum request body size in bytes (default: 10485760)
+        \\  --entity-format <format>            Format of the entity file: names or structured (default: names)
         \\  --entity-file <path>                Path to file containing entity aliases (default: none)
         \\  --watch-interval <ms>               Entity file poll interval in ms (default: 1000)
         \\  --fuzzy-threshold <f32>             Threshold for fuzzy matching (0.0 - 1.0) (default: 0.8)
@@ -464,6 +524,10 @@ pub const Config = struct {
         \\  --enable-healthcare                 Redact healthcare IDs: MRN, ICD-10, Insurance (default: disabled)
         \\  --enable-iban                       Redact EU IBAN values (default: disabled)
         \\  --enable-uk-nino                    Redact UK National Insurance numbers (default: disabled)
+        \\  --enable-uk-nhs                     Redact UK National Health Service numbers (default: disabled)
+        \\  --enable-uk-phone                   Redact UK Phone Numbers (+44, national 0) (default: disabled)
+        \\  --enable-uk-postcode                Redact UK Postcodes (e.g. SW1A 1AA) (default: disabled)
+        \\  --enable-ca-sin                     Redact Canadian SIN and Health Cards (default: disabled)
         \\  --enable-passport                   Redact passport numbers when label-qualified (default: disabled)
         \\  --enable-intl-phone                 Redact common non-US international phone numbers (default: disabled)
         \\  --enable-dates                      Redact dates and aggregate ages > 89 (default: disabled)
@@ -475,6 +539,7 @@ pub const Config = struct {
         \\  --enable-vehicle-ids                Redact VINs and heuristic license plates (default: disabled)
         \\  --enable-context-rules              Redact contextual patterns like Name after 'Patient:' (Stage 4) (default: disabled)
         \\  --context-confidence-threshold <f>  Threshold for context rules (0.0 - 1.0) (default: 0.70)
+        \\  --locale <region>                   Enable regional PII patterns: us, uk, eu, ca, all (default: us)
         \\  --profile <name>                    Enable a detection profile preset (hipaa-safe-harbor, healthcare-lite, llm-basic, custom)
         \\  --list-profiles                     List available detection profiles and exit
         \\  --schema-file <path>                NanoMask schema file using field.path = ACTION rules
@@ -508,6 +573,7 @@ pub const Config = struct {
         "--runtime-model",
         "--runtime-worker-threads",
         "--max-body-size",
+        "--entity-format",
         "--entity-file",
         "--watch-interval",
         "--fuzzy-threshold",
@@ -549,6 +615,10 @@ pub const Config = struct {
         "--enable-healthcare",
         "--enable-iban",
         "--enable-uk-nino",
+        "--enable-uk-nhs",
+        "--enable-uk-phone",
+        "--enable-uk-postcode",
+        "--enable-ca-sin",
         "--enable-passport",
         "--enable-intl-phone",
         "--enable-dates",
@@ -560,6 +630,7 @@ pub const Config = struct {
         "--enable-vehicle-ids",
         "--enable-context-rules",
         "--context-confidence-threshold",
+        "--locale",
         "--profile",
         "--list-profiles",
         "--schema-file",
@@ -734,6 +805,12 @@ pub const Config = struct {
             };
             if (config.target_port == 0) return error.InvalidPort;
             config.target_port_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FORMAT")) {
+            config.entity_format = EntityFormat.parse(value) catch {
+                std.debug.print("error: NANOMASK_ENTITY_FORMAT must be names or structured, got '{s}'\n", .{value});
+                return error.InvalidEntityFormat;
+            };
+            config.entity_format_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ENTITY_FILE")) {
             config.entity_file = try allocator.dupe(u8, value);
             config.entity_file_src = .env_var;
@@ -905,6 +982,18 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_NINO")) {
             config.enable_uk_nino = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_uk_nino_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_NHS")) {
+            config.enable_uk_nhs = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_nhs_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_PHONE")) {
+            config.enable_uk_phone = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_phone_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_UK_POSTCODE")) {
+            config.enable_uk_postcode = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_uk_postcode_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_CA_SIN")) {
+            config.enable_ca_sin = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
+            config.enable_ca_sin_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_ENABLE_PASSPORT")) {
             config.enable_passport = parseBoolEnv(value) orelse return error.InvalidPatternFlag;
             config.enable_passport_src = .env_var;
@@ -942,6 +1031,12 @@ pub const Config = struct {
             };
             if (config.context_confidence_threshold < 0.0 or config.context_confidence_threshold > 1.0) return error.InvalidContextConfidenceThreshold;
             config.context_confidence_threshold_src = .env_var;
+        } else if (std.mem.eql(u8, name, "NANOMASK_LOCALE")) {
+            config.locale = Locale.parse(value) catch {
+                std.debug.print("error: NANOMASK_LOCALE must be us, uk, eu, ca, or all, got '{s}'\n", .{value});
+                return error.InvalidLocale;
+            };
+            config.locale_src = .env_var;
         } else if (std.mem.eql(u8, name, "NANOMASK_PROFILE")) {
             config.profile = Profile.parse(value) catch {
                 std.debug.print("error: NANOMASK_PROFILE must be hipaa-safe-harbor, healthcare-lite, llm-basic, or custom, got '{s}'\n", .{value});
@@ -1137,6 +1232,7 @@ pub const Config = struct {
             "NANOMASK_LISTEN_PORT",
             "NANOMASK_TARGET_HOST",
             "NANOMASK_TARGET_PORT",
+            "NANOMASK_ENTITY_FORMAT",
             "NANOMASK_ENTITY_FILE",
             "NANOMASK_FUZZY_THRESHOLD",
             "NANOMASK_MAX_CONNECTIONS",
@@ -1183,6 +1279,7 @@ pub const Config = struct {
             "NANOMASK_ENABLE_VEHICLE_IDS",
             "NANOMASK_ENABLE_CONTEXT_RULES",
             "NANOMASK_CONTEXT_CONFIDENCE_THRESHOLD",
+            "NANOMASK_LOCALE",
             "NANOMASK_PROFILE",
             "NANOMASK_SCHEMA_FILE",
             "NANOMASK_SCHEMA_DEFAULT",
@@ -1268,6 +1365,17 @@ pub const Config = struct {
                     return error.InvalidPort;
                 }
                 config.target_port_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--entity-format")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --entity-format\n", .{});
+                    return error.MissingValue;
+                }
+                config.entity_format = EntityFormat.parse(args[i]) catch {
+                    std.debug.print("error: --entity-format must be names or structured, got '{s}'\n", .{args[i]});
+                    return error.InvalidEntityFormat;
+                };
+                config.entity_format_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--entity-file")) {
                 i += 1;
                 if (i >= args.len) {
@@ -1567,6 +1675,18 @@ pub const Config = struct {
             } else if (std.mem.eql(u8, arg, "--enable-uk-nino")) {
                 config.enable_uk_nino = true;
                 config.enable_uk_nino_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-nhs")) {
+                config.enable_uk_nhs = true;
+                config.enable_uk_nhs_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-phone")) {
+                config.enable_uk_phone = true;
+                config.enable_uk_phone_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-uk-postcode")) {
+                config.enable_uk_postcode = true;
+                config.enable_uk_postcode_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--enable-ca-sin")) {
+                config.enable_ca_sin = true;
+                config.enable_ca_sin_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--enable-passport")) {
                 config.enable_passport = true;
                 config.enable_passport_src = .cli_flag;
@@ -1591,6 +1711,17 @@ pub const Config = struct {
                     return error.InvalidContextConfidenceThreshold;
                 }
                 config.context_confidence_threshold_src = .cli_flag;
+            } else if (std.mem.eql(u8, arg, "--locale")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: expected value for --locale\n", .{});
+                    return error.MissingValue;
+                }
+                config.locale = Locale.parse(args[i]) catch {
+                    std.debug.print("error: --locale must be us, uk, eu, ca, or all, got '{s}'\n", .{args[i]});
+                    return error.InvalidLocale;
+                };
+                config.locale_src = .cli_flag;
             } else if (std.mem.eql(u8, arg, "--profile")) {
                 i += 1;
                 if (i >= args.len) {
@@ -2542,6 +2673,51 @@ test "Config - tls-no-system-ca + ca-file is valid (complementary)" {
 
     try testing.expect(cfg.tls_no_system_ca);
     try testing.expectEqualStrings(tmp_ca, cfg.ca_file.?);
+}
+
+test "Config - valid locale flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--locale",
+        "uk",
+    };
+
+    var cfg = try Config.parse(std.testing.allocator, &args);
+    defer cfg.deinit();
+
+    try testing.expectEqual(Locale.uk, cfg.locale);
+    try testing.expectEqual(ConfigSource.cli_flag, cfg.locale_src);
+}
+
+test "Config - valid locale env var" {
+    var cfg = Config{ .allocator = std.testing.allocator };
+    defer cfg.deinit();
+
+    try Config.applyEnvVar(&cfg, "NANOMASK_LOCALE", "eu", std.testing.allocator);
+
+    try testing.expectEqual(Locale.eu, cfg.locale);
+    try testing.expectEqual(ConfigSource.env_var, cfg.locale_src);
+}
+
+test "Config - invalid locale flag" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--locale",
+        "invalid_locale",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.InvalidLocale, res);
+}
+
+test "Config - missing locale flag value" {
+    const args = [_][]const u8{
+        "nanomask",
+        "--locale",
+    };
+
+    const res = Config.parse(std.testing.allocator, &args);
+    try testing.expectError(error.MissingValue, res);
 }
 
 test "Config - healthcheck flag" {

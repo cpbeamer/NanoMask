@@ -1,4 +1,6 @@
 const std = @import("std");
+const config_mod = @import("../infra/config.zig");
+const Locale = config_mod.Locale;
 const email_mod = @import("email.zig");
 const phone_mod = @import("phone.zig");
 const cc_mod = @import("credit_card.zig");
@@ -11,6 +13,10 @@ const intl_phone_mod = @import("intl_phone.zig");
 const date_mod = @import("date.zig");
 const address_mod = @import("address.zig");
 const account_mod = @import("account.zig");
+const uk_nhs_mod = @import("uk_nhs.zig");
+const uk_phone_mod = @import("uk_phone.zig");
+const uk_postcode_mod = @import("uk_postcode.zig");
+const ca_sin_mod = @import("ca_sin.zig");
 const license_mod = @import("license.zig");
 const url_mod = @import("url.zig");
 const vin_mod = @import("vin.zig");
@@ -56,6 +62,10 @@ pub const PatternFlags = struct {
     healthcare: bool = false,
     iban: bool = false,
     uk_nino: bool = false,
+    uk_nhs: bool = false,
+    uk_phone: bool = false,
+    uk_postcode: bool = false,
+    ca_sin: bool = false,
     passport: bool = false,
     intl_phone: bool = false,
     dates: bool = false,
@@ -64,10 +74,11 @@ pub const PatternFlags = struct {
     licenses: bool = false,
     urls: bool = false,
     vehicle_ids: bool = false,
+    locale: Locale = .us,
 
     pub fn anyEnabled(self: PatternFlags) bool {
         return self.email or self.phone or self.credit_card or self.ip or self.healthcare or
-            self.iban or self.uk_nino or self.passport or self.intl_phone or self.dates or self.addresses or self.accounts or self.licenses or self.urls or self.vehicle_ids;
+            self.iban or self.uk_nino or self.uk_nhs or self.uk_phone or self.uk_postcode or self.ca_sin or self.passport or self.intl_phone or self.dates or self.addresses or self.accounts or self.licenses or self.urls or self.vehicle_ids;
     }
 };
 
@@ -105,7 +116,18 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
                 }
             }
             if (flags.addresses) {
-                if (address_mod.tryMatchAt(input, cursor)) |m| {
+                const allow_us = (flags.locale == .us or flags.locale == .all);
+                if (address_mod.tryMatchAt(input, cursor, allow_us)) |m| {
+                    const match = toMatch(m);
+                    if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
+                        try spans.append(allocator, match);
+                        cursor = match.end;
+                        continue;
+                    }
+                }
+            }
+            if (flags.uk_postcode and (flags.locale == .uk or flags.locale == .all)) {
+                if (uk_postcode_mod.tryMatchAt(input, cursor)) |m| {
                     const match = toMatch(m);
                     if (spans.items.len == 0 or match.start >= spans.items[spans.items.len - 1].end) {
                         try spans.append(allocator, match);
@@ -147,7 +169,22 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
 
         if (std.ascii.isDigit(input[cursor])) {
             if (flags.phone) {
-                if (phone_mod.tryMatchAt(input, cursor)) |m| {
+                const allow_us = (flags.locale == .us or flags.locale == .all);
+                if (phone_mod.tryMatchAt(input, cursor, allow_us)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+            if (flags.uk_phone and (flags.locale == .uk or flags.locale == .all)) {
+                if (uk_phone_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+            if (flags.ca_sin and (flags.locale == .ca or flags.locale == .all)) {
+                if (ca_sin_mod.tryMatchAt(input, cursor)) |m| {
                     try spans.append(allocator, toMatch(m));
                     cursor = m.end;
                     continue;
@@ -178,7 +215,16 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
         }
 
         if (flags.phone and (input[cursor] == '(' or input[cursor] == '+')) {
-            if (phone_mod.tryMatchAt(input, cursor)) |m| {
+            const allow_us = (flags.locale == .us or flags.locale == .all);
+            if (phone_mod.tryMatchAt(input, cursor, allow_us)) |m| {
+                try spans.append(allocator, toMatch(m));
+                cursor = m.end;
+                continue;
+            }
+        }
+        
+        if (flags.uk_phone and (input[cursor] == '(' or input[cursor] == '+')) {
+            if (uk_phone_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));
                 cursor = m.end;
                 continue;
@@ -214,21 +260,29 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
                 }
             }
             if (is_word_start and flags.accounts) {
-                if (account_mod.tryMatchAt(input, cursor)) |m| {
+                const allow_us = (flags.locale == .us or flags.locale == .all);
+                if (account_mod.tryMatchAt(input, cursor, allow_us)) |m| {
                     try spans.append(allocator, toMatch(m));
                     cursor = m.end;
                     continue;
                 }
             }
-            if (flags.iban) {
+            if (flags.iban and (flags.locale == .eu or flags.locale == .all)) {
                 if (iban_mod.tryMatchAt(input, cursor)) |m| {
                     try spans.append(allocator, toMatch(m));
                     cursor = m.end;
                     continue;
                 }
             }
-            if (flags.uk_nino) {
+            if (flags.uk_nino and (flags.locale == .uk or flags.locale == .all)) {
                 if (uk_nino_mod.tryMatchAt(input, cursor)) |m| {
+                    try spans.append(allocator, toMatch(m));
+                    cursor = m.end;
+                    continue;
+                }
+            }
+            if (flags.uk_nhs and (flags.locale == .uk or flags.locale == .all)) {
+                if (uk_nhs_mod.tryMatchAt(input, cursor)) |m| {
                     try spans.append(allocator, toMatch(m));
                     cursor = m.end;
                     continue;
@@ -236,7 +290,7 @@ fn collectMatches(input: []const u8, flags: PatternFlags, allocator: std.mem.All
             }
         }
 
-        if (flags.passport and (input[cursor] == 'P' or input[cursor] == 'p')) {
+        if (flags.passport and (input[cursor] == 'P' or input[cursor] == 'p') and (flags.locale == .eu or flags.locale == .all)) {
             if (passport_mod.tryMatchAt(input, cursor)) |m| {
                 try spans.append(allocator, toMatch(m));
                 cursor = m.end;
@@ -409,21 +463,21 @@ test "scanner - insurance with label" {
 
 test "scanner - iban" {
     const allocator = std.testing.allocator;
-    const result = try redact("IBAN DE89 3704 0044 0532 0130 00 recorded", .{ .iban = true }, allocator);
+    const result = try redact("IBAN DE89 3704 0044 0532 0130 00 recorded", .{ .iban = true, .locale = .eu }, allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("IBAN [IBAN_REDACTED] recorded", result);
 }
 
 test "scanner - uk nino" {
     const allocator = std.testing.allocator;
-    const result = try redact("Employee AA 12 34 56 C onboarded", .{ .uk_nino = true }, allocator);
+    const result = try redact("Employee AA 12 34 56 C onboarded", .{ .uk_nino = true, .locale = .uk }, allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Employee [UK_NINO_REDACTED] onboarded", result);
 }
 
 test "scanner - passport label" {
     const allocator = std.testing.allocator;
-    const result = try redact("Passport Number: 123456789 verified", .{ .passport = true }, allocator);
+    const result = try redact("Passport Number: 123456789 verified", .{ .passport = true, .locale = .eu }, allocator);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Passport Number: [PASSPORT_REDACTED] verified", result);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const entity_mask = @import("../redaction/entity_mask.zig");
 const fuzzy_match = @import("../redaction/fuzzy_match.zig");
+const config = @import("../infra/config.zig");
 
 // ---------------------------------------------------------------------------
 // Versioned Entity Set — RCU (Read-Copy-Update) for hot-reload
@@ -142,6 +143,7 @@ const max_entity_name_len = 256;
 pub fn loadSnapshotFromFile(
     path: []const u8,
     fuzzy_threshold: f32,
+    entity_format: config.EntityFormat,
     version: u32,
     logger: anytype,
     allocator: std.mem.Allocator,
@@ -158,18 +160,55 @@ pub fn loadSnapshotFromFile(
     var names_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names_list.deinit(allocator);
 
+    var group_ids: std.ArrayListUnmanaged(usize) = .empty;
+    defer group_ids.deinit(allocator);
+
+    var current_group_id: usize = 0;
+    var in_structured_entity = false;
+
     var line_it = std.mem.splitScalar(u8, content, '\n');
     while (line_it.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r"), " \t\r");
+        const trimmed = std.mem.trimRight(u8, std.mem.trimLeft(u8, line, " \t\r\xEF\xBB\xBF"), " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        if (trimmed.len > max_entity_name_len) {
-            std.debug.print("[WARN] Skipping entity name exceeding {d} bytes ({d} bytes)\n", .{
+
+        var entity_value: []const u8 = trimmed;
+        if (entity_format == .structured) {
+            if (trimmed.len >= 1 and trimmed[0] == '[') {
+                if (in_structured_entity) {
+                    current_group_id += 1; // Move to next entity alias block
+                }
+                in_structured_entity = true;
+                continue; // [entity] header line
+            }
+
+            // Very basic INI/key-value parser: look for first '='
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_idx| {
+                const val = std.mem.trim(u8, trimmed[eq_idx + 1 ..], " \t\r");
+                if (val.len > 0) {
+                    entity_value = val;
+                } else {
+                    continue; // Skip keys with empty values
+                }
+            } else {
+                continue; // Skip lines without '=' in structured mode
+            }
+        }
+
+        if (entity_value.len > max_entity_name_len) {
+            std.debug.print("[WARN] Skipping entity value exceeding {d} bytes ({d} bytes)\n", .{
                 max_entity_name_len,
-                trimmed.len,
+                entity_value.len,
             });
             continue;
         }
-        try names_list.append(allocator, try allocator.dupe(u8, trimmed));
+        
+        try names_list.append(allocator, try allocator.dupe(u8, entity_value));
+        try group_ids.append(allocator, current_group_id);
+
+        if (entity_format == .names) {
+            // Names format: each line is a new group
+            current_group_id += 1;
+        }
     }
 
     const loaded_names = try names_list.toOwnedSlice(allocator);
@@ -178,9 +217,12 @@ pub fn loadSnapshotFromFile(
         allocator.free(loaded_names);
     }
 
+    const loaded_group_ids = try group_ids.toOwnedSlice(allocator);
+    defer allocator.free(loaded_group_ids);
+
     var timer = std.time.Timer.start() catch unreachable;
 
-    var em = try entity_mask.EntityMap.init(allocator, loaded_names);
+    var em = try entity_mask.EntityMap.initGrouped(allocator, loaded_names, loaded_group_ids);
     errdefer em.deinit();
     
     // Calculate approximate memory used by the automatons
@@ -299,6 +341,7 @@ test "EntitySnapshot - acquire and release" {
     const snapshot = try loadSnapshotFromFile(
         "entities.txt",
         0.80,
+        .names,
         1,
         null,
         allocator,
@@ -320,7 +363,7 @@ test "EntitySnapshot - acquire and release" {
 test "VersionedEntitySet - acquire returns current snapshot" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
+    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snapshot);
     defer set.deinit();
 
@@ -333,11 +376,11 @@ test "VersionedEntitySet - acquire returns current snapshot" {
 test "VersionedEntitySet - swap installs new version" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
-    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, null, allocator);
+    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 2, null, allocator);
     set.swap(snap2);
 
     const acquired = set.acquire();
@@ -349,13 +392,13 @@ test "VersionedEntitySet - swap installs new version" {
 test "VersionedEntitySet - version monotonicity across multiple swaps" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
     var last_version: u32 = 1;
     for (2..6) |v| {
-        const new_snap = try loadSnapshotFromFile("entities.txt", 0.80, @intCast(v), null, allocator);
+        const new_snap = try loadSnapshotFromFile("entities.txt", 0.80, .names, @intCast(v), null, allocator);
         set.swap(new_snap);
 
         const acquired = set.acquire();
@@ -370,7 +413,7 @@ test "VersionedEntitySet - version monotonicity across multiple swaps" {
 test "VersionedEntitySet - old snapshot survives while referenced" {
     const allocator = std.testing.allocator;
 
-    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
+    const snap1 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     var set = VersionedEntitySet.init(snap1);
     defer set.deinit();
 
@@ -378,7 +421,7 @@ test "VersionedEntitySet - old snapshot survives while referenced" {
     const held = set.acquire();
 
     // Swap to a new version — snap1 should NOT be freed (held still references it)
-    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, 2, null, allocator);
+    const snap2 = try loadSnapshotFromFile("entities.txt", 0.80, .names, 2, null, allocator);
     set.swap(snap2);
 
     // The held snapshot should still be valid and usable
@@ -395,7 +438,7 @@ test "VersionedEntitySet - old snapshot survives while referenced" {
 test "loadSnapshotFromFile - loads entities correctly" {
     const allocator = std.testing.allocator;
 
-    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, 1, null, allocator);
+    const snapshot = try loadSnapshotFromFile("entities.txt", 0.80, .names, 1, null, allocator);
     defer _ = snapshot.release();
 
     // entities.txt has: Jane Smith, John Doe, Dr. Johnson, another name
@@ -408,9 +451,24 @@ test "loadSnapshotFromFile - loads entities correctly" {
     try std.testing.expect(!std.mem.eql(u8, "Jane Smith visited Dr. Johnson", masked));
 }
 
+test "loadSnapshotFromFile - loads structured entities correctly" {
+    const allocator = std.testing.allocator;
+
+    const snapshot = try loadSnapshotFromFile("test_structured.nmentity", 0.80, .structured, 1, null, allocator);
+    defer _ = snapshot.release();
+
+    // test_structured.nmentity has 2 entities, each with 2 fields = 4 total loaded names
+    try std.testing.expectEqual(@as(usize, 4), snapshot.loaded_names.len);
+
+    const masked = try snapshot.entity_map.mask("John Doe DOB is 1985-03-15 and Jane Smith SSN is 123-45-6789", allocator);
+    defer allocator.free(masked);
+    // Entity 1 is John Doe group, Entity 2 is Jane Smith group
+    try std.testing.expectEqualStrings("Entity_1 DOB is Entity_1 and Entity_2 SSN is Entity_2", masked);
+}
+
 test "loadSnapshotFromFile - nonexistent file returns error" {
     const allocator = std.testing.allocator;
-    const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, 1, null, allocator);
+    const result = loadSnapshotFromFile("nonexistent_file_12345.txt", 0.80, .names, 1, null, allocator);
     try std.testing.expectError(error.FileNotFound, result);
 }
 

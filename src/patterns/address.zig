@@ -151,7 +151,7 @@ fn matchCityStateZip(buf: []const u8, cursor: usize) ?usize {
     return null;
 }
 
-pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
+pub fn tryMatchAt(buf: []const u8, pos: usize, allow_us: bool) ?struct { start: usize, end: usize, redact_start: usize, replacement: []const u8 } {
     if (pos >= buf.len) return null;
 
     // Word boundary
@@ -162,12 +162,14 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
     if (std.ascii.isDigit(c)) {
         // Zip code
         if (matchZipCode(buf, pos)) |end| {
-            // Check for Safe Harbor ZIP-3
-            const zip3 = buf[pos .. pos + 3];
-            if (isRestrictedZip(zip3)) {
-                return .{ .start = pos, .end = end, .redact_start = pos, .replacement = zip_zero_replacement };
-            } else {
-                return .{ .start = pos, .end = end, .redact_start = pos + 3, .replacement = "00" };
+            if (allow_us) {
+                // Check for Safe Harbor ZIP-3
+                const zip3 = buf[pos .. pos + 3];
+                if (isRestrictedZip(zip3)) {
+                    return .{ .start = pos, .end = end, .redact_start = pos, .replacement = zip_zero_replacement };
+                } else {
+                    return .{ .start = pos, .end = end, .redact_start = pos + 3, .replacement = "00" };
+                }
             }
         }
 
@@ -188,7 +190,7 @@ pub fn tryMatchAt(buf: []const u8, pos: usize) ?struct { start: usize, end: usiz
 test "address - Safe Harbor Restricted ZIP" {
     const input = "Living in 03605 area.";
     const start = std.mem.indexOf(u8, input, "03605").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("03605", input[m.start..m.end]);
     try std.testing.expectEqualStrings("00000", m.replacement);
 }
@@ -196,7 +198,7 @@ test "address - Safe Harbor Restricted ZIP" {
 test "address - Safe Harbor Normal ZIP" {
     const input = "My ZIP is 12345 right now.";
     const start = std.mem.indexOf(u8, input, "12345").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("12345", input[m.start..m.end]);
     try std.testing.expectEqual(start + 3, m.redact_start);
     try std.testing.expectEqualStrings("00", m.replacement);
@@ -205,7 +207,7 @@ test "address - Safe Harbor Normal ZIP" {
 test "address - Street address" {
     const input = "I live at 123 Main St.";
     const start = std.mem.indexOf(u8, input, "123").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("123 Main St", input[m.start..m.end]);
     try std.testing.expectEqualStrings(address_replacement, m.replacement);
 }
@@ -213,20 +215,20 @@ test "address - Street address" {
 test "address - Street address with avenue" {
     const input = "456 First Avenue in NY";
     const start = std.mem.indexOf(u8, input, "456").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("456 First Avenue", input[m.start..m.end]);
 }
 
 test "address - Street address fail without suffix" {
     const input = "123 Main";
     const start = std.mem.indexOf(u8, input, "123").?;
-    try std.testing.expect(tryMatchAt(input, start) == null);
+    try std.testing.expect(tryMatchAt(input, start, true) == null);
 }
 
 test "address - City, State ZIP" {
     const input = "I live in San Francisco, CA 94105 now";
     const start = std.mem.indexOf(u8, input, "San Francisco").?;
-    const m = tryMatchAt(input, start).?;
+    const m = tryMatchAt(input, start, true).?;
     try std.testing.expectEqualStrings("San Francisco, CA", input[m.start..m.end]);
     try std.testing.expectEqualStrings(address_replacement, m.replacement);
 }
