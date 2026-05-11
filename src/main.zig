@@ -235,15 +235,7 @@ pub fn main() !void {
                 "    report_only   {s}\n" ++
                 "    guardrails    {s} ({s})\n" ++
                 "    sem_cache     {s} ttl={d}ms entries={d}\n" ++
-                "\n" ++
-                "  Admin\n" ++
-                "    admin_api     {s}\n" ++
-                "    audit_log     {s}\n" ++
-                "    log_level     {s}\n" ++
-                "\n" ++
-                "  Not Yet Implemented (flags accepted, no effect)\n" ++
-                "    syslog        accepted (UDP syslog forwarding not yet implemented)\n" ++
-                "    mtls          accepted (mTLS enforcement not yet implemented)\n",
+                "\n",
             .{
                 cfg.listen_host,
                 cfg.listen_port,
@@ -276,6 +268,18 @@ pub fn main() !void {
                 if (cfg.enable_semantic_cache) "enabled" else "disabled",
                 cfg.semantic_cache_ttl_ms,
                 cfg.semantic_cache_max_entries,
+            },
+        );
+        std.debug.print(
+            "  Admin\n" ++
+                "    admin_api     {s}\n" ++
+                "    audit_log     {s}\n" ++
+                "    log_level     {s}\n" ++
+                "\n" ++
+                "  Not Yet Implemented (flags accepted, no effect)\n" ++
+                "    syslog        accepted (UDP syslog forwarding not yet implemented)\n" ++
+                "    mtls          accepted (mTLS enforcement not yet implemented)\n",
+            .{
                 if (cfg.admin_api) "enabled" else "disabled",
                 if (cfg.audit_log) "enabled" else "disabled",
                 @tagName(cfg.log_level),
@@ -393,8 +397,9 @@ pub fn main() !void {
         const initial_snapshot = versioned_entity_set.loadSnapshotFromFile(
             ef,
             cfg.fuzzy_threshold,
+            cfg.entity_format,
             1,
-            &log,
+            @as(?*Logger, &log),
             allocator,
         ) catch {
             std.process.exit(1);
@@ -432,7 +437,7 @@ pub fn main() !void {
             &empty_names,
             cfg.fuzzy_threshold,
             1,
-            &log,
+            @as(?*Logger, &log),
             allocator,
         ) catch {
             log.err("empty_entity_set_failed", null);
@@ -876,7 +881,6 @@ pub fn main() !void {
                 .enable_licenses = cfg.enable_licenses,
                 .enable_urls = cfg.enable_urls,
                 .enable_vehicle_ids = cfg.enable_vehicle_ids,
-                .enable_fax = cfg.enable_fax,
                 .guardrail_settings = .{
                     .enabled = cfg.enable_guardrails,
                     .mode = cfg.guardrail_mode,
@@ -944,7 +948,6 @@ pub fn main() !void {
                     .enable_licenses = cfg.enable_licenses,
                     .enable_urls = cfg.enable_urls,
                     .enable_vehicle_ids = cfg.enable_vehicle_ids,
-                    .enable_fax = cfg.enable_fax,
                     .guardrail_settings = .{
                         .enabled = cfg.enable_guardrails,
                         .mode = cfg.guardrail_mode,

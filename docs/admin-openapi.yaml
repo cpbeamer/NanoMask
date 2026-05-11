@@ -1,0 +1,120 @@
+openapi: 3.1.0
+info:
+  title: NanoMask Admin API
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:9091
+security:
+  - bearerAuth: []
+paths:
+  /_admin/entities:
+    get:
+      summary: List active entities
+      responses:
+        "200":
+          description: Entity list and version metadata
+    post:
+      summary: Add one or more entities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EntityMutation"
+      responses:
+        "200":
+          description: Entity set updated
+        "403":
+          description: Read-only mode or insufficient role
+        "429":
+          description: Mutation rate limit exceeded
+    put:
+      summary: Replace the active entity set
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EntityMutation"
+      responses:
+        "200":
+          description: Entity set replaced
+    delete:
+      summary: Remove entities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EntityMutation"
+      responses:
+        "200":
+          description: Entity set updated
+  /_admin/evaluation-report:
+    get:
+      summary: Fetch report-only evaluation data
+      responses:
+        "200":
+          description: Evaluation report
+        "404":
+          description: Report-only mode is not enabled
+  /_admin/evaluation-report/reset:
+    post:
+      summary: Reset report-only evaluation data
+      responses:
+        "200":
+          description: Evaluation report reset
+  /_admin/api-keys:
+    get:
+      summary: List configured API keys
+      responses:
+        "200":
+          description: API key metadata
+    post:
+      summary: Create or add an API key
+      responses:
+        "200":
+          description: API key added
+  /_admin/api-keys/{id}:
+    delete:
+      summary: Delete an API key
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: API key deleted
+  /_admin/audit:
+    get:
+      summary: Query the in-memory audit ring buffer
+      parameters:
+        - name: event_type
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Audit events
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    EntityMutation:
+      type: object
+      properties:
+        entities:
+          type: array
+          items:
+            type: string
+      required:
+        - entities

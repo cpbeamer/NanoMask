@@ -8,7 +8,8 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 DEFAULT_PROXY_BASE_URL = os.getenv("NANOMASK_BASE_URL", "http://127.0.0.1:8081/v1")
-DEFAULT_ENTITY_HEADER = "X-ZPG-Entities"
+DEFAULT_ENTITY_HEADER = os.getenv("NANOMASK_ENTITIES_HEADER", "X-NanoMask-Entities")
+LEGACY_ENTITY_HEADER = "X-ZPG-Entities"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,18 @@ def _merged_headers(
     headers = dict(default_headers or {})
     headers.update(entity_headers(entities, header_name=header_name))
     return headers
+
+
+def with_entities(
+    options: Mapping[str, Any] | None = None,
+    entities: str | Iterable[str] | None = None,
+    header_name: str = DEFAULT_ENTITY_HEADER,
+) -> dict[str, Any]:
+    request_options = dict(options or {})
+    extra_headers = dict(request_options.get("extra_headers") or {})
+    extra_headers.update(entity_headers(entities, header_name=header_name))
+    request_options["extra_headers"] = extra_headers
+    return request_options
 
 
 def _load_openai_client(async_client: bool) -> Any:

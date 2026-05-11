@@ -1,6 +1,8 @@
 export const DEFAULT_PROXY_BASE_URL =
   process.env.NANOMASK_BASE_URL ?? "http://127.0.0.1:8081/v1";
-export const DEFAULT_ENTITY_HEADER = "X-ZPG-Entities";
+export const DEFAULT_ENTITY_HEADER =
+  process.env.NANOMASK_ENTITIES_HEADER ?? "X-NanoMask-Entities";
+export const LEGACY_ENTITY_HEADER = "X-ZPG-Entities";
 
 function normalizePath(pathname) {
   return pathname.endsWith("/v1") ? pathname : `${pathname.replace(/\/$/, "")}/v1`;
@@ -34,6 +36,17 @@ function mergedHeaders(defaultHeaders, entities, headerName) {
   return {
     ...(defaultHeaders ?? {}),
     ...entityHeaders(entities, headerName),
+  };
+}
+
+export function withEntities(options = {}, entities, headerName = DEFAULT_ENTITY_HEADER) {
+  const extraHeaders = {
+    ...(options.extraHeaders ?? {}),
+    ...entityHeaders(entities, headerName),
+  };
+  return {
+    ...options,
+    extraHeaders,
   };
 }
 
@@ -104,9 +117,11 @@ export async function verify({
 export default {
   DEFAULT_ENTITY_HEADER,
   DEFAULT_PROXY_BASE_URL,
+  LEGACY_ENTITY_HEADER,
   createClient,
   entityHeaders,
   healthcheckUrl,
   normalizeBaseUrl,
   verify,
+  withEntities,
 };

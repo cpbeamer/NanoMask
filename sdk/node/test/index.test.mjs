@@ -7,6 +7,7 @@ import {
   healthcheckUrl,
   normalizeBaseUrl,
   verify,
+  withEntities,
 } from "../src/index.js";
 
 class FakeClient {
@@ -25,7 +26,7 @@ test("healthcheckUrl strips /v1", () => {
 
 test("entityHeaders joins names", () => {
   assert.deepEqual(entityHeaders(["Jane Doe", "ACME"]), {
-    "X-ZPG-Entities": "Jane Doe, ACME",
+    "X-NanoMask-Entities": "Jane Doe, ACME",
   });
 });
 
@@ -39,7 +40,13 @@ test("createClient injects NanoMask transport defaults", () => {
 
   assert.equal(client.options.baseURL, "http://127.0.0.1:8081/v1");
   assert.equal(client.options.defaultHeaders["x-trace-id"], "abc");
-  assert.equal(client.options.defaultHeaders["X-ZPG-Entities"], "Jane Doe");
+  assert.equal(client.options.defaultHeaders["X-NanoMask-Entities"], "Jane Doe");
+});
+
+test("withEntities builds per-request extraHeaders", () => {
+  const options = withEntities({ extraHeaders: { "x-trace-id": "abc" } }, ["Jane Doe"]);
+  assert.equal(options.extraHeaders["x-trace-id"], "abc");
+  assert.equal(options.extraHeaders["X-NanoMask-Entities"], "Jane Doe");
 });
 
 test("verify reports status from fetch", async () => {

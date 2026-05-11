@@ -1,5 +1,6 @@
 export const DEFAULT_PROXY_BASE_URL: string;
 export const DEFAULT_ENTITY_HEADER: string;
+export const LEGACY_ENTITY_HEADER: string;
 
 export type EntityInput = string | string[] | null | undefined;
 
@@ -31,17 +32,24 @@ export interface VerifyOptions {
 export function normalizeBaseUrl(baseUrl?: string): string;
 export function healthcheckUrl(baseUrl?: string, path?: string): string;
 export function entityHeaders(entities?: EntityInput, headerName?: string): Record<string, string>;
+export function withEntities(
+  options?: Record<string, unknown> & { extraHeaders?: Record<string, string> },
+  entities?: EntityInput,
+  headerName?: string,
+): Record<string, unknown> & { extraHeaders: Record<string, string> };
 export function createClient(options: CreateClientOptions): unknown;
 export function verify(options?: VerifyOptions): Promise<VerifyResult>;
 
 declare const _default: {
   DEFAULT_ENTITY_HEADER: string;
   DEFAULT_PROXY_BASE_URL: string;
+  LEGACY_ENTITY_HEADER: string;
   createClient: typeof createClient;
   entityHeaders: typeof entityHeaders;
   healthcheckUrl: typeof healthcheckUrl;
   normalizeBaseUrl: typeof normalizeBaseUrl;
   verify: typeof verify;
+  withEntities: typeof withEntities;
 };
 
 export default _default;

@@ -17,6 +17,8 @@ Set the client base URL to NanoMask's `/v1` endpoint:
 export OPENAI_BASE_URL=http://127.0.0.1:8081/v1
 export OPENAI_API_KEY=replace-me
 export OPENAI_MODEL=gpt-4o-mini
+export NANOMASK_ENTITIES_HEADER=X-NanoMask-Entities
+export NANOMASK_ENTITIES="Jane Smith"
 ```
 
 ## Curl
@@ -46,7 +48,7 @@ If you want the client boilerplate packaged instead of handwritten:
 - Python: `from nanomask import OpenAI, verify`
 - Node: `import { createClient, verify } from "@nanomask/openai"`
 
-The wrappers default the client base URL to NanoMask and inject `X-ZPG-Entities` headers when you pass an entity list.
+The wrappers default the client base URL to NanoMask and inject `X-NanoMask-Entities` headers when you pass an entity list. NanoMask still accepts the legacy `X-ZPG-Entities` header for older clients.
 
 ## Auth
 
@@ -63,3 +65,5 @@ The curl, Python, and Node examples all request streaming responses. Keep `curl 
 ## Health Checks
 
 Before repointing application traffic, verify `http://127.0.0.1:8081/healthz` and `http://127.0.0.1:8081/readyz`. Use `/readyz` for deployment gates so clients do not switch over while NanoMask is draining or reloading.
+
+For local-only testing without a vendor API key, use the mock upstream in [../local-openai-demo](../local-openai-demo/README.md).

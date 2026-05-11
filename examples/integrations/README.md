@@ -8,6 +8,7 @@ NanoMask ships with integration recipes for the deployment shapes buyers usually
 - [Centralized Kubernetes Gateway](gateway/README.md): Helm values for the chart plus the checked-in raw manifest at [../../standalone-deployment.yaml](../standalone-deployment.yaml).
 - [LiteLLM in Front of Vendor APIs](litellm/README.md): Docker Compose stack for `LiteLLM -> NanoMask -> OpenAI-compatible upstream`.
 - [Generic OpenAI-Compatible Clients](openai-compatible/README.md): curl, Python, and Node examples that point `base_url` or `baseURL` at NanoMask.
+- [Local OpenAI-Compatible Demo](local-openai-demo/README.md): one-command Docker Compose stack with NanoMask and a mock upstream, no vendor API key required.
 
 ## Smoke-Test Coverage
 

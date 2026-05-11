@@ -1,0 +1,45 @@
+services:
+  mock-openai:
+    image: node:22-alpine
+    working_dir: /demo
+    command: ["node", "mock-openai.js"]
+    volumes:
+      - ./mock-openai.js:/demo/mock-openai.js:ro
+    ports:
+      - "8082:8080"
+
+  nanomask:
+    build:
+      context: ../../..
+    depends_on:
+      - mock-openai
+    environment:
+      NANOMASK_LISTEN_HOST: 0.0.0.0
+      NANOMASK_LISTEN_PORT: "8081"
+      NANOMASK_TARGET_HOST: mock-openai
+      NANOMASK_TARGET_PORT: "8080"
+      NANOMASK_ENABLE_EMAIL: "true"
+      NANOMASK_ENABLE_PHONE: "true"
+      NANOMASK_AUDIT_LOG: "true"
+    ports:
+      - "8081:8081"
+
+  smoke:
+    image: curlimages/curl:8.12.1
+    profiles: ["smoke"]
+    depends_on:
+      - nanomask
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        until curl -fsS http://nanomask:8081/readyz >/dev/null; do sleep 1; done
+        curl -fsS http://nanomask:8081/v1/chat/completions \
+          -H 'Content-Type: application/json' \
+          -H 'Authorization: Bearer demo' \
+          -H 'X-NanoMask-Entities: Jane Smith' \
+          -d '{"model":"demo","messages":[{"role":"user","content":"Summarize Jane Smith SSN 123-45-6789"}]}' \
+          | tee /tmp/response.json
+        grep -q 'Jane Smith' /tmp/response.json
+        ! grep -q '123-45-6789' /tmp/response.json

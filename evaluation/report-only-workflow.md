@@ -8,6 +8,15 @@ Use report-only mode to prove coverage and operational safety before payload mut
 - baseline false positives on real prompts, notes, and claims payloads
 - show auditors that rollout starts with observation, not blind enforcement
 
+## Rollout
+
+| Day | Mode | Goal |
+|---|---|---|
+| 0 | `--report-only --audit-log` on mirrored or low-risk traffic | Confirm NanoMask sees representative payloads and emits expected detections. |
+| 1 | report-only on production-shaped traffic | Compare audit events to known PHI/PII fields and tune schemas/entities. |
+| 2 | enforcement for one bounded route or service | Validate response restore, latency, and application behavior. |
+| 3 | broaden enforcement gradually | Expand by route, tenant, or workload after metrics and audit logs remain clean. |
+
 ## Commands
 
 Start NanoMask with the healthcare starter pack:

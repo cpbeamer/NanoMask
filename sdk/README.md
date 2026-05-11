@@ -10,7 +10,8 @@ Phase 5 adds lightweight wrappers for the official OpenAI SDKs so teams can poin
 ## Goals
 
 - Default the client `base_url` to NanoMask's local `/v1` endpoint
-- Provide `X-ZPG-Entities` header helpers
+- Provide `X-NanoMask-Entities` header helpers while keeping `X-ZPG-Entities` available as a legacy alias
+- Provide per-request entity helpers for official SDK calls
 - Expose `verify()` health probes for CI and deployment checks
 
 ## Local install

@@ -496,7 +496,7 @@ test "e2e compliance - Azure vendor headers" {
 }
 
 // ---------------------------------------------------------------------------
-// NMV2-002 — Internal headers stripped (X-ZPG-Entities must not leak)
+// NMV2-002 — Internal headers stripped (entity headers must not leak)
 // ---------------------------------------------------------------------------
 test "e2e compliance - internal headers stripped" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -507,6 +507,7 @@ test "e2e compliance - internal headers stripped" {
     const extra_headers = [_]http.Header{
         .{ .name = "Authorization", .value = "Bearer keep-me" },
         .{ .name = "X-ZPG-Entities", .value = "Jane Smith" },
+        .{ .name = "X-NanoMask-Entities", .value = "Jane Smith" },
     };
 
     var result = try harness.roundTrip(allocator, body, .{
@@ -519,8 +520,9 @@ test "e2e compliance - internal headers stripped" {
     const auth_val = http_util.findHeader(result.upstream_head, "Authorization") orelse return error.MissingHeader;
     try std.testing.expectEqualStrings("Bearer keep-me", auth_val);
 
-    // X-ZPG-Entities is consumed by the proxy and must NOT reach upstream
+    // Entity headers are consumed by the proxy and must NOT reach upstream
     try std.testing.expect(http_util.findHeader(result.upstream_head, "X-ZPG-Entities") == null);
+    try std.testing.expect(http_util.findHeader(result.upstream_head, "X-NanoMask-Entities") == null);
 
     // Entity masking should still work (the header was consumed for redaction)
     try std.testing.expect(std.mem.indexOf(u8, result.upstream_body, "Jane Smith") == null);

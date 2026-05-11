@@ -38,6 +38,7 @@ const managed_headers = [_][]const u8{
     "content-length",
     "content-disposition",
     "accept-encoding",
+    "x-nanomask-entities",
     "x-zpg-entities",
     "content-encoding",
     "expect",
@@ -261,6 +262,21 @@ test "collectEndToEndHeaders - extra skip list" {
     defer freeCollectedHeaders(allocator, result);
 
     // Should only forward Authorization
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("Authorization", result[0].name);
+}
+
+test "collectEndToEndHeaders - strips NanoMask entity header aliases" {
+    const allocator = std.testing.allocator;
+    const head = "POST /api HTTP/1.1\r\n" ++
+        "Authorization: Bearer tok\r\n" ++
+        "X-NanoMask-Entities: Jane Smith\r\n" ++
+        "X-ZPG-Entities: Legacy Name\r\n" ++
+        "\r\n";
+
+    const result = try collectEndToEndHeaders(allocator, head, &.{});
+    defer freeCollectedHeaders(allocator, result);
+
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expectEqualStrings("Authorization", result[0].name);
 }

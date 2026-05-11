@@ -18,7 +18,7 @@ Rather than relying on third-party frameworks like `zap`, the proxy is built ent
 The proxy intercepts the HTTP transaction in a bidirectional pipeline:
 
 ### Request Path (Client → LLM)
-1.  **Header Parsing**: The incoming HTTP request head is parsed. The `X-ZPG-Entities` header is extracted (if present) to build a per-request entity map.
+1.  **Header Parsing**: The incoming HTTP request head is parsed. The `X-NanoMask-Entities` header is extracted (if present) to build a per-request entity map. The legacy `X-ZPG-Entities` header is also accepted for older clients.
 2.  **Body Reading**: The request body is read via `request.readerExpectContinue()` into a dynamic `ArrayListUnmanaged(u8)` buffer.
 3.  **Privacy Pipeline**: Entity masking (names→aliases) followed by SSN redaction (digits→`*`) is applied to the body.
 4.  **Forwarding**: The sanitized body is sent upstream via `sendBodyComplete()` with auto-set content-length.
@@ -66,9 +66,9 @@ The entity masking engine provides dictionary-based name pseudonymization for PI
 *   **Entity Limit**: Unbounded — numeric alias suffix (`Entity_1` through `Entity_N`) supports arbitrarily large entity sets.
 
 ### Dynamic Entity Loading
-The `X-ZPG-Entities` header allows per-request entity specification:
+The `X-NanoMask-Entities` header allows per-request entity specification:
 ```
-X-ZPG-Entities: John Doe, Dr. Smith, Jane Williams
+X-NanoMask-Entities: John Doe, Dr. Smith, Jane Williams
 ```
 If present, a per-request `EntityMap` is built from the header values. Otherwise, the session-level default is used.
 

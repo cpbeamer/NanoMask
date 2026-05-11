@@ -79,10 +79,10 @@ pub const FileVault = struct {
 
         // 2. Persist to file (JSON for convenience here, but could be binary)
         // Format payload: {"t":"TOKEN","o":"ORIGINAL"}
-        var payload_buf = std.ArrayList(u8).init(self.allocator);
-        defer payload_buf.deinit();
+        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload_buf.deinit(self.allocator);
 
-        const writer = payload_buf.writer();
+        const writer = payload_buf.writer(self.allocator);
         try writer.writeByte('{');
         try writer.writeAll("\"t\":\"");
         try writer.writeAll(token);
@@ -104,7 +104,7 @@ pub const FileVault = struct {
         defer self.allocator.free(ciphertext);
 
         var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(ciphertext, &tag, plaintext, &"", // aad
+        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(ciphertext, &tag, plaintext, "", // aad
             nonce, self.key);
 
         // 4. Write to disk
@@ -142,18 +142,20 @@ pub const FileVault = struct {
         try self.memory_vault.vaultInterface().evictAll();
 
         // Truncate file
-        try self.file.setEndPos(0);
-        try self.file.seekTo(0);
+        self.file.setEndPos(0) catch return VaultError.EvictFailed;
+        self.file.seekTo(0) catch return VaultError.EvictFailed;
         try self.file.sync();
     }
 
     fn loadFromFile(self: *@This()) !void {
         // Simple loader: scan all entries, decrypt, and put in memory_vault.
         try self.file.seekTo(0);
-        const reader = self.file.reader();
+        var file_read_buf: [8192]u8 = undefined;
+        var file_reader = self.file.reader(&file_read_buf);
+        const reader = &file_reader.interface;
 
         while (true) {
-            const total_len = reader.readInt(u32, .little) catch |err| switch (err) {
+            const total_len = reader.takeInt(u32, .little) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return VaultError.InitializationFailed,
             };
@@ -161,16 +163,16 @@ pub const FileVault = struct {
             if (total_len < 28) return error.IntegrityCheckFailed; // Must have nonce(12) + tag(16)
 
             var nonce: [12]u8 = undefined;
-            if (try reader.readAll(&nonce) != 12) return error.IntegrityCheckFailed;
+            try reader.readSliceAll(&nonce);
 
             var tag: [16]u8 = undefined;
-            if (try reader.readAll(&tag) != 16) return error.IntegrityCheckFailed;
+            try reader.readSliceAll(&tag);
 
             const ctext_len = total_len - 28;
             const ciphertext = try self.allocator.alloc(u8, ctext_len);
             defer self.allocator.free(ciphertext);
 
-            if (try reader.readAll(ciphertext) != ctext_len) return error.IntegrityCheckFailed;
+            try reader.readSliceAll(ciphertext);
 
             const plaintext = try self.allocator.alloc(u8, ctext_len);
             defer self.allocator.free(plaintext);
@@ -179,7 +181,7 @@ pub const FileVault = struct {
                 plaintext,
                 ciphertext,
                 tag,
-                &"",
+                "",
                 nonce,
                 self.key,
             ) catch return VaultError.IntegrityCheckFailed;

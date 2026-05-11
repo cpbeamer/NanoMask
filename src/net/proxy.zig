@@ -35,7 +35,12 @@ const hasher_mod = @import("../schema/hasher.zig");
 /// Maximum length for the constructed target URL (stack-allocated).
 const max_url_len = 2048;
 
-/// Maximum number of entities accepted via the X-ZPG-Entities header.
+/// Preferred per-request entity header. The legacy X-ZPG-Entities header is
+/// still accepted for backward compatibility.
+const entity_header_name = "X-NanoMask-Entities";
+const legacy_entity_header_name = "X-ZPG-Entities";
+
+/// Maximum number of entities accepted via the entity header.
 /// Prevents Aho-Corasick construction DoS from oversized entity lists.
 const max_header_entities: usize = 100;
 
@@ -923,8 +928,9 @@ pub fn handleRequest(
     defer if (per_request_map) |*m| m.deinit();
 
     const active_entity_map: ?*const entity_mask.EntityMap = blk: {
-        // Check for X-ZPG-Entities header
-        if (findHeader(request.head_buffer, "X-ZPG-Entities")) |header_val| {
+        // Check for the preferred NanoMask header first, then the legacy
+        // compatibility header used by older examples and SDKs.
+        if (findHeader(request.head_buffer, entity_header_name) orelse findHeader(request.head_buffer, legacy_entity_header_name)) |header_val| {
             const names = parseEntityHeader(header_val, allocator) catch |err| {
                 log.log(.warn, "entity_header_parse_failed", session_id, &.{
                     .{ .key = "error", .value = .{ .string = @errorName(err) } },

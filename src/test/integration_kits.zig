@@ -144,6 +144,7 @@ test "integration kits - generic OpenAI-compatible clients point at NanoMask" {
     defer allocator.free(readme);
     try expectContainsAll(readme, &.{
         "OPENAI_BASE_URL=http://127.0.0.1:8081/v1",
+        "X-NanoMask-Entities",
         "curl-chat.sh",
         "python_client.py",
         "node_client.mjs",
@@ -158,6 +159,7 @@ test "integration kits - generic OpenAI-compatible clients point at NanoMask" {
     try expectContainsAll(env_example, &.{
         "OPENAI_BASE_URL=http://127.0.0.1:8081/v1",
         "OPENAI_MODEL=gpt-4o-mini",
+        "NANOMASK_ENTITIES_HEADER=X-NanoMask-Entities",
     });
 
     const curl_script = try readFile(allocator, "examples/integrations/openai-compatible/curl-chat.sh", 8 * 1024);
@@ -165,20 +167,27 @@ test "integration kits - generic OpenAI-compatible clients point at NanoMask" {
     try expectContainsAll(curl_script, &.{
         "curl -N",
         "/chat/completions",
+        "NANOMASK_ENTITIES_HEADER",
         "\\\"stream\\\":true",
     });
 
     const python_client = try readFile(allocator, "examples/integrations/openai-compatible/python_client.py", 8 * 1024);
     defer allocator.free(python_client);
     try expectContainsAll(python_client, &.{
-        "base_url=os.environ.get(\"OPENAI_BASE_URL\", \"http://127.0.0.1:8081/v1\")",
+        "from nanomask import OpenAI, with_entities",
+        "**with_entities",
         "stream=True",
     });
 
     const node_client = try readFile(allocator, "examples/integrations/openai-compatible/node_client.mjs", 8 * 1024);
     defer allocator.free(node_client);
     try expectContainsAll(node_client, &.{
-        "baseURL: process.env.OPENAI_BASE_URL ?? \"http://127.0.0.1:8081/v1\"",
+        "createClient",
+        "withEntities",
         "stream: true",
     });
+
+    try std.fs.cwd().access("examples/integrations/local-openai-demo/docker-compose.yaml", .{});
+    try std.fs.cwd().access("examples/integrations/local-openai-demo/mock-openai.js", .{});
+    try std.fs.cwd().access("examples/integrations/local-openai-demo/README.md", .{});
 }

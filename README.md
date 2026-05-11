@@ -44,7 +44,7 @@ docker run --rm -p 8081:8081 \
 # In another terminal — send a request with PII:
 curl -s -X POST http://localhost:8081/post \
   -H "Content-Type: application/json" \
-  -H "X-ZPG-Entities: John Doe, Jane Smith" \
+  -H "X-NanoMask-Entities: John Doe, Jane Smith" \
   -d '{"note": "Patient John Doe SSN 123-45-6789 was referred by Jane Smith"}'
 ```
 
@@ -85,6 +85,12 @@ zig build bench-all 2>$null
 
 # Run the vendor compatibility suite and emit the matrix artifact
 zig build compat-matrix -- compatibility/compatibility-matrix.json
+
+# Check a running local NanoMask instance
+node tools/nanomask-doctor.mjs --base-url http://127.0.0.1:8081
+
+# Run a small external OpenAI-compatible contract check
+node tools/nanomask-compat.mjs --base-url=http://127.0.0.1:8081/v1
 
 # Generate the accuracy + benchmark proof artifacts
 zig build proof-report -- zig-out/proof/proof-report.json zig-out/proof/proof-report.md
@@ -127,7 +133,7 @@ Or pass entity names per-request via HTTP header:
 
 ```bash
 curl -X POST http://localhost:8081/api/chat \
-  -H "X-ZPG-Entities: John Doe, Jane Smith" \
+  -H "X-NanoMask-Entities: John Doe, Jane Smith" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Patient John Doe SSN 123-45-6789 was seen today"}'
 ```
@@ -174,6 +180,7 @@ NanoMask now includes packaged integration recipes under `examples/integrations/
 - `examples/integrations/gateway/README.md`: centralized Kubernetes gateway recipe with Helm values and the standalone deployment manifest.
 - `examples/integrations/litellm/README.md`: LiteLLM in front of NanoMask in front of vendor APIs, including a compose stack and config file.
 - `examples/integrations/openai-compatible/README.md`: generic OpenAI-compatible client wiring with curl, Python, and Node examples that point `base_url` at NanoMask.
+- `examples/integrations/local-openai-demo/README.md`: local Docker Compose demo with a mock OpenAI-compatible upstream and no vendor API key.
 
 The sidecar, gateway, and LiteLLM recipes each include smoke-test commands plus operator notes for auth, TLS, streaming, and health checks. The OpenAI-compatible kit includes reusable client environment settings and streaming client samples.
 
@@ -185,6 +192,7 @@ Phase 5 adds lightweight SDK wrappers under `sdk/` so teams can point official O
 - `sdk/node`: installable `@nanomask/openai` package
 - both packages default the client endpoint to `http://127.0.0.1:8081/v1`
 - both packages expose `verify()` helpers for CI and readiness checks
+- both packages use `X-NanoMask-Entities` by default and expose per-request entity helpers (`with_entities` / `withEntities`)
 
 Quick local install:
 
@@ -211,7 +219,7 @@ Phase 5 also packages the buyer-facing evaluation assets:
 
 Core redaction and restore surface:
 - SSN redaction is always available for supported text and JSON bodies.
-- Entity masking and response unmasking can be driven from `--entity-file` / `NANOMASK_ENTITY_FILE` or per-request `X-ZPG-Entities`.
+- Entity masking and response unmasking can be driven from `--entity-file` / `NANOMASK_ENTITY_FILE` or per-request `X-NanoMask-Entities`; `X-ZPG-Entities` remains accepted as a legacy alias.
 - Fuzzy matching targets OCR-style name drift in text that has already been extracted into the HTTP payload.
 - Optional pattern-library flags expose built-in redactors for email, phone, credit card, IP address, healthcare identifiers, IBANs, UK National Insurance numbers, passport values, and common international phone formats.
 - Optional schema-aware JSON mode exposes `KEEP`, `REDACT`, `SCAN`, and `HASH` actions through `--schema-file`, `--schema-default`, `--hash-key`, and `--hash-key-file`.
@@ -306,7 +314,7 @@ Output: "Dr. visited Entity_A and Entity_B"
 **Key properties**:
 - **O(n + m)** time complexity: linear in text length plus total matches, regardless of how many names are in the set
 - **Bidirectional**: the same automaton is used in reverse to restore aliases → names in upstream responses
-- **Per-request override**: the `X-ZPG-Entities` header can supply a different name set per request
+- **Per-request override**: the `X-NanoMask-Entities` header can supply a different name set per request
 - **Word-boundary aware**: only matches at word boundaries to avoid false positives inside longer words
 
 **Source**: [`src/entity_mask.zig`](src/entity_mask.zig)
@@ -549,7 +557,7 @@ NanoMask supports a strict configuration precedence:
 | HASH key | `--hash-key` | `NANOMASK_HASH_KEY` | none | Inline 64-character hex HMAC key for schema `HASH` actions |
 | HASH key file | `--hash-key-file` | `NANOMASK_HASH_KEY_FILE` | none | File containing the 64-character hex HMAC key for schema `HASH` actions |
 
-*Note: Per-request `X-ZPG-Entities` header overrides the entity names loaded from the file or compiled defaults.*
+*Note: Per-request `X-NanoMask-Entities` or legacy `X-ZPG-Entities` headers override the entity names loaded from the file or compiled defaults.*
 
 > **Listener TLS**: When both `--tls-cert` and `--tls-key` are provided, NanoMask performs a full TLS 1.3 handshake on each accepted connection using AES-128-GCM-SHA256 with X25519 key exchange. The encrypted reader/writer wraps the raw socket transparently — the HTTP server and redaction pipeline operate on plaintext. Supports ECDSA P-256 and Ed25519 private keys in PKCS#8 PEM format.
 
@@ -635,6 +643,9 @@ NanoMask ships with a complete security evidence package for enterprise evaluato
 - **[Security Review Checklist](docs/security_review_checklist.md)** — per-release verification checklist
 - **[HIPAA BAA Template](docs/hipaa_baa_template.md)** — draft Business Associate Agreement for healthcare buyers
 - **[FedRAMP Readiness](docs/fedramp_readiness.md)** — NIST SP 800-53 control mapping and gap analysis
+- **[Developer Integrations](docs/developer_integrations.md)** — FastAPI, Flask, Express, Next.js, LangChain, SDK helpers, and local verification commands
+- **[Failure Behavior](docs/failure_behavior.md)** — expected client behavior and operator signals for common failure modes
+- **[Admin OpenAPI](docs/admin-openapi.yaml)** — OpenAPI contract for the admin control plane
 
 ## License
 

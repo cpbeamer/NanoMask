@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from nanomask import OpenAI, entity_headers, healthcheck_url, normalize_base_url
+from nanomask import OpenAI, entity_headers, healthcheck_url, normalize_base_url, with_entities
 
 
 class FakeClient:
@@ -23,7 +23,7 @@ class NanoMaskSdkTests(unittest.TestCase):
 
     def test_entity_headers_joins_names(self) -> None:
         self.assertEqual(
-            {"X-ZPG-Entities": "Jane Doe, ACME"},
+            {"X-NanoMask-Entities": "Jane Doe, ACME"},
             entity_headers(["Jane Doe", "ACME"]),
         )
 
@@ -36,7 +36,12 @@ class NanoMaskSdkTests(unittest.TestCase):
         )
         self.assertEqual("http://127.0.0.1:8081/v1", client.kwargs["base_url"])
         self.assertEqual("abc", client.kwargs["default_headers"]["x-trace-id"])
-        self.assertEqual("Jane Doe", client.kwargs["default_headers"]["X-ZPG-Entities"])
+        self.assertEqual("Jane Doe", client.kwargs["default_headers"]["X-NanoMask-Entities"])
+
+    def test_with_entities_sets_per_request_headers(self) -> None:
+        options = with_entities({"extra_headers": {"x-trace-id": "abc"}}, ["Jane Doe"])
+        self.assertEqual("abc", options["extra_headers"]["x-trace-id"])
+        self.assertEqual("Jane Doe", options["extra_headers"]["X-NanoMask-Entities"])
 
 
 if __name__ == "__main__":

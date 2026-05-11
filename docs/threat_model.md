@@ -52,7 +52,7 @@ NanoMask is a privacy-firewall reverse proxy that intercepts HTTP traffic, scans
 | # | Threat | Existing Mitigation | Residual Risk |
 |---|--------|-------------------|---------------|
 | S-1 | Attacker impersonates a legitimate client | Admin API requires Bearer token with constant-time comparison; IP allowlist restricts admin access | Proxy endpoints have no client authentication (by design — auth headers are forwarded to upstream). Admin token must be configured explicitly; default is unauthenticated. |
-| S-2 | Attacker forges `X-ZPG-Entities` header to manipulate per-request entity maps | None — header is trusted | Low risk: worst case is the attacker controls which names get redacted in their own request. The header does not affect other sessions. |
+| S-2 | Attacker forges `X-NanoMask-Entities` or legacy `X-ZPG-Entities` header to manipulate per-request entity maps | None — header is trusted | Low risk: worst case is the attacker controls which names get redacted in their own request. The header does not affect other sessions. |
 
 #### Tampering
 

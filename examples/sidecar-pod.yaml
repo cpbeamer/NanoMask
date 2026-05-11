@@ -41,7 +41,7 @@ spec:
           while true; do
             echo "Sending request through NanoMask sidecar..."
             curl -s -X POST http://localhost:8081/post \
-              -H "X-ZPG-Entities: Jane Smith" \
+              -H "X-NanoMask-Entities: Jane Smith" \
               -H "Content-Type: application/json" \
               -d '{"patient": "Jane Smith", "patient_email": "jane.smith@example.com", "patient_phone": "202-555-0147", "patient_id": "A1234567", "notes": "SSN 123-45-6789, card 4111-1111-1111-1111, source 203.0.113.7, MRN MRN123456"}'
             echo ""
